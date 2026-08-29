@@ -1,0 +1,253 @@
+id: thinkpad-t14
+name: Lenovo ThinkPad T14
+enabled: true
+provider: ebay
+schema_version: 1
+
+# ---------------------------------------------------------------------------
+# 1. SEARCH — pushed to the API. Anything filtered here costs no rate budget.
+# ---------------------------------------------------------------------------
+search:
+  queries:
+    - "Lenovo ThinkPad T14"
+
+  # Negative terms in `q` are best-effort on Browse and behave inconsistently.
+  # Treat these as an optimisation only. The reject rules below are the
+  # authoritative filter — never rely on the API to keep junk out.
+  query_exclude:
+    - T14s
+    - dock
+    - palmrest
+
+  category_ids:
+    - "177"          # PC Laptops & Netbooks
+
+  filters:
+    conditionIds: [2000, 2500, 3000]     # cert refurb, seller refurb, used
+    buyingOptions: [FIXED_PRICE, AUCTION, BEST_OFFER]
+    price: [80, 1200]
+    priceCurrency: USD
+    itemLocationCountry: US
+
+  poll:
+    interval_minutes: 5
+    sweep_interval_minutes: 60           # deep pagination, refreshes active set
+    sort: newlyListed
+
+# ---------------------------------------------------------------------------
+# 2. REJECT — runs BEFORE extraction. Order matters; first match wins.
+#    Anything rejected never reaches the baseline. See design.md §5.1.
+# ---------------------------------------------------------------------------
+reject:
+  - id: t14s-not-t14
+    where: title
+    any:
+      - '\bT14\s?s\b'
+    reason: "T14s is a different machine with a different price curve"
+
+  - id: for-parts-condition
+    where: condition_id
+    in: [7000]
+    reason: "For parts or not working"
+
+  - id: for-parts-text
+    where: [title, subtitle]
+    any:
+      - 'for\s+parts'
+      - '\bparts\s+only\b'
+      - '\bas[\s-]?is\b'
+      - '\bnot\s+working\b'
+      - '\bbios\s+lock'
+      - '\bcracked\b'
+      - '\bbad\s+battery\b'
+      - '\bno\s+power\b'
+
+  - id: barebones
+    where: [title, subtitle]
+    any:
+      - '\bbarebones?\b'
+      - '\bno\s+(ram|ssd|hdd|memory|storage|drive|os)\b'
+      - '\bno\s+hard\s+drive\b'
+      - '\bw/?o\s+(ram|ssd|hdd)\b'
+    reason: "Drags bucket medians down hard; primary source of false alerts"
+
+  - id: lot-listing
+    where: title
+    any:
+      - '\blot\s+of\s+\d+'
+      - '\b(qty|quantity)\s*[:.]?\s*[2-9]\d*\b'
+      - '\bx\s?[2-9]\b'
+      - '\bbulk\b'
+      - '\bwholesale\b'
+    reason: "One listing, N machines. Price is not comparable."
+
+  - id: accessory
+    where: title
+    any:
+      - '\b(dock|docking\s+station|palmrest|keyboard|lcd|screen\s+assembly)\b'
+      - '\b(motherboard|mainboard|bezel|hinge|heatsink|fan|webcam)\b'
+      - '\b(charger|ac\s+adapter|power\s+supply|sleeve|case|bag)\b'
+    unless:
+      # Accessory words legitimately appear in whole-laptop listings
+      # ("T14 laptop with dock included"). Don't reject those.
+      - '\b(laptop|notebook|ultrabook)\b'
+      - '\b(i[3579]|ryzen)\b'
+    reason: "Matches the keyword search but is not the machine"
+
+# ---------------------------------------------------------------------------
+# 3. EXTRACT — ordered rules per field, first match wins.
+#    Capture groups referenced as {1}, {2}. `apply` names a function from
+#    normalize/functions.py.
+# ---------------------------------------------------------------------------
+extract:
+  generation:
+    from: title
+    rules:
+      - pattern: '\bgen\s*([1-5])\b'
+        value: '{1}'
+      - pattern: '\bg([1-5])\b'
+        value: '{1}'
+    default: null
+
+  cpu_family:
+    from: title
+    rules:
+      # AMD — generation is inferable from the Ryzen series, see derive below
+      - pattern: '\bryzen\s*[3579]\s*pro\s*4\d{3}'
+        value: amd-ryzen-4000
+      - pattern: '\bryzen\s*[3579]\s*pro\s*5\d{3}'
+        value: amd-ryzen-5000
+      - pattern: '\bryzen\s*[3579]\s*4\d{3}'
+        value: amd-ryzen-4000
+      - pattern: '\bryzen\s*[3579]\s*5\d{3}'
+        value: amd-ryzen-5000
+      # Intel — 4-digit model numbers, 10th gen onward
+      - pattern: '\bi[3579][\s-]?10\d{2,3}'
+        value: intel-10th
+      - pattern: '\bi[3579][\s-]?11\d{2,3}'
+        value: intel-11th
+      - pattern: '\bi[3579][\s-]?12\d{2,3}'
+        value: intel-12th
+      - pattern: '\bi[3579][\s-]?13\d{2,3}'
+        value: intel-13th
+    default: null
+
+  ram_gb:
+    from: title
+    rules:
+      # The unit suffix is MANDATORY. A bare `(\d+)\s*gb` will happily
+      # capture "512GB SSD" as 512GB of RAM and poison the bucket.
+      - pattern: '(\d{1,3})\s*gb\s*(?:ddr[45]|ram|memory)\b'
+        value: '{1}'
+        apply: to_int
+      - pattern: '\b(?:ram|memory)\s*[:.]?\s*(\d{1,3})\s*gb\b'
+        value: '{1}'
+        apply: to_int
+    default: null
+
+  storage_gb:
+    from: title
+    rules:
+      - pattern: '(\d)\s*tb\s*(?:ssd|nvme|hdd|m\.?2)\b'
+        value: '{1}'
+        apply: tb_to_gb
+      - pattern: '(\d{3,4})\s*gb\s*(?:ssd|nvme|hdd|m\.?2)\b'
+        value: '{1}'
+        apply: to_int
+    default: null
+
+  touchscreen:
+    from: title
+    rules:
+      - pattern: '\btouch(screen)?\b'
+        value: true
+    default: false
+
+# ---------------------------------------------------------------------------
+# 4. DERIVE — cross-field inference. Runs after extract. Only fills nulls
+#    unless `overwrite: true`. This is what regex alone cannot do.
+# ---------------------------------------------------------------------------
+derive:
+  - field: generation
+    when: {cpu_family: amd-ryzen-4000}
+    value: "1"
+  - field: generation
+    when: {cpu_family: amd-ryzen-5000}
+    value: "2"
+  - field: generation
+    when: {cpu_family: intel-10th}
+    value: "1"
+  - field: generation
+    when: {cpu_family: intel-11th}
+    value: "2"
+
+  - field: cpu_vendor
+    when: {cpu_family: {startswith: amd}}
+    value: amd
+  - field: cpu_vendor
+    when: {cpu_family: {startswith: intel}}
+    value: intel
+
+# ---------------------------------------------------------------------------
+# 5. BUCKET — the unit of price comparison.
+# ---------------------------------------------------------------------------
+tiers:
+  ram_tier:
+    from: ram_gb
+    breaks:
+      - {max: 8,   label: "8"}
+      - {max: 16,  label: "16"}
+      - {max: 32,  label: "32"}
+      - {min: 33,  label: "64+"}
+  storage_tier:
+    from: storage_gb
+    breaks:
+      - {max: 256,  label: "256"}
+      - {max: 512,  label: "512"}
+      - {max: 1024, label: "1TB"}
+      - {min: 1025, label: "2TB+"}
+
+bucket_key: [generation, cpu_family, ram_tier, storage_tier]
+
+# Fields that MUST be non-null for a listing to contribute to a baseline.
+# Listings failing this are still alertable on price alone — they just
+# don't get a vote on what "normal" means. See design.md §5.2.
+bucket_require: [generation, cpu_family]
+
+# ---------------------------------------------------------------------------
+# 6. SCORING
+# ---------------------------------------------------------------------------
+scoring:
+  min_samples: 12              # below this, fall back to seed_baselines
+  target_percentile: 25
+  sanity_floor_pct: 25         # under this % of median => flag, do not alert
+  best_offer_weight: 0.85      # BIN with Best Offer is an anchor, not a price
+  include_shipping: true
+
+# ---------------------------------------------------------------------------
+# 7. SEED BASELINES — day-0 thresholds from the maintainer's own chart.
+#    Used until a bucket reaches scoring.min_samples. Partial matches allowed;
+#    most specific match wins.
+# ---------------------------------------------------------------------------
+seed_baselines:
+  - match: {generation: "1", cpu_family: intel-10th, ram_tier: "16", storage_tier: "512"}
+    p25: 220
+    p50: 280
+  - match: {generation: "2", cpu_family: intel-11th, ram_tier: "16", storage_tier: "512"}
+    p25: 300
+    p50: 380
+  - match: {generation: "2", cpu_family: amd-ryzen-5000, ram_tier: "16", storage_tier: "512"}
+    p25: 320
+    p50: 400
+  # Fallback for anything not listed above
+  - match: {}
+    p25: 250
+    p50: 350
+
+# ---------------------------------------------------------------------------
+# 8. ALERTS
+# ---------------------------------------------------------------------------
+alerts:
+  webhook_env: DISCORD_WEBHOOK_DEALS
+  realert_drop_pct: 8          # re-alert if BIN drops this much below last alert
+  cooldown_minutes: 60

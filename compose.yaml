@@ -1,0 +1,12 @@
+services:
+  dealwatch:
+    build: .
+    container_name: dealwatch
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "8087:8000"
+    volumes:
+      - ./data:/app/data
+      - ./profiles:/app/profiles:ro
