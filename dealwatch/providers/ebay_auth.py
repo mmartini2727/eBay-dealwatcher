@@ -57,27 +57,34 @@ class TokenManager:
         if self._owns_client:
             await self._client.aclose()
 
-    async def get_token(self, *, force_refresh: bool = False) -> str:
-        """Return a cached token, or mint one if it's stale or forced.
+    async def get_token(self, *, stale_token: str | None = None) -> str:
+        """Return a cached token, or mint one if it's stale or known-bad.
 
-        force_refresh exists so a caller that just got a 401 from eBay (the
-        cached token looked valid locally but eBay disagrees) can ask for a
-        guaranteed-fresh token and retry the request exactly once. If the
-        retry also fails, that's a real auth problem - the caller should let
-        the error propagate rather than looping.
+        stale_token exists so a caller that just got a 401 from eBay using a
+        specific token (the cached token looked valid locally but eBay
+        disagrees) can name that exact token as bad and retry once. It is
+        not a blanket "refresh unconditionally" flag: if another caller has
+        already refreshed past stale_token by the time this one gets the
+        lock, the current cached token is returned as-is rather than
+        minting again - N concurrent callers holding the same stale token
+        should produce one mint, not N.
         """
-        if not force_refresh and self._is_fresh():
+        if stale_token is None and self._is_fresh():
             assert self._token is not None
             return self._token
 
         async with self._lock:
-            # Re-check after acquiring the lock: another caller may have
-            # already refreshed while we were waiting on it. Skipped for
-            # force_refresh, since the whole point there is "mint me a
-            # token eBay hasn't already rejected."
-            if not force_refresh and self._is_fresh():
-                assert self._token is not None
+            if stale_token is None:
+                # Re-check after acquiring the lock: another caller may
+                # have already refreshed while we were waiting on it.
+                if self._is_fresh():
+                    assert self._token is not None
+                    return self._token
+            elif self._token is not None and self._token != stale_token:
+                # The token changed since the caller observed it as bad -
+                # someone else already refreshed it. Use that one.
                 return self._token
+
             await self._mint()
             assert self._token is not None
             return self._token
@@ -109,7 +116,7 @@ class TokenManager:
         )
         # Deliberately not caught here: a failed mint should propagate to
         # the caller rather than being retried in a loop or silently cached
-        # as a "success". See get_token()'s force_refresh docstring.
+        # as a "success". See get_token()'s stale_token docstring.
         response.raise_for_status()
 
         payload = response.json()

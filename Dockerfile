@@ -5,10 +5,19 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+
 COPY pyproject.toml ./
 COPY dealwatch ./dealwatch
+COPY tests ./tests
 
-RUN pip install --no-cache-dir .
+# data/ is a host bind mount; the host-side directory must also be
+# writable by uid 10001. See README operational notes.
+RUN pip install --no-cache-dir . \
+    && useradd --uid 10001 --create-home --shell /usr/sbin/nologin dealwatch \
+    && mkdir -p /app/data \
+    && chown -R dealwatch:dealwatch /app
+
+USER dealwatch
 
 EXPOSE 8000
 

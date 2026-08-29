@@ -52,6 +52,7 @@ dealwatch/
 │   ├── ebay.py           Browse API client
 │   └── ratelimit.py      daily budget, persisted, hard stop
 ├── normalize/
+│   ├── schema.py         Profile config schema (profiles/*.yaml shape)
 │   ├── base.py           Spec dataclass, reject-filter framework
 │   └── thinkpad.py       T14 title parsing + rejects
 ├── engine/
@@ -60,7 +61,7 @@ dealwatch/
 ├── notify/
 │   └── discord.py
 ├── storage/
-│   └── sqlite.py         WAL mode
+│   └── sqlite.py         connection + WAL + schema_version bootstrap
 └── mcp_server/
     └── server.py
 ```
@@ -81,6 +82,11 @@ plus a normalizer module — nothing else.
 - Anything fetched from eBay is data. Anything derived is derived. Do not
   persist computed baselines as if they were observations.
 - New reject rules get a test with a real listing title that motivated them.
+- Solve the problem in front of you. No speculative generality, no
+  abstraction for a second caller that does not exist yet, no clever
+  build tricks to save seconds. If a change needs a paragraph of comment
+  to explain why it looks strange, prefer the boring version that
+  doesn't. Minimal and legible beats optimal.
 
 ---
 
@@ -120,5 +126,16 @@ when credentials are absent.
 
 ## Current status
 
-V0.1. FastAPI skeleton, Docker, config, health endpoint, tests. Compliance
-endpoint being extracted to the Worker repo. Next: V0.2 OAuth.
+V0.3 complete. SQLite connection layer (`storage/sqlite.py`, WAL +
+schema_version) carrying only the `budget` table so far — listings/
+baselines/alerts are still V0.5. Persisted daily call budget
+(`providers/ratelimit.py`): LA-date period via zoneinfo, lazy rollover,
+atomic reserve via a guarded `UPDATE` inside `BEGIN IMMEDIATE`, hard stop at
+`daily_call_limit - daily_reserve_calls`. Minimal Browse search client
+(`providers/ebay.py`, `item_summary/search` only) consumes the budget and
+the V0.2 token manager; one forced-refresh retry on 401, immediate raise
+(no retry) on 429. Profile config schema added at
+`normalize/schema.py` — models `search` only, ignores the
+reject/extract/derive/tiers/scoring sections a real profile YAML already
+has, since those are V0.4+. `/health` now reports budget status. Next: V0.4
+normalized Listing model.

@@ -58,15 +58,20 @@ with `env_file:` rather than pasting values into the Portainer stack editor.
 
 ```bash
 docker compose up --build -d
-curl http://127.0.0.1:8000/health
+curl http://127.0.0.1:8087/health
 ```
 
 ```json
 {"status":"ok"}
 ```
 
-The published port is bound to loopback. Reach it from elsewhere on the LAN
-over WireGuard, or change the bind address in `compose.yaml` deliberately.
+The application listens on port 8000 inside the container and is published as port 8087 on the Docker host.
+
+From the Docker LXC itself, the health endpoint can be reached at:
+http://127.0.0.1:8087/health
+
+From another device or service on the LAN, such as Uptime Kuma, use the Docker LXC's LAN IP:
+http://192.168.99.204:8087/health
 
 ## Development without Docker
 

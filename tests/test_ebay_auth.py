@@ -161,22 +161,60 @@ async def _401_triggers_one_retry_then_propagates():
     assert token1 == "tok-1"
     assert calls == 1
 
-    # Caller got a 401 using tok-1 downstream and forces exactly one retry.
+    # Caller got a 401 using tok-1 downstream and names it as bad,
+    # triggering exactly one retry.
     with pytest.raises(httpx.HTTPStatusError):
-        await tm.get_token(force_refresh=True)
+        await tm.get_token(stale_token=token1)
     assert calls == 2
 
     # A failed mint must not corrupt the cache: the last good token is still
-    # served (without a network call) until something explicitly forces a
-    # refresh again.
+    # served (without a network call) until something explicitly names it
+    # as stale again.
     token_after_failure = await tm.get_token()
     assert token_after_failure == "tok-1"
     assert calls == 2
 
-    # And a second forced retry is a caller decision, not something
-    # TokenManager loops on internally - it tries once and propagates again.
+    # And a second retry is a caller decision, not something TokenManager
+    # loops on internally - it tries once and propagates again.
     with pytest.raises(httpx.HTTPStatusError):
-        await tm.get_token(force_refresh=True)
+        await tm.get_token(stale_token=token_after_failure)
     assert calls == 3
+
+    await client.aclose()
+
+
+def test_concurrent_stale_token_callers_mint_exactly_once():
+    asyncio.run(_concurrent_stale_token_callers_mint_exactly_once())
+
+
+async def _concurrent_stale_token_callers_mint_exactly_once():
+    # Regression test for the bug get_token(stale_token=...) replaced
+    # get_token(force_refresh=True) to fix: two callers that both got a 401
+    # using the SAME cached token should produce exactly one mint, not two -
+    # the second caller should see the first caller's fresh token and reuse
+    # it instead of minting again.
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            200, json={"access_token": f"tok-{calls}", "expires_in": 7200}
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    tm = TokenManager(make_settings(), client=client, clock=FakeClock())
+
+    stale = await tm.get_token()
+    assert stale == "tok-1"
+    assert calls == 1
+
+    token_a, token_b = await asyncio.gather(
+        tm.get_token(stale_token=stale),
+        tm.get_token(stale_token=stale),
+    )
+
+    assert token_a == token_b == "tok-2"
+    assert calls == 2  # one mint for the refresh, not one per caller
 
     await client.aclose()
