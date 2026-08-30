@@ -42,29 +42,36 @@ Prefers understanding failure modes over abstractions that hide them.
 
 ## Layout
 
+Files marked (V0.x) do not exist yet — the milestone that creates them is
+noted. Everything else is on disk today.
 ```
 dealwatch/
-├── config.py             pydantic-settings, injected via Depends
-├── main.py               FastAPI app — LAN only, /health + MCP mount
+├── config.py pydantic-settings, injected via Depends
+├── main.py FastAPI app — LAN only, /health
 ├── providers/
-│   ├── base.py           provider interface
-│   ├── ebay_auth.py      OAuth application token (TokenManager)
-│   ├── ebay.py           Browse API client
-│   └── ratelimit.py      daily budget, persisted, hard stop
+│ ├── base.py provider interface
+│ ├── ebay_auth.py OAuth application token (TokenManager)
+│ ├── ebay.py Browse API client — item_summary/search only
+│ └── ratelimit.py daily budget, persisted, hard stop
 ├── normalize/
-│   ├── schema.py         Profile config schema (profiles/*.yaml shape)
-│   ├── base.py           Spec dataclass, reject-filter framework
-│   └── thinkpad.py       T14 title parsing + rejects
+│ ├── schema.py profile YAML shape (models search: only so far)
+│ ├── listing.py Listing model + map_item_summary()
+│ ├── engine.py (V0.7) generic profile interpreter:
+│ │ reject → extract → derive → tiers → bucket_key
+│ ├── functions.py (V0.7) named transforms for apply: (to_int, tb_to_gb)
+│ └── explain.py (V0.7) CLI: trace one title through the pipeline
 ├── engine/
-│   ├── collector.py      poll → normalize → persist
-│   └── scoring.py        baselines → deal score
+│ ├── collector.py (V0.6) poll → persist raw → map → persist
+│ └── scoring.py (V0.8) baselines → deal score
 ├── notify/
-│   └── discord.py
+│ └── discord.py (V0.9)
 ├── storage/
-│   └── sqlite.py         connection + WAL + schema_version bootstrap
+│ └── sqlite.py connection + WAL + forward-only migrations
 └── mcp_server/
-    └── server.py
+└── server.py (V1.0) streamable HTTP, LAN only
 ```
+
+There is exactly one normalization engine and it is generic. Adding a target is a YAML file in `profiles/` — never a Python module. See locked decision #5.
 
 `profiles/*.yaml` defines what to hunt: query string, Browse filters, which
 normalizer, bucket keys, thresholds. Adding a new target should be a YAML file
@@ -127,6 +134,13 @@ deals. They also always vanish on schedule, so lifespan says nothing about
 price. V0.8 must either weight by distance-from-end-date or exclude auctions
 from baselines — decide with real data, and consider dropping AUCTION from
 the profile's buyingOptions.
+
+**Persist raw before mapping.** The collector writes `raw_json` first, then
+maps. A mapping failure becomes a row with raw data and null derived fields —
+re-mappable once the shape is understood. Mapping first and dropping failures
+loses history permanently: 5 of 150 live listings currently fail to map
+(auction-only, no `price` field), and that is 3% of comps gone for a bug that
+takes ten minutes to fix afterward.
 ---
 
 ## Testing

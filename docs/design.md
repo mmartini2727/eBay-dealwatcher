@@ -53,8 +53,21 @@ Three layers, in order of when they become available:
 
 **Known weakness of (3):** disappearance conflates *sold* with *ended early* or
 *pulled by seller*. `getItem` on a dead listing errors and does not disclose
-which. Mitigate by weighting listings that vanish well before their scheduled
-end date. Accept the noise; it is a deal finder, not an appraisal service.
+which.
+
+An earlier version of this document proposed weighting by how far before the
+scheduled end date a listing vanished. **That mitigation is not available.**
+Browse search returns `itemEndDate` only for auctions — measured live, 143 of
+145 listings had no end date, because fixed-price listings are Good 'Til
+Cancelled and have no scheduled end. Auctions do have one, but they always end
+on schedule, so the signal is worthless precisely where it exists. Per-listing
+`getItem` would cost the entire daily budget.
+
+**Decision: accept the noise.** Raw lifespan is still signal — 90 minutes vs.
+three weeks separates priced-to-sell from aspirational, whatever the reason for
+disappearance. If a discriminator is needed later, seller relisting the same
+title within hours is the most promising candidate. This is a deal finder, not
+an appraisal service.
 
 ### 2.2 Implication for build order
 
@@ -142,8 +155,10 @@ Do not "simplify" by folding the endpoint back into the FastAPI app.
 ```sql
 watches(id, name, query, filters_json, normalizer, enabled)
 
-listings(item_id PK, watch_id, title, price, ship, total, condition_id,
-         seller, buying_option, end_date, spec_json, bucket_key,
+listings(item_id PK, watch_id, title, price_cents, shipping_cents, total_cents,
+         condition_id, seller, seller_feedback_pct, seller_feedback_score,
+         buying_options, current_bid_cents, bid_count, end_date,
+         raw_json, spec_json, bucket_key,
          first_seen, last_seen, gone_at, lifespan_mins)
 
 baselines(watch_id, bucket_key, n, p10, p25, p50, computed_at)
@@ -159,6 +174,12 @@ alerts(item_id, watch_id, sent_at, price_at_alert)
 - `bucket_key` is the unit of price comparison. For ThinkPads it is at minimum
   `(model, generation, cpu_family)` and preferably includes RAM and storage
   tiers.
+  - **Money is integer cents.** Floats accumulate rounding error across percentile
+  math and "N% below last alert" comparisons.
+- `shipping_cents` NULL means **unknown**, not free. Free shipping is `0`.
+  ~15% of live listings carry no shipping cost. A NULL `total_cents` must be
+  excluded from baseline computation — same rule as an unparseable spec (§5.2).
+- `raw_json` is the untouched eBay response and is what makes every later stage re-runnable. It is a **snapshot, not a log** — one row per listing, so time-varying fields (`bidCount`, `currentBidPrice`) hold whatever they were at write time and cannot be reconstructed.
 
 ### 4.2 The listing history is the irreplaceable asset
 
@@ -182,10 +203,12 @@ project succeeds or fails. A naive price baseline over search results for
 - **Barebones** — "no RAM", "no SSD", "no HDD", "no OS", "no drive". These will
   drag bucket medians down hard and generate a stream of false deal alerts.
 - **For parts / AS-IS / cracked / bad battery / BIOS locked / no charger.**
-  Frequently *not* in the title — check condition ID and the sub-description.
+  Frequently *not* in the title. **Browse search does not return a subtitle** — measured live, 145 of 145 listings had none, so any reject rule matching on `subtitle` is dead. Full descriptions require `getItem` per listing, which the budget cannot afford. Condition ID therefore carries more weight than this section originally assumed, and title-only matching is the practical ceiling for text rejects.
 - **Lot listings** — "Lot of 5", "x5", "Bulk". One listing, N machines.
 - **Accessories** — docks, palmrests, keyboards, LCD assemblies, motherboards.
   All match a keyword search for "ThinkPad T14".
+- **Auction-only listings have no `price` field.** Browse returns
+  `currentBidPrice` instead. Measured live, 5 of 150. They are not junk, but a current bid is not an asking price and must never be mapped as one. See §5.5. 
 
 ### 5.2 Attribute extraction
 
@@ -207,6 +230,22 @@ missing reject rule — treat the queue as a to-do list.
 
 `buyingOptions` including BEST_OFFER means the listed price is an anchor, not a
 transaction price. Weight accordingly; do not let it pollute baselines.
+
+### 5.5 Auctions
+
+For `buyingOptions: ["AUCTION"]`, Browse omits `price` entirely and supplies
+`currentBidPrice`. For listings offering both AUCTION and FIXED_PRICE, `price`
+is the BIN and `currentBidPrice` is the live bid.
+
+`Listing` records both and reconciles neither. A current bid is an in-progress
+number, not an asking price, and treating it as one would drag bucket medians
+toward auction opening prices — the same poisoning mechanism as barebones
+listings, from the opposite direction.
+
+Open question for V0.8, to be decided with real data: weight auctions down,
+exclude them from baselines, or drop AUCTION from the profile's
+`buyingOptions` entirely. A Discord alert on an auction six days out is not
+actionable in any case.
 
 ---
 
