@@ -164,7 +164,7 @@ listings(
   seller_feedback_score INTEGER,
   condition_id  INTEGER,
   spec_json     TEXT,
-  spec_status   TEXT NOT NULL,          -- ok | partial | rejected | not_target
+  spec_status   TEXT NOT NULL,   -- pending | ok | partial | rejected | not_target | stale
   reject_rule_id TEXT,
   bucket_key    TEXT,
   first_seen    INTEGER NOT NULL,
@@ -210,11 +210,23 @@ Indexes: `observations(item_id, observed_at)`, `listings(bucket_key, gone_at)`.
 - Dedup on `item_id`. **Re-alert when price drops materially below the price we
   last alerted at** — sellers revise BINs downward and that is frequently the
   actual deal.
+- **`spec_status` vocabulary.** `pending` — never normalized (written by the
+  collector at V0.6, before the engine exists). `ok` — normalized, all
+  `bucket_require` fields present. `partial` — normalized, some fields null;
+  alertable but excluded from baselines (§5.2). `rejected` — matched a reject
+  rule; `reject_rule_id` names which. `not_target` — parsed as a different
+  machine. `stale` — was normalized, but the title has since changed and the
+  stored `spec_json` describes a listing that no longer exists.
+
+  `pending` and `stale` both mean "V0.7 must normalize this," but they are not
+  the same state: `pending` has never had a spec, `stale` has one that is
+  wrong. Collapsing them loses the ability to tell a first pass from a
+  re-parse, which is the only evidence you get about how often sellers edit
+  titles. 
 
 ### 4.2 Disappearance rules
 
-These are load-bearing. Getting them wrong produces a database that looks
-correct and is not.
+These are load-bearing. Getting them wrong produces a database that looks correct and is not.
 
 - **Only the sweep writes `last_seen`.** The 5-minute poll uses
   `sort=newlyListed` with an `itemStartDate` filter and returns only what is
@@ -238,7 +250,7 @@ correct and is not.
 
 ### 4.3 The listing history is the irreplaceable asset
 
-[unchanged]
+- Code can be rewritten. Three months of accumulated comps cannot. The SQLite file lives in the Docker LXC and is therefore in PBS, but SQLite inside a live LXC backup is not guaranteed consistent — take a periodic `VACUUM INTO` dump to the NAS as a second copy.
 
 ---
 
