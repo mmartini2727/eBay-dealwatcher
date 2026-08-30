@@ -138,6 +138,9 @@ Ship V0.6 even though the normalizer is a stub. Raw titles and prices are
 useful history, and persisting `raw_json` means the engine can be re-run over
 everything already collected once it exists.
 
+## Flow Chart 
+![dealwatch_pipeline_overview.svg](docs/dealwatch_pipeline_overview.svg)
+
 ## Operational notes
 
 - Add `/health` to Uptime Kuma. Separately add an **external** monitor against
