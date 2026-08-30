@@ -153,27 +153,42 @@ when credentials are absent.
 
 ## Current status
 
-**V0.3 complete.** Live-verified against the production keyset on the LXC.
+**V0.4 complete.** Live-verified against the production keyset on the LXC.
 
-- `storage/sqlite.py` — connection layer, WAL, forward-only migrations.
-  Only the `budget` table exists; listings/baselines/alerts are V0.5.
-- `providers/ratelimit.py` — persisted daily call budget. LA-date period via
-  zoneinfo, lazy rollover, atomic reserve via a guarded `UPDATE` inside
-  `BEGIN IMMEDIATE`, hard stop at `daily_call_limit - daily_reserve_calls`.
-  Opens a connection per call — the instance is shared across threads.
-- `providers/ebay.py` — `item_summary/search` only. Reserves budget per page
-  before any network call. One forced-refresh retry on 401, immediate raise
-  on 429. Returns partial results if the budget runs out mid-pagination.
-- `normalize/schema.py` — models the `search:` block only. Ignores
-  reject/extract/derive/tiers/scoring, which are V0.7.
-- Container runs as uid 10001. `data/` on the host must be owned by it.
-- `/health` reports budget status.
+- `normalize/listing.py` — `Listing` model + `map_item_summary()`. Money is
+  integer cents. Required: `item_id`, `title`, `price_cents`, `seen_at`
+  (tz-aware UTC). Everything else optional and forgiving — a missing nested
+  key yields None, never an exception, because a mapping exception at V0.6
+  means a dropped listing and lost history.
+- `shipping_cents` None means **unknown**, not free. Free is `0`. V0.8 must
+  exclude NULL `total_cents` from baselines, same rule as an unparseable spec.
+- Records `current_bid_cents` / `bid_count` (time-varying, unrecoverable from
+  `raw_json` later) and `seller_feedback_pct` / `seller_feedback_score`.
+  Reconciles nothing between `price` and `currentBidPrice` — that is a V0.8
+  scoring decision. See design.md §5.5.
+- `EbayBrowseProvider.search()` still returns `list[dict]`. Mapping is a
+  separate function the collector calls at V0.6, so the transport layer stays
+  thin and the mapper stays testable without HTTP.
 
-Live verification confirmed: filter grammar accepted by eBay, 3 pages =
-3 reservations, 134/150 items carried shipping costs, budget survived a
-container restart.
+Live run over 150 real listings: 145 mapped, 5 failed — all auction-only, which
+Browse returns with no `price` key at all. Cents conversion correct. Null rates:
+`subtitle` 145/145, `end_date` 143/145, `shipping_cents` 22/145,
+`seller_feedback_pct` 0/145.
 
-Next: V0.4 normalized `Listing` model.
+Those null rates changed two design assumptions — see design.md §2.1 (the
+end-date weighting mitigation is unavailable) and §5.1 (subtitle-based reject
+rules are dead).
+
+Next: V0.5 SQLite listing history.
+
+## Open items before V0.6
+
+- **V0.5 schema decision: one row per listing, or one row per observation?**
+  design.md §4.1 assumes per-listing with `first_seen`/`last_seen`, which makes
+  `raw_json` a snapshot. Since `end_date` is unavailable for 99% of listings,
+  raw lifespan is the whole survival signal — decide deliberately whether
+  per-listing is still the right shape.
+- Reject rules matching on `subtitle` in
 
 ## Open items before V0.6
 
