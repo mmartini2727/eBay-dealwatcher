@@ -75,34 +75,30 @@ class DailyBudget:
             (today, today),
         )
 
-    def reserve(self, n: int = 1) -> bool:
-        today = _today_la()
-        conn = self._connect()
-        try:
-            self._rollover_if_needed(conn, today)
+    def reserve(self) -> bool:
+    today = _today_la()
+    conn = self._connect()
+    try:
+        self._rollover_if_needed(conn, today)
 
-            # BEGIN IMMEDIATE takes the write lock up front (rather than on
-            # the first write inside the transaction), so a second
-            # connection attempting this at the same instant blocks here
-            # instead of racing past the WHERE check below. The guarded
-            # UPDATE itself is atomic without this - SQLite serializes
-            # writers regardless - but it's kept because it documents the
-            # intent (reserve-or-refuse as one unit) even though it isn't
-            # load-bearing here.
-            conn.execute("BEGIN IMMEDIATE")
-            try:
-                cur = conn.execute(
-                    "UPDATE budget SET used = used + ? "
-                    "WHERE id = 1 AND period = ? AND used + ? <= ?",
-                    (n, today, n, self._ceiling),
-                )
-                conn.execute("COMMIT")
-                return cur.rowcount == 1
-            except BaseException:
-                conn.execute("ROLLBACK")
-                raise
-        finally:
-            conn.close()
+        # BEGIN IMMEDIATE isn't load-bearing for the single guarded UPDATE
+        # below - SQLite serializes writers regardless. It's kept because it
+        # would become load-bearing if this were ever split into a read and
+        # a write.
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = conn.execute(
+                "UPDATE budget SET used = used + 1 "
+                "WHERE id = 1 AND period = ? AND used < ?",
+                (today, self._ceiling),
+            )
+            conn.execute("COMMIT")
+            return cur.rowcount == 1
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+    finally:
+        conn.close()
 
     def status(self) -> dict:
         today = _today_la()

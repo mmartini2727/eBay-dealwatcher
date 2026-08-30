@@ -62,8 +62,17 @@ curl http://127.0.0.1:8087/health
 ```
 
 ```json
-{"status":"ok"}
+ {
+    "status": "ok",
+    "budget": {
+        "period": "2026-08-29",
+        "used": 6,
+        "ceiling": 4750,
+        "remaining": 4744
+    }
+ } 
 ```
+> **Note:** `period` is the LA date the counter belongs to; `ceiling` is `daily_call_limit - daily_reserve_calls`.
 
 The application listens on port 8000 inside the container and is published as port 8087 on the Docker host.
 
@@ -72,6 +81,8 @@ http://127.0.0.1:8087/health
 
 From another device or service on the LAN, such as Uptime Kuma, use the Docker LXC's LAN IP:
 http://192.168.99.204:8087/health
+
+The published port binds all interfaces so LAN monitoring can reach it. The LXC is not port-forwarded and DealWatch has no authentication — this is a LAN-only service by design (see design.md §3.1).
 
 ## Development without Docker
 

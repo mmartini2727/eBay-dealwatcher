@@ -110,9 +110,14 @@ scheduled end date it vanished.
 **Re-alert on price drops.** Dedup on `item_id` alone misses BIN revisions,
 which are frequently the real deal.
 
-**SQLite history is irreplaceable.** Code is rewritable; three months of comps
-are not. `VACUUM INTO` a copy to the NAS periodically — a live LXC backup does
-not guarantee a consistent SQLite file.
+**SQLite history is irreplaceable.** Code is rewritable; three months of comps are not. `VACUUM INTO` a copy to the NAS periodically — a live LXC backup does not guarantee a consistent SQLite file.
+
+**"No OS" is not barebones.** The `barebones` reject rule's alternation
+includes `os`, so "16GB 256GB NVMe No OS" — a complete machine missing only a
+Windows license — gets rejected. Refurb sellers list this constantly and those
+listings are systematically cheaper, so rejecting the class removes the low end
+of every bucket and biases medians upward. Fix at V0.7: drop `os` from that
+alternation and extract it as an attribute instead.
 
 ---
 
@@ -126,16 +131,32 @@ when credentials are absent.
 
 ## Current status
 
-V0.3 complete. SQLite connection layer (`storage/sqlite.py`, WAL +
-schema_version) carrying only the `budget` table so far — listings/
-baselines/alerts are still V0.5. Persisted daily call budget
-(`providers/ratelimit.py`): LA-date period via zoneinfo, lazy rollover,
-atomic reserve via a guarded `UPDATE` inside `BEGIN IMMEDIATE`, hard stop at
-`daily_call_limit - daily_reserve_calls`. Minimal Browse search client
-(`providers/ebay.py`, `item_summary/search` only) consumes the budget and
-the V0.2 token manager; one forced-refresh retry on 401, immediate raise
-(no retry) on 429. Profile config schema added at
-`normalize/schema.py` — models `search` only, ignores the
-reject/extract/derive/tiers/scoring sections a real profile YAML already
-has, since those are V0.4+. `/health` now reports budget status. Next: V0.4
-normalized Listing model.
+**V0.3 complete.** Live-verified against the production keyset on the LXC.
+
+- `storage/sqlite.py` — connection layer, WAL, forward-only migrations.
+  Only the `budget` table exists; listings/baselines/alerts are V0.5.
+- `providers/ratelimit.py` — persisted daily call budget. LA-date period via
+  zoneinfo, lazy rollover, atomic reserve via a guarded `UPDATE` inside
+  `BEGIN IMMEDIATE`, hard stop at `daily_call_limit - daily_reserve_calls`.
+  Opens a connection per call — the instance is shared across threads.
+- `providers/ebay.py` — `item_summary/search` only. Reserves budget per page
+  before any network call. One forced-refresh retry on 401, immediate raise
+  on 429. Returns partial results if the budget runs out mid-pagination.
+- `normalize/schema.py` — models the `search:` block only. Ignores
+  reject/extract/derive/tiers/scoring, which are V0.7.
+- Container runs as uid 10001. `data/` on the host must be owned by it.
+- `/health` reports budget status.
+
+Live verification confirmed: filter grammar accepted by eBay, 3 pages =
+3 reservations, 134/150 items carried shipping costs, budget survived a
+container restart.
+
+Next: V0.4 normalized `Listing` model.
+
+## Open items before V0.6
+
+- **Raise `search.filters.price` in `profiles/thinkpad-t14.yaml`.** The search
+  filter is the only lossy stage — anything above the ceiling is never fetched
+  and cannot be backfilled. Gen 4/5 machines exceed $1200. Everything
+  downstream re-runs over `raw_json` and can be fixed later; this cannot.
+- Delete `reserve(n)`'s unused `n` parameter.
