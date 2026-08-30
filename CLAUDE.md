@@ -166,42 +166,50 @@ when credentials are absent.
 
 ## Current status
 
-**V0.4 complete.** Live-verified against the production keyset on the LXC.
+**V0.5 complete.** `storage/sqlite.py` extended with the `listings` and
+`observations` tables and the `record_sighting`/`record_sweep` write path
+(design.md §4.1, §4.2). No collector, scheduler, or normalize-engine wiring
+yet — those are V0.6/V0.7.
 
-- `normalize/listing.py` — `Listing` model + `map_item_summary()`. Money is
-  integer cents. Required: `item_id`, `title`, `price_cents`, `seen_at`
-  (tz-aware UTC). Everything else optional and forgiving — a missing nested
-  key yields None, never an exception, because a mapping exception at V0.6
-  means a dropped listing and lost history.
-- `shipping_cents` None means **unknown**, not free. Free is `0`. V0.8 must
-  exclude NULL `total_cents` from baselines, same rule as an unparseable spec.
-- Records `current_bid_cents` / `bid_count` (time-varying, unrecoverable from
-  `raw_json` later) and `seller_feedback_pct` / `seller_feedback_score`.
-  Reconciles nothing between `price` and `currentBidPrice` — that is a V0.8
-  scoring decision. See design.md §5.5.
-- `EbayBrowseProvider.search()` still returns `list[dict]`. Mapping is a
-  separate function the collector calls at V0.6, so the transport layer stays
-  thin and the mapper stays testable without HTTP.
+- `record_sighting` inserts on first sight, otherwise compares the incoming
+  values against **the most recent observation row**, in Python (`NULL !=
+  NULL` in SQL, so a WHERE-clause comparison would flag every
+  unknown-shipping listing as changed on every poll). Writes a new
+  observation only on a watched-field change: `title`, `price_cents`,
+  `shipping_cents`, `buying_options`. A title change also nulls
+  `spec_json`/`bucket_key` and sets `spec_status = 'stale'` so V0.7
+  re-normalizes it. Never writes `last_seen`.
+- `record_sweep` is the only thing that writes `last_seen`. It increments
+  `miss_count` on a miss, resets it to 0 on any sighting, and sets
+  `gone_at = last_seen` (not detection time) once `miss_count` reaches
+  `MISS_THRESHOLD = 3`. One transaction per sweep, not one per row.
+- **`record_sighting`/`record_sweep` take `conn` as their first argument;
+  `DailyBudget` (`providers/ratelimit.py`) opens a connection per call
+  instead.** V0.6's collector owns one connection and passes it into every
+  call — it must not open a fresh one per item the way `DailyBudget` does.
+- **Rows from `storage.connect()` are `sqlite3.Row`, not tuples.** Use
+  `dict(row)` when printing/logging one, and `row["column"]` for named
+  access. Tuple-unpacking (`a, b = row`) still works, but `row == (1, 2)`
+  does not.
+- **Two clocks, one call site.** `map_item_summary(item, seen_at)` takes a
+  tz-aware UTC `datetime`; `record_sighting`/`record_sweep` take integer
+  Unix seconds. V0.6's collector is the one place both get called back to
+  back — convert explicitly (e.g. `int(seen_at.timestamp())`), don't let
+  one type drift in as the other's.
+- **`total_cents` is not a `Listing` field — V0.6 has to compute it before
+  calling `record_sighting`.** NULL `shipping_cents` must produce a NULL
+  `total_cents`, never `price_cents + 0`. This is the one that silently
+  biases baselines low: a listing with unresolved shipping would look
+  cheaper than it actually is, and enough of those in one bucket drags the
+  whole median down.
+- **`buying_options` is a `list[str]` on `Listing`, `TEXT` in the DB.**
+  `record_sighting` serializes it with `json.dumps` and compares the
+  deserialized list back in Python. Serialize it the same way at every call
+  site — a different serialization (sorted vs. insertion order, comma-join
+  instead of JSON) makes two logically identical lists compare unequal, and
+  change-detection fires a spurious observation on every single poll.
 
-Live run over 150 real listings: 145 mapped, 5 failed — all auction-only, which
-Browse returns with no `price` key at all. Cents conversion correct. Null rates:
-`subtitle` 145/145, `end_date` 143/145, `shipping_cents` 22/145,
-`seller_feedback_pct` 0/145.
-
-Those null rates changed two design assumptions — see design.md §2.1 (the
-end-date weighting mitigation is unavailable) and §5.1 (subtitle-based reject
-rules are dead).
-
-Next: V0.5 SQLite listing history.
-
-## Open items before V0.6
-
-- **V0.5 schema decision: one row per listing, or one row per observation?**
-  design.md §4.1 assumes per-listing with `first_seen`/`last_seen`, which makes
-  `raw_json` a snapshot. Since `end_date` is unavailable for 99% of listings,
-  raw lifespan is the whole survival signal — decide deliberately whether
-  per-listing is still the right shape.
-- Reject rules matching on `subtitle` in
+Next: V0.6 collector loop (poll → persist raw → map → persist).
 
 ## Open items before V0.6
 
@@ -209,4 +217,10 @@ Next: V0.5 SQLite listing history.
   filter is the only lossy stage — anything above the ceiling is never fetched
   and cannot be backfilled. Gen 4/5 machines exceed $1200. Everything
   downstream re-runs over `raw_json` and can be fixed later; this cannot.
+- **Decide who owns the SQLite connection.** V0.6 runs a collector loop
+  alongside FastAPI. `record_sighting`/`record_sweep` take a `conn`;
+  `DailyBudget` opens one per call. A single connection shared between a
+  background task and request handlers hits SQLite's threading rules. Settle
+  this at the top of the V0.6 session, not in a traceback.
+- Reject rules matching on `subtitle` in `profiles/thinkpad-t14.yaml` are dead weight — Browse returns no subtitle. Remove or repoint at V0.7.
 - Delete `reserve(n)`'s unused `n` parameter.

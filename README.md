@@ -127,8 +127,8 @@ be recovered.
 | V0.2 | eBay OAuth (client credentials, token cache) | done |
 | V0.3 | Browse API search + persisted rate-limit budget | done |
 | V0.4 | Normalized `Listing` model | done |
-| V0.5 | SQLite + listing history (WAL) | next |
-| V0.6 | **Dumb collector loop — poll and persist, no scoring** | |
+| V0.5 | SQLite + listing history (WAL) | done |
+| V0.6 | **Dumb collector loop — poll and persist, no scoring** | next |
 | V0.7 | ThinkPad T14 profile + normalize engine | |
 | V0.8 | Scoring engine | |
 | V0.9 | Discord alerts | |
