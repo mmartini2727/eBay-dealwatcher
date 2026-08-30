@@ -24,6 +24,10 @@ class Settings(BaseSettings):
 
     log_level: str = "INFO"
 
+    # Which profiles/*.yaml the collector runs. Not a schema change -
+    # Profile itself is unmodified; this just points at a file for it.
+    profile_path: str = "profiles/thinkpad-t14.yaml"
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

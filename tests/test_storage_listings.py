@@ -130,6 +130,49 @@ def test_title_change_writes_observation_and_marks_spec_stale(tmp_path):
     assert row["bucket_key"] is None
 
 
+def test_insert_with_explicit_spec_status_pending_stores_pending(tmp_path):
+    conn = make_conn(tmp_path)
+
+    record_sighting(
+        conn,
+        "item-1",
+        listing_fields(spec_status="pending"),
+        observation_fields(),
+        1000,
+    )
+
+    row = conn.execute(
+        "SELECT spec_status FROM listings WHERE item_id = 'item-1'"
+    ).fetchone()
+    assert row["spec_status"] == "pending"
+
+
+def test_insert_with_spec_status_omitted_defaults_to_pending(tmp_path):
+    conn = make_conn(tmp_path)
+
+    # listing_fields() here carries no spec_status key at all - the default
+    # must come from record_sighting, not from a value the test supplied.
+    record_sighting(conn, "item-1", listing_fields(), observation_fields(), 1000)
+
+    row = conn.execute(
+        "SELECT spec_status FROM listings WHERE item_id = 'item-1'"
+    ).fetchone()
+    assert row["spec_status"] == "pending"
+
+
+def test_insert_with_spec_status_ok_is_not_overridden(tmp_path):
+    conn = make_conn(tmp_path)
+
+    record_sighting(
+        conn, "item-1", listing_fields(spec_status="ok"), observation_fields(), 1000
+    )
+
+    row = conn.execute(
+        "SELECT spec_status FROM listings WHERE item_id = 'item-1'"
+    ).fetchone()
+    assert row["spec_status"] == "ok"
+
+
 def test_fast_poll_sighting_does_not_advance_last_seen(tmp_path):
     conn = make_conn(tmp_path)
 

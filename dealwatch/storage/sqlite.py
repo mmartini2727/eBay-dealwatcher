@@ -155,7 +155,8 @@ def record_sighting(
 
     listing_fields keys: profile_id (str), title (str), seller (str|None),
     seller_feedback_pct (float|None), seller_feedback_score (int|None),
-    condition_id (int|None).
+    condition_id (int|None), spec_status (str, optional - only consulted on
+    insert; defaults to 'pending' if omitted, meaning "never normalized").
 
     observation_fields keys: price_cents, shipping_cents, total_cents,
     current_bid_cents, bid_count (all int|None), buying_options (list[str]),
@@ -172,6 +173,17 @@ def record_sighting(
         ).fetchone()
 
         if existing is None:
+            # 'pending' means "never normalized" - distinct from 'stale'
+            # ("was normalized, title has since changed", design.md §4.1),
+            # which is never true for a listing's very first sighting. A
+            # caller that already knows better (e.g. a backfill) can pass
+            # its own spec_status; this only supplies the default.
+            # 'pending' means "never normalized" - distinct from 'stale'
+            # ("was normalized, title has since changed", design.md §4.1),
+            # which is never true for a listing's very first sighting. A
+            # caller that already knows better (e.g. a backfill) can pass
+            # its own spec_status; this only supplies the default.
+            spec_status = listing_fields.get("spec_status", "pending")
             conn.execute(
                 """
                 INSERT INTO listings (
@@ -179,7 +191,7 @@ def record_sighting(
                     seller_feedback_score, condition_id, spec_json,
                     spec_status, reject_rule_id, bucket_key,
                     first_seen, last_seen, miss_count, gone_at, lifespan_mins
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'stale', NULL, NULL,
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, NULL,
                           ?, ?, 0, NULL, NULL)
                 """,
                 (
@@ -190,6 +202,7 @@ def record_sighting(
                     listing_fields.get("seller_feedback_pct"),
                     listing_fields.get("seller_feedback_score"),
                     listing_fields.get("condition_id"),
+                    spec_status,
                     seen_at,
                     seen_at,
                 ),
