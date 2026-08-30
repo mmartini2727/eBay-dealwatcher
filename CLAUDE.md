@@ -94,6 +94,19 @@ plus a normalizer module — nothing else.
   build tricks to save seconds. If a change needs a paragraph of comment
   to explain why it looks strange, prefer the boring version that
   doesn't. Minimal and legible beats optimal.
+- **Two different connection-ownership patterns exist in `storage/` on
+  purpose — don't merge them.** `DailyBudget` (`providers/ratelimit.py`)
+  opens and closes its own connection per call, because it's a
+  `lru_cache`d singleton shared across uvicorn's threadpool and
+  `asyncio.to_thread` calls — a connection can't safely be reused across
+  those threads. `record_sighting`/`record_sweep`
+  (`storage/sqlite.py`) instead take an already-open `conn` as their first
+  argument, because V0.6's collector is a single long-lived loop calling
+  them many times per poll/sweep — reopening a connection (and re-running
+  the migration check) per item would be wasted work for no safety benefit.
+  V0.6's collector should open one connection at startup and pass it in;
+  it should not instantiate a `DailyBudget`-style per-call wrapper around
+  the listings/observations write path.
 
 ---
 
