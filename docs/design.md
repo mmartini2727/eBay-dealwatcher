@@ -44,12 +44,11 @@ Three layers, in order of when they become available:
 2. **Active-asking-price statistics (day 0).** Percentiles over currently listed
    prices for a bucket. Weak — asking prices are aspirational and skew high —
    but requires no history.
-3. **Survival-derived baseline (week 4+).** The real one. Persist every listing
-   seen, record when it stops appearing in results, and derive `lifespan`. A
-   listing that vanishes quickly was probably priced to sell. The distribution
-   of prices for fast-disappearing listings in a bucket is a better answer to
-   "what price gets sniped" than sold comps would be, because that is the
-   question we actually care about.
+3. **Survival-derived baseline (week 4+).** The real one. Persist every listing seen, record every change to its price, and record when it stops appearing. **Lifespan is a property of a price, not of a listing.** A listing that sat at $340 for eleven days, was cut to $310, then cut to $290 and vanished the next morning is three observations: two slow prices and one fast one. The thing we want to know — what price gets sniped — is answered by the last of those, and storing only the listing's endpoints would file the whole 23-day lifespan against $290 and conclude the opposite.
+
+   That error is directional, not noisy. Every price cut becomes evidence that the reduced price was slow to sell, which is exactly backwards. This is why listing history is split across two tables — see §4.1.
+
+   The distribution of prices for fast-disappearing *observations* in a bucket is a better answer to "what price gets sniped" than sold comps would be, because that is the question we actually care about.
 
 **Known weakness of (3):** disappearance conflates *sold* with *ended early* or
 *pulled by seller*. `getItem` on a dead listing errors and does not disclose
@@ -59,15 +58,15 @@ An earlier version of this document proposed weighting by how far before the
 scheduled end date a listing vanished. **That mitigation is not available.**
 Browse search returns `itemEndDate` only for auctions — measured live, 143 of
 145 listings had no end date, because fixed-price listings are Good 'Til
-Cancelled and have no scheduled end. Auctions do have one, but they always end
-on schedule, so the signal is worthless precisely where it exists. Per-listing
-`getItem` would cost the entire daily budget.
+Cancelled and have no scheduled end. Auctions do have one, but they always end on schedule, so the signal is worthless precisely where it exists. Per-listing `getItem` would cost the entire daily budget.
 
 **Decision: accept the noise.** Raw lifespan is still signal — 90 minutes vs.
-three weeks separates priced-to-sell from aspirational, whatever the reason for
-disappearance. If a discriminator is needed later, seller relisting the same
-title within hours is the most promising candidate. This is a deal finder, not
-an appraisal service.
+three weeks separates priced-to-sell from aspirational, whatever the reason for disappearance. If a discriminator is needed later, seller relisting the same title within hours is the most promising candidate. This is a deal finder, not an appraisal service.
+
+Resolution note: absence can only be established by the hourly sweep (§7), so
+lifespan resolution is one hour. A listing that appears and sells in twenty
+minutes records as ≤1h. Adequate for separating priced-to-sell from
+aspirational; finer resolution costs rate budget.
 
 ### 2.2 Implication for build order
 
@@ -155,38 +154,91 @@ Do not "simplify" by folding the endpoint back into the FastAPI app.
 ```sql
 watches(id, name, query, filters_json, normalizer, enabled)
 
-listings(item_id PK, watch_id, title, price_cents, shipping_cents, total_cents,
-         condition_id, seller, seller_feedback_pct, seller_feedback_score,
-         buying_options, current_bid_cents, bid_count, end_date,
-         raw_json, spec_json, bucket_key,
-         first_seen, last_seen, gone_at, lifespan_mins)
+-- identity + current state. One row per item_id, updated in place.
+listings(
+  item_id       TEXT PRIMARY KEY,
+  profile_id    TEXT NOT NULL,
+  title         TEXT NOT NULL,          -- current; a change re-triggers normalize
+  seller        TEXT,
+  seller_feedback_pct REAL,
+  seller_feedback_score INTEGER,
+  condition_id  INTEGER,
+  spec_json     TEXT,
+  spec_status   TEXT NOT NULL,          -- ok | partial | rejected | not_target
+  reject_rule_id TEXT,
+  bucket_key    TEXT,
+  first_seen    INTEGER NOT NULL,
+  last_seen     INTEGER NOT NULL,       -- heartbeat; SWEEP ONLY
+  miss_count    INTEGER NOT NULL DEFAULT 0,
+  gone_at       INTEGER,                -- = last_seen, not detection time
+  lifespan_mins INTEGER
+)
+
+-- append-only. One row on first sight, one per watched-field change.
+observations(
+  id                INTEGER PRIMARY KEY,
+  item_id           TEXT NOT NULL REFERENCES listings(item_id),
+  observed_at       INTEGER NOT NULL,
+  price_cents       INTEGER,
+  shipping_cents    INTEGER,            -- NULL = unknown, 0 = free
+  total_cents       INTEGER,
+  buying_options    TEXT,
+  current_bid_cents INTEGER,
+  bid_count         INTEGER,
+  raw_json          TEXT NOT NULL
+)
 
 baselines(watch_id, bucket_key, n, p10, p25, p50, computed_at)
-
 alerts(item_id, watch_id, sent_at, price_at_alert)
 ```
 
+Indexes: `observations(item_id, observed_at)`, `listings(bucket_key, gone_at)`.
+
 - `PRAGMA journal_mode=WAL` at init. The collector writes while the MCP server
   reads; WAL keeps readers from blocking.
-- Dedup on `item_id`. **Re-alert when price drops materially below the price we
-  last alerted at** — sellers revise BINs downward and that is frequently the
-  actual deal.
-- `bucket_key` is the unit of price comparison. For ThinkPads it is at minimum
-  `(model, generation, cpu_family)` and preferably includes RAM and storage
-  tiers.
-  - **Money is integer cents.** Floats accumulate rounding error across percentile
-  math and "N% below last alert" comparisons.
+- **Money is integer cents.** Floats accumulate rounding error across
+  percentile math and "N% below last alert" comparisons.
 - `shipping_cents` NULL means **unknown**, not free. Free shipping is `0`.
   ~15% of live listings carry no shipping cost. A NULL `total_cents` must be
   excluded from baseline computation — same rule as an unparseable spec (§5.2).
-- `raw_json` is the untouched eBay response and is what makes every later stage re-runnable. It is a **snapshot, not a log** — one row per listing, so time-varying fields (`bidCount`, `currentBidPrice`) hold whatever they were at write time and cannot be reconstructed.
+- **`raw_json` lives on the observation, not the listing.** Sellers edit titles.
+  When that happens the stored `spec_json` silently describes a machine the
+  listing no longer claims to be. `title` is therefore a watched field: a change
+  writes an observation *and* re-triggers normalization. `raw_json` per
+  observation is the input that produced each spec — that is the re-runnability
+  that matters, not price history, which normalization never reads.
+- Dedup on `item_id`. **Re-alert when price drops materially below the price we
+  last alerted at** — sellers revise BINs downward and that is frequently the
+  actual deal.
 
-### 4.2 The listing history is the irreplaceable asset
+### 4.2 Disappearance rules
 
-Code can be rewritten. Three months of accumulated comps cannot. The SQLite
-file lives in the Docker LXC and is therefore in PBS, but SQLite inside a live
-LXC backup is not guaranteed consistent — take a periodic `VACUUM INTO` dump to
-the NAS as a second copy.
+These are load-bearing. Getting them wrong produces a database that looks
+correct and is not.
+
+- **Only the sweep writes `last_seen`.** The 5-minute poll uses
+  `sort=newlyListed` with an `itemStartDate` filter and returns only what is
+  new. A listing absent from that result set has told you *nothing*. If the
+  collector treats fast-poll absence as absence, it will mark every existing
+  listing gone within five minutes of starting — and the rows will still land
+  and the lifespans will still compute.
+- **N consecutive sweep misses before `gone_at`.** eBay's search index is not
+  perfectly consistent; listings drop out of a sweep and return. Setting
+  `gone_at` on first absence manufactures short lifespans, which land in exactly
+  the bucket the survival baseline weighs most heavily. `miss_count` increments
+  on a sweep miss, resets to 0 on any sighting, and `gone_at` is set at
+  N=3.
+- **`gone_at = last_seen`, not detection time.** Otherwise every lifespan
+  carries the full detection delay (N sweeps ≈ 3h) as a constant error.
+- **Resurrection means N is too low.** If an item with `gone_at` set ◊reappears,
+  clear `gone_at`, `lifespan_mins`, and `miss_count`, and log at WARNING. A
+  relist normally gets a new `item_id`; the same one returning is index
+  inconsistency that outlasted the threshold. Count these — they are the only
+  evidence you get about whether N=3 is right.
+
+### 4.3 The listing history is the irreplaceable asset
+
+[unchanged]
 
 ---
 
