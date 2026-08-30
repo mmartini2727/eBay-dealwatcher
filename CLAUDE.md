@@ -119,6 +119,14 @@ listings are systematically cheaper, so rejecting the class removes the low end
 of every bucket and biases medians upward. Fix at V0.7: drop `os` from that
 alternation and extract it as an attribute instead.
 
+**Auction prices are not BIN prices.** For AUCTION listings `price` is the
+current bid; with both AUCTION and FIXED_PRICE it's the BIN and
+`currentBidPrice` is the bid. Auctions start near zero, so including them in
+bucket percentiles drags medians down and makes ordinary listings score as
+deals. They also always vanish on schedule, so lifespan says nothing about
+price. V0.8 must either weight by distance-from-end-date or exclude auctions
+from baselines — decide with real data, and consider dropping AUCTION from
+the profile's buyingOptions.
 ---
 
 ## Testing

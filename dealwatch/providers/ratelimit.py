@@ -76,29 +76,29 @@ class DailyBudget:
         )
 
     def reserve(self) -> bool:
-    today = _today_la()
-    conn = self._connect()
-    try:
-        self._rollover_if_needed(conn, today)
-
-        # BEGIN IMMEDIATE isn't load-bearing for the single guarded UPDATE
-        # below - SQLite serializes writers regardless. It's kept because it
-        # would become load-bearing if this were ever split into a read and
-        # a write.
-        conn.execute("BEGIN IMMEDIATE")
+        today = _today_la()
+        conn = self._connect()
         try:
-            cur = conn.execute(
-                "UPDATE budget SET used = used + 1 "
-                "WHERE id = 1 AND period = ? AND used < ?",
-                (today, self._ceiling),
-            )
-            conn.execute("COMMIT")
-            return cur.rowcount == 1
-        except BaseException:
-            conn.execute("ROLLBACK")
-            raise
-    finally:
-        conn.close()
+            self._rollover_if_needed(conn, today)
+
+            # BEGIN IMMEDIATE isn't load-bearing for the single guarded UPDATE
+            # below - SQLite serializes writers regardless. It's kept because it
+            # would become load-bearing if this were ever split into a read and
+            # a write.
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = conn.execute(
+                    "UPDATE budget SET used = used + 1 "
+                    "WHERE id = 1 AND period = ? AND used < ?",
+                    (today, self._ceiling),
+                )
+                conn.execute("COMMIT")
+                return cur.rowcount == 1
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+        finally:
+            conn.close()
 
     def status(self) -> dict:
         today = _today_la()
