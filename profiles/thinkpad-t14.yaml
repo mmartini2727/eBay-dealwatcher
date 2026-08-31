@@ -23,8 +23,8 @@ search:
     - "177"          # PC Laptops & Netbooks
 
   filters:
-    conditionIds: [2000, 2500, 3000]     # cert refurb, seller refurb, used
-    buyingOptions: [FIXED_PRICE, AUCTION, BEST_OFFER]
+    conditionIds: [2000, 2500, 3000]     # cert refurb, seller refurb, used, auction removed
+    buyingOptions: [FIXED_PRICE, BEST_OFFER]
     price: [80, 1200]
     priceCurrency: USD
     itemLocationCountry: US
