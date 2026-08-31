@@ -1,5 +1,20 @@
   - Lenovo ThinkPad T14 Gen 1 Core i5-10310U @1.70GHz, 16GB RAM , 256GB SSD
   - Lenovo ThinkPad T14 Gen 1 i5-10310U 1.7GHz 16GB 256GB NVMe 14" No OS: Fair
-  - LENOVO THINKPAD T14 GEN 1 Core i7  NO HDD/OS  Motherboard Laptop 
+  - LENOVO THINKPAD T14 GEN 1 Core i7  NO HDD/OS  Motherboard Laptop
   - LENOVO THINKPAD T14s GEN 2a Ryzen 7 PRO 5850U 1.9GHz 16GB 256GB TOUCH - NO OS
   - Lenovo ThinkPad T14s Gen 3 14" Touch Intel i7-1280P 32GB 1TB Win 11 No AC
+
+  # V0.7 additions below: illustrative titles in the same style as the live
+  # pulls above, added to motivate reject/require rules and cpu_family
+  # patterns that had no real example on file yet - not a new live scrape.
+  - Lenovo ThinkPad T14 Gen 2 i5-1135G7 16GB 256GB - Cracked Screen AS IS
+  - Lot of 5 Lenovo ThinkPad T14 Gen 1 i5 8GB 256GB - Untested
+  - Lenovo ThinkPad T14 Docking Station USB-C Dock Only
+  - Lenovo ThinkPad T480 Core i5-8350U 16GB 256GB SSD
+  - Lenovo ThinkPad T14 Gen 1 16GB 256GB SSD - For Parts Not Working
+  - Lenovo ThinkPad T14 Gen 4 Intel Core Ultra 5 135U 16GB 512GB
+  - Lenovo ThinkPad T14 Gen 6 Intel Core Ultra 7 265H 32GB 1TB
+  - Lenovo ThinkPad T14 Gen 3 AMD Ryzen 5 PRO 6650U 16GB 256GB
+  - Lenovo ThinkPad T14 Gen 4 AMD Ryzen 7 PRO 7840U 32GB 512GB
+  - Lenovo ThinkPad T14 Gen 5 AMD Ryzen 7 PRO 8840U 32GB 1TB
+  - Lenovo ThinkPad T14 Gen 6 AMD Ryzen AI 7 PRO 360 32GB 1TB

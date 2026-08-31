@@ -12,10 +12,13 @@ import pytest
 
 from dealwatch.normalize.listing import ListingMappingError, map_item_summary
 
-TITLES = (
-    Path(__file__).parent / "fixtures" / "titles.txt"
-).read_text().strip().splitlines()
-TITLES = [line.strip().lstrip("- ").strip() for line in TITLES]
+def _load_titles() -> list[str]:
+    lines = (Path(__file__).parent / "fixtures" / "titles.txt").read_text().splitlines()
+    titles = (line.strip().lstrip("- ").strip() for line in lines)
+    return [t for t in titles if t and not t.startswith("#")]
+
+
+TITLES = _load_titles()
 
 SEEN_AT = datetime(2026, 8, 29, 12, 0, tzinfo=timezone.utc)
 

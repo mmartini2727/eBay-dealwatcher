@@ -25,7 +25,12 @@ search:
   filters:
     conditionIds: [2000, 2500, 3000]     # cert refurb, seller refurb, used, auction removed
     buyingOptions: [FIXED_PRICE, BEST_OFFER]
-    price: [80, 1200]
+    # Raised from 1200: the search filter is the only lossy stage — a
+    # listing never fetched cannot be backfilled from raw_json later.
+    # Truncating at 1200 would compute Gen 5/6 medians from the bottom
+    # tail only, biasing p25 low and under-alerting on those buckets. The
+    # buying ceiling belongs in alerts.max_price_usd below, not here.
+    price: [80, 2000]
     priceCurrency: USD
     itemLocationCountry: US
 
@@ -35,8 +40,11 @@ search:
     sort: newlyListed
 
 # ---------------------------------------------------------------------------
-# 2. REJECT — runs BEFORE extraction. Order matters; first match wins.
-#    Anything rejected never reaches the baseline. See design.md §5.1.
+# 2. REJECT — runs BEFORE require, deliberately: `\bT14\b` does not match
+#    "T14s" (no word boundary between "4" and "s"), so require-first would
+#    classify every T14s listing as not_target and the t14s-not-t14 rule
+#    below would report zero hits forever. First match wins; the rest are
+#    not evaluated. See design.md §5.1.
 # ---------------------------------------------------------------------------
 reject:
   - id: t14s-not-t14
@@ -50,8 +58,11 @@ reject:
     in: [7000]
     reason: "For parts or not working"
 
+  # title only, not subtitle: Browse returns no subtitle - measured live,
+  # 145 of 145 listings had none (design.md §5.1). A subtitle match here
+  # was dead code by accident, before the engine existed to notice.
   - id: for-parts-text
-    where: [title, subtitle]
+    where: title
     any:
       - 'for\s+parts'
       - '\bparts\s+only\b'
@@ -61,12 +72,18 @@ reject:
       - '\bcracked\b'
       - '\bbad\s+battery\b'
       - '\bno\s+power\b'
+    reason: "For parts, as-is, or otherwise not working"
 
   - id: barebones
-    where: [title, subtitle]
+    where: title
     any:
       - '\bbarebones?\b'
-      - '\bno\s+(ram|ssd|hdd|memory|storage|drive|os)\b'
+      # `os` deliberately excluded: "16GB 256GB NVMe No OS" is a complete
+      # machine missing only a Windows license, not a barebones unit, and
+      # is systematically cheaper - rejecting the class removed the low
+      # end of every bucket and biased medians upward. See CLAUDE.md and
+      # the no_os extract field below.
+      - '\bno\s+(ram|ssd|hdd|memory|storage|drive)\b'
       - '\bno\s+hard\s+drive\b'
       - '\bw/?o\s+(ram|ssd|hdd)\b'
     reason: "Drags bucket medians down hard; primary source of false alerts"
@@ -95,6 +112,17 @@ reject:
     reason: "Matches the keyword search but is not the machine"
 
 # ---------------------------------------------------------------------------
+# 2b. REQUIRE — runs after reject, before extraction. All rules must match;
+#     failing any one means not_target (design.md §5.2).
+# ---------------------------------------------------------------------------
+require:
+  - id: is-t14
+    where: title
+    any:
+      - '\bT14\b'
+    reason: "Browse query_exclude is best-effort; T13/X13/T480 come back"
+
+# ---------------------------------------------------------------------------
 # 3. EXTRACT — ordered rules per field, first match wins.
 #    Capture groups referenced as {1}, {2}. `apply` names a function from
 #    normalize/functions.py.
@@ -103,9 +131,9 @@ extract:
   generation:
     from: title
     rules:
-      - pattern: '\bgen\s*([1-5])\b'
+      - pattern: '\bgen\s*([1-6])\b'
         value: '{1}'
-      - pattern: '\bg([1-5])\b'
+      - pattern: '\bg([1-6])\b'
         value: '{1}'
     default: null
 
@@ -121,6 +149,18 @@ extract:
         value: amd-ryzen-4000
       - pattern: '\bryzen\s*[3579]\s*5\d{3}'
         value: amd-ryzen-5000
+      # "Ryzen AI" model names carry their own series digit after "AI"
+      # (e.g. "Ryzen AI 9 365") - this must be checked before the
+      # digit-series patterns below so an AI chip is never misread as a
+      # plain 6000/7000/8000-series part.
+      - pattern: '\bryzen\s*ai\b'
+        value: amd-ryzen-ai
+      - pattern: '\bryzen\s*[3579]\s*(?:pro\s*)?6\d{3}'
+        value: amd-ryzen-6000
+      - pattern: '\bryzen\s*[3579]\s*(?:pro\s*)?7\d{3}'
+        value: amd-ryzen-7000
+      - pattern: '\bryzen\s*[3579]\s*(?:pro\s*)?8\d{3}'
+        value: amd-ryzen-8000
       # Intel — 4-digit model numbers, 10th gen onward
       - pattern: '\bi[3579][\s-]?10\d{2,3}'
         value: intel-10th
@@ -130,6 +170,11 @@ extract:
         value: intel-12th
       - pattern: '\bi[3579][\s-]?13\d{2,3}'
         value: intel-13th
+      # Core Ultra replaced the iX naming from Meteor Lake onward
+      - pattern: '\bultra\s*[3579]\s*1\d{2}'
+        value: intel-ultra-1
+      - pattern: '\bultra\s*[3579]\s*2\d{2}'
+        value: intel-ultra-2
     default: null
 
   ram_gb:
@@ -163,6 +208,16 @@ extract:
         value: true
     default: false
 
+  # Not in bucket_key on purpose: whether "no OS" deserves its own bucket
+  # is a V0.8 decision to be made with data, and adding it now doubles
+  # bucket count against a min_samples of 12 we may already not reach.
+  no_os:
+    from: title
+    rules:
+      - pattern: '\bno\s+(os|operating\s+system)\b'
+        value: true
+    default: false
+
 # ---------------------------------------------------------------------------
 # 4. DERIVE — cross-field inference. Runs after extract. Only fills nulls
 #    unless `overwrite: true`. This is what regex alone cannot do.
@@ -180,7 +235,34 @@ derive:
   - field: generation
     when: {cpu_family: intel-11th}
     value: "2"
+  - field: generation
+    when: {cpu_family: intel-12th}
+    value: "3"
+  - field: generation
+    when: {cpu_family: amd-ryzen-6000}
+    value: "3"
+  - field: generation
+    when: {cpu_family: intel-13th}
+    value: "4"
+  - field: generation
+    when: {cpu_family: amd-ryzen-7000}
+    value: "4"
+  - field: generation
+    when: {cpu_family: intel-ultra-1}
+    value: "5"
+  - field: generation
+    when: {cpu_family: amd-ryzen-8000}
+    value: "5"
+  - field: generation
+    when: {cpu_family: intel-ultra-2}
+    value: "6"
+  - field: generation
+    when: {cpu_family: amd-ryzen-ai}
+    value: "6"
 
+  # startswith on cpu_family's *value string* already covers every family
+  # added above (intel-ultra-1/2 both start with "intel", amd-ryzen-ai
+  # starts with "amd") - no new rules needed per family, just these two.
   - field: cpu_vendor
     when: {cpu_family: {startswith: amd}}
     value: amd
@@ -251,3 +333,7 @@ alerts:
   webhook_env: DISCORD_WEBHOOK_DEALS
   realert_drop_pct: 8          # re-alert if BIN drops this much below last alert
   cooldown_minutes: 60
+  # The buying ceiling, distinct from search.filters.price above (a fetch
+  # threshold - never truncate what gets collected). V0.9 reads this to
+  # decide whether to alert at all, regardless of how good the deal score is.
+  max_price_usd: 1200

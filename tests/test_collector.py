@@ -111,7 +111,10 @@ def test_load_profile_parses_the_real_profile_yaml():
     assert profile.search.queries == ["Lenovo ThinkPad T14"]
     assert profile.search.poll.interval_minutes == 5
     assert profile.search.poll.sweep_interval_minutes == 60
-    assert profile.search.filters["price"] == [80, 1200]
+    # Raised from [80, 1200] at V0.7: the search filter is a fetch
+    # threshold, not a buying ceiling - see alerts.max_price_usd for the
+    # latter.
+    assert profile.search.filters["price"] == [80, 2000]
 
 
 def test_fast_poll_cycle_inserts_and_does_not_advance_last_seen(tmp_path):

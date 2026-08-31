@@ -1,16 +1,20 @@
 """Profile config schema - the shape of `profiles/*.yaml`.
 
-This models only what V0.3 needs (identity fields + `search`), which is why
-extra keys are ignored rather than rejected: a real profile file like
-profiles/thinkpad-t14.yaml already has reject/extract/derive/tiers/scoring/
-seed_baselines/alerts sections that later milestones (V0.4+) will model
-here. Rejecting them now would mean today's client can't load a real
-profile at all.
+Models identity fields, `search`, and the normalization pipeline
+(reject/require/extract/derive/tiers/bucket_key/bucket_require - design.md
+§5). `extra="ignore"` stays on Profile because scoring/seed_baselines/
+alerts are still unmodeled (later milestones); rejecting them now would
+mean today's client can't load a real profile at all.
+
+This module only models *shape* - what keys/types are allowed. Semantic
+validation (does a regex compile, does an `apply:` name a real function,
+does a bucket_key field actually get produced by something) is
+dealwatch.normalize.engine.compile_profile's job, not this one's.
 """
 
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class PollConfig(BaseModel):
@@ -33,6 +37,65 @@ class SearchConfig(BaseModel):
     poll: PollConfig = PollConfig()
 
 
+class MatchRule(BaseModel):
+    """One reject or require rule - same shape for both (design.md §5).
+
+    Exactly one of `any` (regex patterns) or `in` (a value-membership
+    check, e.g. against condition_id) must be given; engine.compile_profile
+    enforces that, not this model, since it's a semantic rule rather than a
+    shape one.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    id: str
+    where: str | list[str]
+    any: list[str] = []
+    unless: list[str] = []
+    in_values: list[Any] | None = Field(default=None, alias="in")
+    reason: str
+
+
+class ExtractRule(BaseModel):
+    pattern: str
+    # A string with {1}/{2} capture-group placeholders, or a literal value
+    # (bool/str/int) used as-is when the pattern matches - see
+    # profiles/thinkpad-t14.yaml's touchscreen field for the literal case.
+    value: Any
+    apply: str | None = None
+
+
+class ExtractField(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    from_field: str = Field(alias="from")
+    rules: list[ExtractRule]
+    default: Any = None
+
+
+class DeriveRule(BaseModel):
+    field: str
+    # {field_name: literal_value} for equality, or
+    # {field_name: {"startswith": prefix}} - engine.py interprets this, not
+    # a full sub-model, since it's a two-case mini-language.
+    when: dict[str, Any]
+    value: Any
+    overwrite: bool = False
+
+
+class TierBreak(BaseModel):
+    max: int | None = None
+    min: int | None = None
+    label: str
+
+
+class TierField(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    from_field: str = Field(alias="from")
+    breaks: list[TierBreak]
+
+
 class Profile(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -42,3 +105,15 @@ class Profile(BaseModel):
     provider: str = "ebay"
     schema_version: int = 1
     search: SearchConfig
+
+    reject: list[MatchRule] = []
+    require: list[MatchRule] = []
+    extract: dict[str, ExtractField] = {}
+    derive: list[DeriveRule] = []
+    tiers: dict[str, TierField] = {}
+    bucket_key: list[str] = []
+    bucket_require: list[str] = []
+    # Exposed as a raw dict (scripts/normalize_report.py reads
+    # min_samples), not interpreted here - actually scoring against it is
+    # V0.8's job and explicitly out of scope for this module.
+    scoring: dict[str, Any] = {}
