@@ -166,61 +166,67 @@ when credentials are absent.
 
 ## Current status
 
-**V0.5 complete.** `storage/sqlite.py` extended with the `listings` and
-`observations` tables and the `record_sighting`/`record_sweep` write path
-(design.md §4.1, §4.2). No collector, scheduler, or normalize-engine wiring
-yet — those are V0.6/V0.7.
+**V0.6 complete.** Live-verified on the LXC. `engine/collector.py` runs two
+independent loops against the V0.5 write path; `main.py` starts and cancels
+them from the FastAPI lifespan. No normalization, scoring, or alerting.
 
-- `record_sighting` inserts on first sight, otherwise compares the incoming
-  values against **the most recent observation row**, in Python (`NULL !=
-  NULL` in SQL, so a WHERE-clause comparison would flag every
-  unknown-shipping listing as changed on every poll). Writes a new
-  observation only on a watched-field change: `title`, `price_cents`,
-  `shipping_cents`, `buying_options`. A title change also nulls
-  `spec_json`/`bucket_key` and sets `spec_status = 'stale'` so V0.7
-  re-normalizes it. Never writes `last_seen`.
-- `record_sweep` is the only thing that writes `last_seen`. It increments
-  `miss_count` on a miss, resets it to 0 on any sighting, and sets
-  `gone_at = last_seen` (not detection time) once `miss_count` reaches
-  `MISS_THRESHOLD = 3`. One transaction per sweep, not one per row.
-- **`record_sighting`/`record_sweep` take `conn` as their first argument;
-  `DailyBudget` (`providers/ratelimit.py`) opens a connection per call
-  instead.** V0.6's collector owns one connection and passes it into every
-  call — it must not open a fresh one per item the way `DailyBudget` does.
-- **Rows from `storage.connect()` are `sqlite3.Row`, not tuples.** Use
-  `dict(row)` when printing/logging one, and `row["column"]` for named
-  access. Tuple-unpacking (`a, b = row`) still works, but `row == (1, 2)`
-  does not.
-- **Two clocks, one call site.** `map_item_summary(item, seen_at)` takes a
-  tz-aware UTC `datetime`; `record_sighting`/`record_sweep` take integer
-  Unix seconds. V0.6's collector is the one place both get called back to
-  back — convert explicitly (e.g. `int(seen_at.timestamp())`), don't let
-  one type drift in as the other's.
-- **`total_cents` is not a `Listing` field — V0.6 has to compute it before
-  calling `record_sighting`.** NULL `shipping_cents` must produce a NULL
-  `total_cents`, never `price_cents + 0`. This is the one that silently
-  biases baselines low: a listing with unresolved shipping would look
-  cheaper than it actually is, and enough of those in one bucket drags the
-  whole median down.
-- **`buying_options` is a `list[str]` on `Listing`, `TEXT` in the DB.**
-  `record_sighting` serializes it with `json.dumps` and compares the
-  deserialized list back in Python. Serialize it the same way at every call
-  site — a different serialization (sorted vs. insertion order, comma-join
-  instead of JSON) makes two logically identical lists compare unequal, and
-  change-detection fires a spurious observation on every single poll.
+- **Two schedules, different semantics.** The fast poll (5 min, one page)
+  calls `record_sighting` only. The sweep (60 min, deep pagination) calls
+  `record_sighting` per item then one `record_sweep`. Only the sweep writes
+  `last_seen`. Verified live: 16 polls and 3 sweeps produced exactly 3
+  distinct `last_seen` values.
+- **Sweep truncation is inferred, not reported.** `search()` swallows
+  `BudgetExhausted` once it has any results (V0.3), so a truncated page set is
+  indistinguishable from a complete one. The collector checks
+  `budget.status()["remaining"] <= 0` after each sweep query and skips
+  `record_sweep` if exhausted. Known false positive: a genuinely complete
+  sweep that exhausts the budget on its last page is also skipped. Costs one
+  hour of resolution; the opposite error corrupts lifespans.
+- **`record_sighting` writes `listing_fields["spec_status"]` on insert,
+  defaulting to `'pending'`** (V0.5 hardcoded `'stale'` and ignored the
+  caller — corrected). The collector passes nothing, so every row it writes is
+  `'pending'`. The update path still sets `'stale'` on a title change.
+- **The collector owns one connection** for the process lifetime and passes it
+  to every call. `DailyBudget` keeps its per-call pattern. `sqlite3` calls
+  block the event loop; at this volume that is correct. Do not add
+  `aiosqlite`.
+- **Startup does not reconcile downtime.** Absence that was not observed is
+  not absence; the first sweep after a restart resets `miss_count` on
+  everything it sees.
+- `AUCTION` removed from the profile's `buyingOptions`. Auction-only listings
+  have no `price` field and cannot map, and design.md §5.5 rules a current bid
+  out of baselines anyway. Provisional answer to §5.5's V0.8 question;
+  reversible.
 
-Next: V0.6 collector loop (poll → persist raw → map → persist).
+Live verification after ~2h: 1,026 listings / 1,028 observations (two real
+revisions across ~18,000 sighting comparisons), one `'stale'` from a genuine
+seller title edit, `miss_count` accumulating only on listings the AUCTION
+filter change orphaned, zero `gone_at`, zero cycle errors.
 
-## Open items before V0.6
+Next: V0.7 ThinkPad T14 profile + normalize engine.
 
+## Open items before V0.7
+
+- **Persist raw before mapping.** The collector maps first and drops failures,
+  contrary to design.md and this file's own trap entry. ~8 listings per sweep
+  are lost this way. A mapping failure should write a `listings` row and an
+  `observations` row carrying `raw_json` with null derived fields. Scoped fix,
+  do it before V0.7 accumulates more history.
+- **~8 fixed-price listings per sweep fail to map on a missing `price`.**
+  Stable count, not growing. Not auctions — those are filtered out now.
+  Suspect `priceDisplayCondition` (MAP / see-price-in-cart). Identify the
+  actual shape before writing extract rules.
+- **Correct design.md §7's budget math.** It assumes ~2 calls per cycle
+  against a 150-listing active set. Measured: ~1,000 active listings, sweep
+  costs ~11 calls, ~264/day for one watch. Still comfortable at 4,750, but the
+  old figure would badly under-estimate five watches.
 - **Raise `search.filters.price` in `profiles/thinkpad-t14.yaml`.** The search
   filter is the only lossy stage — anything above the ceiling is never fetched
-  and cannot be backfilled. Gen 4/5 machines exceed $1200. Everything
-  downstream re-runs over `raw_json` and can be fixed later; this cannot.
-- **Decide who owns the SQLite connection.** V0.6 runs a collector loop
-  alongside FastAPI. `record_sighting`/`record_sweep` take a `conn`;
-  `DailyBudget` opens one per call. A single connection shared between a
-  background task and request handlers hits SQLite's threading rules. Settle
-  this at the top of the V0.6 session, not in a traceback.
-- Reject rules matching on `subtitle` in `profiles/thinkpad-t14.yaml` are dead weight — Browse returns no subtitle. Remove or repoint at V0.7.
+  and cannot be backfilled. Gen 4/5 machines exceed $1200.
+- Reject rules matching on `subtitle` are dead weight — Browse returns no
+  subtitle. Remove or repoint at V0.7.
 - Delete `reserve(n)`'s unused `n` parameter.
+- **WAL high-water is ~4 MB** after the initial full sweeps. Checkpoints are
+  clean (`wal_checkpoint(PASSIVE)` returns `(0, n, n)`). Re-check after a day
+  of steady state; if it has grown an order of magnitude, something is holding
+  a read snapshot.
