@@ -23,6 +23,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timezone
 
 from dealwatch.engine.collector import load_profile
+from dealwatch.normalize import engine as engine_internals
 from dealwatch.normalize.engine import compile_profile, normalize
 from dealwatch.normalize.listing import ListingMappingError, map_item_summary
 
@@ -41,16 +42,42 @@ def open_readonly(db_path: str) -> sqlite3.Connection:
     return conn
 
 
+def _generation_from_cpu_family(profile) -> dict:
+    """What each cpu_family value implies for `generation`, per the
+    profile's own derive rules - built once so the disagreement check below
+    doesn't need to re-simulate the whole derive stage per listing. Only
+    plain equality rules ({cpu_family: <value>} -> generation) are
+    meaningful here; startswith rules target cpu_vendor, not generation."""
+    return {
+        rule.when["cpu_family"]: rule.value
+        for rule in profile.derive
+        if rule.field == "generation"
+        and set(rule.when) == {"cpu_family"}
+        and isinstance(rule.when["cpu_family"], str)
+    }
+
+
 def run_report(profile, conn: sqlite3.Connection, seed: int) -> str:
+    compiled = compile_profile(profile)
+    generation_extract = compiled.extract.get("generation")
+    generation_from_cpu_family = _generation_from_cpu_family(profile)
+
     mapping_failures = 0
     status_counts: Counter = Counter()
     # Pre-seed every reject rule at 0 hits, not just the ones that fired -
     # a rule that never fires is itself worth seeing (dead rule? condition
     # 7000 just never used by real sellers? wrong pattern?).
     reject_hits: dict[str, list[str]] = defaultdict(list, {r.id: [] for r in profile.reject})
-    bucket_counts: Counter = Counter()
+    # ok and partial tracked separately (V0.7a): a bucket reaching
+    # min_samples on partial listings alone can never back a baseline -
+    # partial listings are, by definition, missing a bucket_require field.
+    bucket_counts_ok: Counter = Counter()
+    bucket_counts_partial: Counter = Counter()
     partial_examples: list[tuple[str, dict]] = []
     not_target_examples: list[str] = []
+    generation_agreements = 0
+    generation_disagreements = 0
+    disagreement_examples: list[tuple[str, str, str]] = []
 
     now = datetime.now(timezone.utc)
 
@@ -62,7 +89,8 @@ def run_report(profile, conn: sqlite3.Connection, seed: int) -> str:
             mapping_failures += 1
             continue
 
-        result = normalize(profile, listing.model_dump())
+        listing_fields = listing.model_dump()
+        result = normalize(profile, listing_fields)
         status_counts[result.spec_status] += 1
 
         if result.spec_status == "rejected":
@@ -71,9 +99,37 @@ def run_report(profile, conn: sqlite3.Connection, seed: int) -> str:
             not_target_examples.append(listing.title)
         else:
             if result.bucket_key is not None:
-                bucket_counts[result.bucket_key] += 1
+                if result.spec_status == "ok":
+                    bucket_counts_ok[result.bucket_key] += 1
+                else:
+                    bucket_counts_partial[result.bucket_key] += 1
             if result.spec_status == "partial":
                 partial_examples.append((listing.title, result.spec))
+
+            # Compare what the title's own text said (pre-derive - derive
+            # only fills nulls, so this is a no-op for null-generation
+            # listings and matters only when extraction already had an
+            # opinion) against what the CPU model implies. Reaches into
+            # engine.py's compiled extract step for one field rather than
+            # re-implementing extraction here, so this never drifts out of
+            # sync with the real pipeline - normalize() itself is not
+            # modified or reordered to expose this.
+            if generation_extract is not None:
+                extracted_generation = engine_internals._extract_field(
+                    generation_extract, listing_fields
+                )
+                implied_generation = generation_from_cpu_family.get(
+                    result.spec.get("cpu_family")
+                )
+                if extracted_generation is not None and implied_generation is not None:
+                    if extracted_generation == implied_generation:
+                        generation_agreements += 1
+                    else:
+                        generation_disagreements += 1
+                        if len(disagreement_examples) < 10:
+                            disagreement_examples.append(
+                                (listing.title, extracted_generation, implied_generation)
+                            )
 
     total = sum(status_counts.values())
     min_samples = profile.scoring.get("min_samples", 12)
@@ -97,15 +153,30 @@ def run_report(profile, conn: sqlite3.Connection, seed: int) -> str:
             lines.append(f"    - {title}")
 
     lines.append("")
-    lines.append("=== bucket histogram ===")
-    reaching = sum(1 for c in bucket_counts.values() if c >= min_samples)
-    singletons = sum(1 for c in bucket_counts.values() if c == 1)
+    lines.append("=== bucket histogram (ok / partial) ===")
+    all_buckets = set(bucket_counts_ok) | set(bucket_counts_partial)
+    reaching = sum(1 for c in bucket_counts_ok.values() if c >= min_samples)
+    singletons = sum(1 for c in bucket_counts_ok.values() if c == 1)
     lines.append(
-        f"  {len(bucket_counts)} distinct buckets; {reaching} reach "
-        f"scoring.min_samples={min_samples}; {singletons} are n=1"
+        f"  {len(all_buckets)} distinct buckets; {reaching} OK-only buckets reach "
+        f"scoring.min_samples={min_samples}; {singletons} OK-only buckets are n=1 "
+        f"(partial listings can't back a baseline, so they don't count toward either)"
     )
-    for bucket_key, count in bucket_counts.most_common():
-        lines.append(f"    {bucket_key}: {count}")
+    for bucket_key in sorted(
+        all_buckets,
+        key=lambda k: -(bucket_counts_ok.get(k, 0) + bucket_counts_partial.get(k, 0)),
+    ):
+        ok_n = bucket_counts_ok.get(bucket_key, 0)
+        partial_n = bucket_counts_partial.get(bucket_key, 0)
+        lines.append(f"    {bucket_key}: {ok_n} ok, {partial_n} partial")
+
+    lines.append("")
+    lines.append("=== generation: title text vs. CPU-model-implied (extracted-generation listings only) ===")
+    lines.append(
+        f"  {generation_agreements} agree, {generation_disagreements} disagree"
+    )
+    for title, extracted, implied in disagreement_examples:
+        lines.append(f"    - extracted={extracted!r} implied={implied!r}: {title}")
 
     lines.append("")
     lines.append("=== up to 20 random partial listings (with extracted spec) ===")

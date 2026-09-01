@@ -20,3 +20,6 @@ htmlcov/
 
 .vscode/
 .idea/
+
+*.db
+report-*.txt

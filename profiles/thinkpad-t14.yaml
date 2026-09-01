@@ -47,12 +47,20 @@ search:
 #    not evaluated. See design.md §5.1.
 # ---------------------------------------------------------------------------
 reject:
+  # '[\s-]?' between T and 14 (V0.7a): real sellers write "T 14s" with a
+  # space. Must stay in lockstep with is-t14's require pattern below - if
+  # require widens to accept spaced "T 14" but this doesn't widen too,
+  # spaced T14s listings pass require and get scored as if they were T14.
   - id: t14s-not-t14
     where: title
     any:
-      - '\bT14\s?s\b'
+      - '\bT[\s-]?14\s?s\b'
     reason: "T14s is a different machine with a different price curve"
 
+  # This reads 0 hits in the V0.7 report because search.filters.conditionIds
+  # above already excludes 7000 at the API level - the rule never gets a
+  # chance to fire. That's intentional belt-and-braces (a filter change
+  # elsewhere shouldn't silently reopen this hole), not a dead rule to prune.
   - id: for-parts-condition
     where: condition_id
     in: [7000]
@@ -102,13 +110,22 @@ reject:
     where: title
     any:
       - '\b(dock|docking\s+station|palmrest|keyboard|lcd|screen\s+assembly)\b'
-      - '\b(motherboard|mainboard|bezel|hinge|heatsink|fan|webcam)\b'
+      # `fan` and `webcam` removed (V0.7a): neither is sold as a standalone
+      # T14 part in any real volume, and both appear routinely in ordinary
+      # whole-laptop feature lists ("...16GB DDR5, 512GB SSD, Webcam, 4G").
+      # That was silently rejecting every Core Ultra listing whose spec
+      # list happened to mention a webcam, since Core Ultra ("Ultra 7
+      # 165U") wasn't in the `unless` CPU alternation below either - see
+      # CLAUDE.md and the real listing this fixes in tests/fixtures/titles.txt.
+      - '\b(motherboard|mainboard|bezel|hinge|heatsink)\b'
       - '\b(charger|ac\s+adapter|power\s+supply|sleeve|case|bag)\b'
     unless:
       # Accessory words legitimately appear in whole-laptop listings
       # ("T14 laptop with dock included"). Don't reject those.
       - '\b(laptop|notebook|ultrabook)\b'
-      - '\b(i[3579]|ryzen)\b'
+      # `ultra` added (V0.7a): Core Ultra is exactly the Gen 5/6 silicon
+      # this profile most cares about, and "i[3579]|ryzen" doesn't cover it.
+      - '\b(i[3579]|ryzen|ultra)\b'
     reason: "Matches the keyword search but is not the machine"
 
 # ---------------------------------------------------------------------------
@@ -116,10 +133,15 @@ reject:
 #     failing any one means not_target (design.md §5.2).
 # ---------------------------------------------------------------------------
 require:
+  # '[\s-]?' between T and 14 (V0.7a): two real listings were lost to
+  # sellers writing "T 14" with a space ("Lenovo Thinkpad T 14 Gen 1...",
+  # "Lenovo T 14 Gen 4..."). "T14SGen2" (no space, capital S) still
+  # correctly stays not_target either way - there's no word boundary
+  # between "4" and "S" for \b to land on, same as before this change.
   - id: is-t14
     where: title
     any:
-      - '\bT14\b'
+      - '\bT[\s-]?14\b'
     reason: "Browse query_exclude is best-effort; T13/X13/T480 come back"
 
 # ---------------------------------------------------------------------------
@@ -175,6 +197,34 @@ extract:
         value: intel-ultra-1
       - pattern: '\bultra\s*[3579]\s*2\d{2}'
         value: intel-ultra-2
+      # Ordinal fallbacks (V0.7a) - AFTER every model-number pattern above,
+      # since the model number is the stronger signal when both are present
+      # (204/1094 listings came back partial on cpu_family alone; most
+      # sellers write the generation as an ordinal instead of, or in
+      # addition to, the model number: "i5 10th Gen", "12Gen Intel i5").
+      #
+      # NOTE on the capture group: it captures the FULL two-digit ordinal
+      # (1[0-3], e.g. "10", "12"), not just the units digit. That's
+      # deliberate - value 'intel-{1}th' then reproduces exactly
+      # "intel-10th" / "intel-12th", identical to the values the
+      # model-number patterns above already produce, so these hook straight
+      # into the existing derive rules for generation/cpu_vendor below
+      # without needing new ones. Capturing only the units digit would
+      # produce "intel-0th"/"intel-2th" - a disjoint set of values with no
+      # derive rule and a separate (wrong) bucket from same-generation
+      # listings matched by model number.
+      - pattern: '\bi[3579][\s-]?(1[0-3])th\b'
+        value: 'intel-{1}th'
+      - pattern: '\b(1[0-3])(?:th)?\s*gen(?:eration)?\b'
+        value: 'intel-{1}th'
+      # Bare model number that's lost adjacency to its i-series marker
+      # ("Intel Core i7 vPRO 10610U" - "vPRO" sits between i7 and 10610U,
+      # so the i[3579]-anchored patterns above never reach it). The
+      # mandatory U/H/G suffix is what keeps this from capturing a storage
+      # size ("512GB") or a clock speed ("2.80GHz") instead - both are
+      # missing the digit-then-letter shape this requires.
+      - pattern: '\b(1[0-3])\d{3}[uhg]\b'
+        value: 'intel-{1}th'
     default: null
 
   ram_gb:

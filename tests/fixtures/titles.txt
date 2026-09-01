@@ -4,17 +4,43 @@
   - LENOVO THINKPAD T14s GEN 2a Ryzen 7 PRO 5850U 1.9GHz 16GB 256GB TOUCH - NO OS
   - Lenovo ThinkPad T14s Gen 3 14" Touch Intel i7-1280P 32GB 1TB Win 11 No AC
 
-  # V0.7 additions below: illustrative titles in the same style as the live
-  # pulls above, added to motivate reject/require rules and cpu_family
-  # patterns that had no real example on file yet - not a new live scrape.
-  - Lenovo ThinkPad T14 Gen 2 i5-1135G7 16GB 256GB - Cracked Screen AS IS
-  - Lot of 5 Lenovo ThinkPad T14 Gen 1 i5 8GB 256GB - Untested
-  - Lenovo ThinkPad T14 Docking Station USB-C Dock Only
-  - Lenovo ThinkPad T480 Core i5-8350U 16GB 256GB SSD
-  - Lenovo ThinkPad T14 Gen 1 16GB 256GB SSD - For Parts Not Working
-  - Lenovo ThinkPad T14 Gen 4 Intel Core Ultra 5 135U 16GB 512GB
-  - Lenovo ThinkPad T14 Gen 6 Intel Core Ultra 7 265H 32GB 1TB
-  - Lenovo ThinkPad T14 Gen 3 AMD Ryzen 5 PRO 6650U 16GB 256GB
-  - Lenovo ThinkPad T14 Gen 4 AMD Ryzen 7 PRO 7840U 32GB 512GB
-  - Lenovo ThinkPad T14 Gen 5 AMD Ryzen 7 PRO 8840U 32GB 1TB
-  - Lenovo ThinkPad T14 Gen 6 AMD Ryzen AI 7 PRO 360 32GB 1TB
+  # v0.7 additions below: Pulled actual tiltes from db. 
+  - Used Lenovo Custom Built Thinkpad (used - great condition )
+  - Lenovo Thinkbook 14s Yoga 14” Core i7-1165G7, 2.80GHz, 16GB RAM, 512GB SSD Touch
+  - lenovo laptop gray the display size is 14.6 and the condition is slightly used
+  - Lenovo Thinkpad L15 Gen 1 | i5-10310 | 32gb RAM | 256gb NVME | W11 Pro (No Key)
+  - Lenovo ThinkPad L15Gen 4 i5-1345U 32GB RAM 256GB Win 11 Pro
+  - Lenovo Thinkpad T 14 Gen 1  14" Laptop Core i7/i5 8GB/16GB RAM Up To 512GB SSD
+  - Lenovo ThinkPad P15s Gen 1 15.6" i7 10610U 16GB 512GB Win 11 Pro Quadro P520
+  - Lenovo ThinkPad X1 Carbon Gen7 i5 10610U 8GB RAM 256GB  FHD 14".  Grade B
+  - Lenovo ThinkPad X1 Carbon Gen7 i7 8565U 16GB RAM 256GB FHD 14"
+  - LENOVO THINKPAD E14 AMD RYZEN 5 4500U 16GB RAM NO HD
+  - LENOVO THINKPAD T440S Laptop Intel i5-4200U 1.6 GHZ 4GB Ram 128GB (CLN071017)
+  - LENOVO THINKPAD E14 AMD RYZEN 5 4500U 16GB RAM NO HD
+  - All Black Touchscreen Intel Core 15 vPro 471 GB RAM In Good Condition
+  - Lenovo T 14 Gen 4 i5 1335U 512 GB SSD 16 GB Ram W11 Pro- Touch & Warranty
+  - Lenovo ThinkPad X1 Carbon Gen6 i7 8650U 16GB RAM 256GB FHD 14"
+  - Lenovo ThinkPad L15Gen 4 i5-1345U 32GB RAM 256GB Win 11 Pro
+  - ThinkPad T14SGen2 i5-1135G7 2.40GHz/16GB RAM/256GB NVMe SSD. Touch Screen
+  - Lenovo ThinkPad X1 Carbon Gen7 i7 8565U 16GB RAM 512GB FHD Touchscreen 14"
+  - Lenovo ThinkPad T15 Gen 1 i5-10210U 16GB RAM 512GB SSD 15.6" Laptop
+  - Lenovo Thinkpad
+
+  # V0.7a additions below: real listings the first report against 1,094
+  # collected rows surfaced as problems (accessory false-reject, cpu_family
+  # ordinal-format misses). See CLAUDE.md / design.md for the fixes these
+  # motivated.
+  - Lenovo ThinkPad T14 Gen 5  Ultra 7 165U 14", 16GB DDR5, 512GB SSD, Webcam, 4G
+  - Lenovo ThinkPad T14 G1 – Intel i7 10th Gen | 16GB RAM | 256GB SSD | Win11 #324
+  - Lenovo ThinkPad T14 Gen 1 14" Laptop i5 10th 256GB SSD 8GB RAM Win 11 (WG) C L
+  - Lenovo ThinkPad T14 Gen3 Touchscreen Laptop 512GB SSD, 16GB RAM, 12Gen Intel i5*
+  - Lenovo ThinkPad T14 1st Gen 14" (256GB SSD, Intel Core i5 10th Gen., 16GB Ram)
+  - Lenovo ThinkPad T14 Intel Core i7 vPRO 10610U CPU/512GB SSD/16GB RAM Laptop
+
+  # No real observed example on file yet for these reject rules (the V0.7a
+  # report output quoted in the task didn't include one) - the tests below
+  # construct a title inline rather than inventing a fake "real" fixture
+  # entry here. Replace with a real title the next time the report surfaces
+  # one: for-parts-text (cracked/as-is wording specifically), lot-listing,
+  # accessory (dock-only, no full-laptop context).
+
