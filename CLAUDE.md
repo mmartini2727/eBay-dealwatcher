@@ -107,6 +107,7 @@ plus a normalizer module — nothing else.
   V0.6's collector should open one connection at startup and pass it in;
   it should not instantiate a `DailyBudget`-style per-call wrapper around
   the listings/observations write path.
+- Tests do not ship in the image. tests/ is deliberately not copied into the Dockerfile and pytest is not installed there — the Mac venv is the authoritative test environment. Do not add COPY tests ./tests or pip install '.[dev]' to the Dockerfile.
 
 ---
 
@@ -166,67 +167,20 @@ when credentials are absent.
 
 ## Current status
 
-**V0.6 complete.** Live-verified on the LXC. `engine/collector.py` runs two
-independent loops against the V0.5 write path; `main.py` starts and cancels
-them from the FastAPI lifespan. No normalization, scoring, or alerting.
+- **V0.7 complete:** engine is pure (normalize(profile, listing_fields) -> SpecResult), not wired to the DB. Deployed and live-verified.
+- Report over 1,094 collected listings: 48.7% ok, 36.7% rejected, 12.1% partial, 2.6% not_target. 0 mapping failures in the snapshot.
+139 distinct buckets; 14 ok-only reach min_samples=12; 33 are singletons.
+- Generation disagreement (title text vs. CPU-implied): 428 agree, 2 disagree (~0.5%). Derive stays fill-null; do not add overwrite: true without new evidence.
+- Accessory rule was rejecting Core Ultra machines on webcam; fixed. Rule now reads 0 hits — category_ids: 177 does most of the accessory filtering. Do not delete it as dead weight.
+for-parts-condition reads 0 hits because conditionIds already excludes 7000. Intentional.
 
-- **Two schedules, different semantics.** The fast poll (5 min, one page)
-  calls `record_sighting` only. The sweep (60 min, deep pagination) calls
-  `record_sighting` per item then one `record_sweep`. Only the sweep writes
-  `last_seen`. Verified live: 16 polls and 3 sweeps produced exactly 3
-  distinct `last_seen` values.
-- **Sweep truncation is inferred, not reported.** `search()` swallows
-  `BudgetExhausted` once it has any results (V0.3), so a truncated page set is
-  indistinguishable from a complete one. The collector checks
-  `budget.status()["remaining"] <= 0` after each sweep query and skips
-  `record_sweep` if exhausted. Known false positive: a genuinely complete
-  sweep that exhausts the budget on its last page is also skipped. Costs one
-  hour of resolution; the opposite error corrupts lifespans.
-- **`record_sighting` writes `listing_fields["spec_status"]` on insert,
-  defaulting to `'pending'`** (V0.5 hardcoded `'stale'` and ignored the
-  caller — corrected). The collector passes nothing, so every row it writes is
-  `'pending'`. The update path still sets `'stale'` on a title change.
-- **The collector owns one connection** for the process lifetime and passes it
-  to every call. `DailyBudget` keeps its per-call pattern. `sqlite3` calls
-  block the event loop; at this volume that is correct. Do not add
-  `aiosqlite`.
-- **Startup does not reconcile downtime.** Absence that was not observed is
-  not absence; the first sweep after a restart resets `miss_count` on
-  everything it sees.
-- `AUCTION` removed from the profile's `buyingOptions`. Auction-only listings
-  have no `price` field and cannot map, and design.md §5.5 rules a current bid
-  out of baselines anyway. Provisional answer to §5.5's V0.8 question;
-  reversible.
+## Open items before V0.8
 
-Live verification after ~2h: 1,026 listings / 1,028 observations (two real
-revisions across ~18,000 sighting comparisons), one `'stale'` from a genuine
-seller title edit, `miss_count` accumulating only on listings the AUCTION
-filter change orphaned, zero `gone_at`, zero cycle errors.
-
-Next: V0.7 ThinkPad T14 profile + normalize engine.
-
-## Open items before V0.7
-
-- **Persist raw before mapping.** The collector maps first and drops failures,
-  contrary to design.md and this file's own trap entry. ~8 listings per sweep
-  are lost this way. A mapping failure should write a `listings` row and an
-  `observations` row carrying `raw_json` with null derived fields. Scoped fix,
-  do it before V0.7 accumulates more history.
-- **~8 fixed-price listings per sweep fail to map on a missing `price`.**
-  Stable count, not growing. Not auctions — those are filtered out now.
-  Suspect `priceDisplayCondition` (MAP / see-price-in-cart). Identify the
-  actual shape before writing extract rules.
-- **Correct design.md §7's budget math.** It assumes ~2 calls per cycle
-  against a 150-listing active set. Measured: ~1,000 active listings, sweep
-  costs ~11 calls, ~264/day for one watch. Still comfortable at 4,750, but the
-  old figure would badly under-estimate five watches.
-- **Raise `search.filters.price` in `profiles/thinkpad-t14.yaml`.** The search
-  filter is the only lossy stage — anything above the ceiling is never fetched
-  and cannot be backfilled. Gen 4/5 machines exceed $1200.
-- Reject rules matching on `subtitle` are dead weight — Browse returns no
-  subtitle. Remove or repoint at V0.7.
+- **Persist raw before mapping.** The collector maps first and drops failures, contrary to design.md and this file's own trap entry. ~6 listings per sweep are lost this way. A mapping failure should write a `listings` row and an `observations` row carrying `raw_json` with null derived fields. Scoped fix, do it before V0.7 accumulates more history.
+- **~6 fixed-price listings per sweep fail to map on a missing `price`.** Stable count, not growing. Not auctions — those are filtered out now. Suspect `priceDisplayCondition` (MAP / see-price-in-cart). Identify the actual shape before writing extract rules.
+- **Correct design.md §7's budget math.** It assumes ~2 calls per cycle against a 150-listing active set. Measured: ~1,000 active listings, sweep costs ~11 calls, ~264/day for one watch. Still comfortable at 4,750, but the old figure would badly under-estimate five watches.
 - Delete `reserve(n)`'s unused `n` parameter.
-- **WAL high-water is ~4 MB** after the initial full sweeps. Checkpoints are
-  clean (`wal_checkpoint(PASSIVE)` returns `(0, n, n)`). Re-check after a day
-  of steady state; if it has grown an order of magnitude, something is holding
-  a read snapshot.
+- **WAL high-water is ~4 MB** after the initial full sweeps. Checkpoints are clean (`wal_checkpoint(PASSIVE)` returns `(0, n, n)`). Re-check after a day of steady state; if it has grown an order of magnitude, something is holding a read snapshot.
+- Remaining 132 partials: CPU marker with no model number and no ordinal. Intel derivable from generation + vendor, but that makes bucket_require satisfiable by inference and a wrong generation would manufacture a cpu_family. Separate design session.
+- Two disagreement listings produced impossible buckets (1|intel-11th, 1|intel-12th). V0.8 wants a sanity check on generation/CPU pairs that can't exist.
+- First resurrection observed on deploy: lifespan_mins=1082, ~18h. §4.2 says count these; they're the only evidence about whether N=3 is right.

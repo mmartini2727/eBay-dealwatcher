@@ -8,7 +8,6 @@ WORKDIR /app
 
 COPY pyproject.toml ./
 COPY dealwatch ./dealwatch
-COPY tests ./tests
 
 # data/ is a host bind mount; the host-side directory must also be
 # writable by uid 10001. See README operational notes.

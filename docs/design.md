@@ -50,6 +50,10 @@ Three layers, in order of when they become available:
 
    The distribution of prices for fast-disappearing *observations* in a bucket is a better answer to "what price gets sniped" than sold comps would be, because that is the question we actually care about.
 
+  - Measured (V0.7, n=1,094): layer 3 will not cover the buckets that matter most. Normalizing the collected set produces 139 distinct buckets, of which 14 reach scoring.min_samples=12 and 33 are singletons. The dense buckets are Gen 1–3 Intel; Gen 5/6 AMD — the actual buying target — appear in ones and twos. Bucket fragmentation is driven by nulls in ram_tier/storage_tier, not by the key being too wide, so this does not improve much with time.
+
+  - Consequence: the survival-derived baseline is in practice a Gen 1–3 Intel feature. Gen 5/6 will run on seed baselines indefinitely. That is what layer 1 is for, but V0.8 must not be designed as if layer 3 eventually replaces it — the fallback is the steady state for the target generations, and the seed chart's accuracy matters more than this document originally assumed.
+
 **Known weakness of (3):** disappearance conflates *sold* with *ended early* or
 *pulled by seller*. `getItem` on a dead listing errors and does not disclose
 which.
@@ -279,6 +283,8 @@ project succeeds or fails. A naive price baseline over search results for
 Parse generation, CPU family, RAM, storage, screen from the title into a `Spec`.
 Gen 1 and Gen 2 exist in both Intel and AMD variants and they are not
 interchangeable (Gen 1 AMD = Ryzen 4000, Gen 2 AMD = Ryzen 5000).
+
+The cpu_family confidence isn't uniform: model-number matches are strong, ordinal matches ("12th Gen") are keyword-stuffable and are the only evidence when no model number is present. One of the two observed disagreements was a T14 listing carrying "Chromebook 12th Gen." V0.8 shouldn't weight the two sources equally.
 
 Listings that fail to parse get `spec = unknown`: **excluded from baseline
 computation**, but still eligible to be alerted on if the price is low enough to

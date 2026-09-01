@@ -25,6 +25,7 @@
   - Lenovo ThinkPad X1 Carbon Gen7 i7 8565U 16GB RAM 512GB FHD Touchscreen 14"
   - Lenovo ThinkPad T15 Gen 1 i5-10210U 16GB RAM 512GB SSD 15.6" Laptop
   - Lenovo Thinkpad
+  - Lenovo ThinkPad Ultra Docking Station 40AJ for T14 Gen 2
 
   # V0.7a additions below: real listings the first report against 1,094
   # collected rows surfaced as problems (accessory false-reject, cpu_family
