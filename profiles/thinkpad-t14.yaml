@@ -125,7 +125,7 @@ reject:
       - '\b(laptop|notebook|ultrabook)\b'
       # `ultra` added (V0.7a): Core Ultra is exactly the Gen 5/6 silicon
       # this profile most cares about, and "i[3579]|ryzen" doesn't cover it.
-      - '\b(i[3579]|ryzen|ultra)\b'
+      - '\b(i[3579]|ryzen)\b|\bultra\s*[3579]\b'
     reason: "Matches the keyword search but is not the machine"
 
 # ---------------------------------------------------------------------------
