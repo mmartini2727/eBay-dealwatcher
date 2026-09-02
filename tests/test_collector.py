@@ -257,6 +257,180 @@ async def _mapping_failure_is_isolated_surrounding_items_still_land(tmp_path):
     assert stats.mapping_error_count == 1
 
 
+def test_unmappable_item_with_no_price_still_writes_both_rows(tmp_path):
+    run(_unmappable_item_with_no_price_still_writes_both_rows(tmp_path))
+
+
+async def _unmappable_item_with_no_price_still_writes_both_rows(tmp_path):
+    # The real bug this fix exists for: ~6/sweep fixed-price listings with
+    # no `price` field at all. item_id and title are both present - only
+    # price is missing - so there's no reason this history should be lost.
+    conn = connect(tmp_path / "dealwatch.db")
+    provider = FakeProvider()
+    bad_item = raw_item(item_id="v1|1|0")
+    del bad_item["price"]
+    provider.queue_items([bad_item])
+    profile = make_profile()
+    stats = CollectorStats()
+
+    await run_fast_poll_cycle(provider, profile, conn, stats)
+
+    row = conn.execute(
+        "SELECT title, spec_status FROM listings WHERE item_id = 'v1|1|0'"
+    ).fetchone()
+    assert row is not None
+    assert row["title"] == bad_item["title"]
+    assert row["spec_status"] == "pending"  # a mapping failure, not a normalization outcome
+
+    obs = get_latest_observation(conn, "v1|1|0")
+    assert obs is not None
+    assert obs["price_cents"] is None
+    assert obs["raw_json"] is not None
+    assert stats.mapping_error_count == 1
+
+
+def test_unmappable_item_still_captures_seller_and_condition_id(tmp_path):
+    run(_unmappable_item_still_captures_seller_and_condition_id(tmp_path))
+
+
+async def _unmappable_item_still_captures_seller_and_condition_id(tmp_path):
+    # "the fields that ARE present" - a missing price says nothing about
+    # whether seller/condition_id are present, so they shouldn't be thrown
+    # away along with the fields that genuinely aren't there.
+    conn = connect(tmp_path / "dealwatch.db")
+    provider = FakeProvider()
+    bad_item = raw_item(
+        item_id="v1|1|0",
+        conditionId="3000",
+        seller={"username": "gooddeals99", "feedbackPercentage": "99.1", "feedbackScore": 4200},
+    )
+    del bad_item["price"]
+    provider.queue_items([bad_item])
+    profile = make_profile()
+    stats = CollectorStats()
+
+    await run_fast_poll_cycle(provider, profile, conn, stats)
+
+    row = conn.execute(
+        "SELECT seller, seller_feedback_pct, seller_feedback_score, condition_id "
+        "FROM listings WHERE item_id = 'v1|1|0'"
+    ).fetchone()
+    assert row["seller"] == "gooddeals99"
+    assert row["seller_feedback_pct"] == 99.1
+    assert row["seller_feedback_score"] == 4200
+    assert row["condition_id"] == 3000
+
+
+def test_unmappable_item_missing_item_id_or_title_is_skipped_not_written(tmp_path):
+    run(_unmappable_item_missing_item_id_or_title_is_skipped_not_written(tmp_path))
+
+
+async def _unmappable_item_missing_item_id_or_title_is_skipped_not_written(tmp_path):
+    # No item_id (PRIMARY KEY) and no title (NOT NULL) - there's no row to
+    # write. This differs from the no-price case above: the same
+    # ListingMappingError fires, but here there's genuinely nothing to key
+    # a row on. Per eBay's Browse API schema this should be unreachable in
+    # practice (itemId/title are always present; price is the one that
+    # legitimately isn't), so this is a defensive path, not a live gap.
+    conn = connect(tmp_path / "dealwatch.db")
+    provider = FakeProvider()
+    provider.queue_items([{"title": "no itemId at all", "price": {"value": "10.00"}}])
+    profile = make_profile()
+    stats = CollectorStats()
+
+    await run_fast_poll_cycle(provider, profile, conn, stats)  # must not raise
+
+    assert conn.execute("SELECT COUNT(*) FROM listings").fetchone()[0] == 0
+    assert stats.mapping_error_count == 1
+
+
+def test_unmappable_item_repeated_across_cycles_does_not_duplicate_listings_row(tmp_path):
+    run(_unmappable_item_repeated_across_cycles_does_not_duplicate_listings_row(tmp_path))
+
+
+async def _unmappable_item_repeated_across_cycles_does_not_duplicate_listings_row(tmp_path):
+    conn = connect(tmp_path / "dealwatch.db")
+    provider = FakeProvider()
+    bad_item = raw_item(item_id="v1|1|0")
+    del bad_item["price"]
+    provider.queue_items([bad_item])
+    provider.queue_items([bad_item])  # still unmappable on a later cycle
+    profile = make_profile()
+    stats = CollectorStats()
+
+    await run_fast_poll_cycle(provider, profile, conn, stats)
+    await run_fast_poll_cycle(provider, profile, conn, stats)
+
+    count = conn.execute(
+        "SELECT COUNT(*) FROM listings WHERE item_id = 'v1|1|0'"
+    ).fetchone()[0]
+    assert count == 1
+    assert stats.mapping_error_count == 2
+
+
+def test_unmappable_item_in_a_sweep_does_not_get_miss_count_incremented(tmp_path):
+    run(_unmappable_item_in_a_sweep_does_not_get_miss_count_incremented(tmp_path))
+
+
+async def _unmappable_item_in_a_sweep_does_not_get_miss_count_incremented(tmp_path):
+    # The subtle failure mode the task calls out explicitly: if an
+    # unmappable-but-present item isn't added to the sweep's seen set, its
+    # miss_count climbs while it's sitting right there in the search
+    # results, and it gets marked gone at N=3 with a fabricated lifespan.
+    conn = connect(tmp_path / "dealwatch.db")
+    bad_item = raw_item(item_id="v1|1|0")
+    del bad_item["price"]
+
+    old_seen_at = 1_000_000
+    # Seed the listing as already existing (as if a prior sweep wrote the
+    # raw-only row) so record_sweep's miss_count bookkeeping has something
+    # to (not) act on.
+    record_sighting(
+        conn,
+        "v1|1|0",
+        dict(profile_id=PROFILE_ID, title=bad_item["title"]),
+        dict(price_cents=None, raw_json="{}"),
+        old_seen_at,
+    )
+
+    budget = DailyBudget(make_settings(tmp_path))
+    provider = FakeProvider(budget)
+    provider.queue_items([bad_item], reserve=1)
+    profile = make_profile()
+    stats = CollectorStats()
+
+    await run_sweep_cycle(provider, profile, budget, conn, stats)
+
+    row = conn.execute(
+        "SELECT miss_count, last_seen FROM listings WHERE item_id = 'v1|1|0'"
+    ).fetchone()
+    assert row["miss_count"] == 0
+    assert row["last_seen"] != old_seen_at  # still counted as seen
+
+
+def test_item_that_maps_successfully_after_a_prior_failure_gets_price_populated(tmp_path):
+    run(_item_that_maps_successfully_after_a_prior_failure_gets_price_populated(tmp_path))
+
+
+async def _item_that_maps_successfully_after_a_prior_failure_gets_price_populated(tmp_path):
+    conn = connect(tmp_path / "dealwatch.db")
+    provider = FakeProvider()
+    bad_item = raw_item(item_id="v1|1|0")
+    del bad_item["price"]
+    provider.queue_items([bad_item])
+    provider.queue_items([raw_item(item_id="v1|1|0")])  # same item, now mappable
+    profile = make_profile()
+    stats = CollectorStats()
+
+    await run_fast_poll_cycle(provider, profile, conn, stats)
+    await run_fast_poll_cycle(provider, profile, conn, stats)
+
+    observations = get_observations(conn, "v1|1|0")
+    assert len(observations) == 2  # None -> a real price counts as a change
+    assert observations[0]["price_cents"] is None
+    assert observations[-1]["price_cents"] == 34999
+
+
 def test_budget_exhausted_mid_cycle_does_not_propagate(tmp_path):
     run(_budget_exhausted_mid_cycle_does_not_propagate(tmp_path))
 
