@@ -303,19 +303,28 @@ transaction price. Weight accordingly; do not let it pollute baselines.
 
 ### 5.5 Auctions
 
-For `buyingOptions: ["AUCTION"]`, Browse omits `price` entirely and supplies
-`currentBidPrice`. For listings offering both AUCTION and FIXED_PRICE, `price`
-is the BIN and `currentBidPrice` is the live bid.
+`search.filters.buyingOptions: [FIXED_PRICE]` (§7 — eBay's set filters are OR,
+so FIXED_PRICE must be the *only* value listed) excludes auction-only listings
+at the API: a listing whose `buyingOptions` is `["AUCTION"]` never matches a
+filter of `[FIXED_PRICE]`. Those are never fetched, so this section's earlier
+open question — whether an admitted listing's `price` is a bid or an asking
+price — is now closed at the API, not in code.
 
-`Listing` records both and reconciles neither. A current bid is an in-progress
-number, not an asking price, and treating it as one would drag bucket medians
-toward auction opening prices — the same poisoning mechanism as barebones
-listings, from the opposite direction.
+What still reaches the collector is `buyingOptions` including **both**
+`AUCTION` and `FIXED_PRICE` (an auction with a Buy-It-Now fallback, or vice
+versa) — such a listing still matches the filter on FIXED_PRICE alone. For
+these, `price` is a genuine BIN and `currentBidPrice` is the separate,
+live, in-progress bid. `Listing` records both and reconciles neither.
+`price` is a legitimate baseline input here — it's a real asking price, not
+a bid. `currentBidPrice` is not: it's an in-progress number that would drag
+bucket medians toward auction opening prices, the same poisoning mechanism
+as barebones listings from the opposite direction.
 
-Open question for V0.8, to be decided with real data: weight auctions down,
-exclude them from baselines, or drop AUCTION from the profile's
-`buyingOptions` entirely. A Discord alert on an auction six days out is not
-actionable in any case.
+Open question for V0.8, narrower than it used to be: what to do with
+`currentBidPrice` on an auction+BIN listing — ignore it (baseline off
+`price` alone, which is already valid on its own) or use it as a secondary
+signal (a live bid already above the BIN suggests real demand). Not a
+blocking question the way "is this bid data safe to treat as a price" was.
 
 ---
 
@@ -363,6 +372,16 @@ Polling strategy:
 - ~5 minutes is the useful polling floor — good ThinkPad deals are taken in
   minutes. Faster than that spends budget for little gain.
 - Budget math: 5 watches × 288 polls/day × ~2 calls ≈ 2,900/day. Comfortable.
+
+**eBay's `filter=` set-parameters are OR across every value listed, not AND —
+undocumented in Browse's own reference, and it will bite again on the next
+profile.** `buyingOptions: [FIXED_PRICE, BEST_OFFER]` does not mean "fixed-price
+listings that also take offers" — it means "buyingOptions contains FIXED_PRICE
+OR contains BEST_OFFER", which quietly admitted `["AUCTION","BEST_OFFER"]`
+listings: an auction whose offer channel happens to include Best Offer, with
+no `price` field at all, only `currentBidPrice` (see §5.5). Any future profile
+that lists more than one value for a set filter needs to be checked against
+this before assuming the extra value narrows results rather than widening them.
 
 ---
 

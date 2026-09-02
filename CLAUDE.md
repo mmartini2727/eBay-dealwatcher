@@ -173,11 +173,11 @@ when credentials are absent.
 - Generation disagreement (title text vs. CPU-implied): 428 agree, 2 disagree (~0.5%). Derive stays fill-null; do not add overwrite: true without new evidence.
 - Accessory rule was rejecting Core Ultra machines on webcam; fixed. Rule now reads 0 hits — category_ids: 177 does most of the accessory filtering. Do not delete it as dead weight.
 for-parts-condition reads 0 hits because conditionIds already excludes 7000. Intentional.
+- **Persist raw before mapping is complete** (V0.7a-fix) and paid for itself immediately: it diagnosed the `buyingOptions` bug below on its first sweep after deploy. Without raw_json on the unmappable rows, that cause would have stayed a guess.
+- **The ~6/sweep fixed-price-mapping-failure open item is closed.** Not a mapper bug — the mapper was right to refuse a raw dict with no `price` field. Cause: eBay's set filter is OR, not AND. `buyingOptions: [FIXED_PRICE, BEST_OFFER]` was admitting `["AUCTION","BEST_OFFER"]` listings — an auction whose offer channel includes Best Offer, no `price` field, only `currentBidPrice`. Fixed by narrowing the filter to `[FIXED_PRICE]` alone. See design.md §7 (the OR-semantics finding, general) and §5.5 (what this means for auction+BIN listings, which still get through and are fine).
 
 ## Open items before V0.8
 
-- **Persist raw before mapping.** The collector maps first and drops failures, contrary to design.md and this file's own trap entry. ~6 listings per sweep are lost this way. A mapping failure should write a `listings` row and an `observations` row carrying `raw_json` with null derived fields. Scoped fix, do it before V0.7 accumulates more history.
-- **~6 fixed-price listings per sweep fail to map on a missing `price`.** Stable count, not growing. Not auctions — those are filtered out now. Suspect `priceDisplayCondition` (MAP / see-price-in-cart). Identify the actual shape before writing extract rules.
 - **Correct design.md §7's budget math.** It assumes ~2 calls per cycle against a 150-listing active set. Measured: ~1,000 active listings, sweep costs ~11 calls, ~264/day for one watch. Still comfortable at 4,750, but the old figure would badly under-estimate five watches.
 - Delete `reserve(n)`'s unused `n` parameter.
 - **WAL high-water is ~4 MB** after the initial full sweeps. Checkpoints are clean (`wal_checkpoint(PASSIVE)` returns `(0, n, n)`). Re-check after a day of steady state; if it has grown an order of magnitude, something is holding a read snapshot.

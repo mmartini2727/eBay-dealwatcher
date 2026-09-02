@@ -24,7 +24,14 @@ search:
 
   filters:
     conditionIds: [2000, 2500, 3000]     # cert refurb, seller refurb, used, auction removed
-    buyingOptions: [FIXED_PRICE, BEST_OFFER]
+    # eBay's set filter is OR, not AND. [FIXED_PRICE, BEST_OFFER] admitted
+    # ["AUCTION","BEST_OFFER"] listings — an auction whose offer channel
+    # closes on the first bid. Those have no `price` field, only
+    # currentBidPrice, and failed to map (4/sweep). BIN-with-Best-Offer
+    # still matches on FIXED_PRICE; auction+BIN still comes through, and
+    # its `price` is a real BIN. buying_options is still recorded per
+    # observation, so scoring.best_offer_weight is unaffected.
+    buyingOptions: [FIXED_PRICE]
     # Raised from 1200: the search filter is the only lossy stage — a
     # listing never fetched cannot be backfilled from raw_json later.
     # Truncating at 1200 would compute Gen 5/6 medians from the bottom
