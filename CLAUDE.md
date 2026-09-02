@@ -157,6 +157,22 @@ loses history permanently: 5 of 150 live listings currently fail to map
 takes ten minutes to fix afterward.
 ---
 
+## Operational notes
+
+- **Profile edits need `docker compose restart`; code changes need
+  `docker compose up -d --build`.** `profiles/` mounts into the container,
+  so a YAML edit is visible on disk immediately — but the process read it
+  once at startup and keeps running against the old values until the
+  container restarts. The failure mode is silent: `docker exec ... cat` or
+  `grep` on the profile shows your edit is there, giving false confidence
+  that it's live, while the running process is still scoring against
+  whatever it loaded at boot. A plain `restart` is enough for a
+  profile-only change and is the *required* step, not an optional extra; a
+  full `up -d --build` is only needed when `dealwatch/` Python itself
+  changes. See design.md §10 for the rest of the deploy notes.
+
+---
+
 ## Testing
 
 `pytest`. The network layer should be mockable — no test may require live eBay
@@ -184,3 +200,4 @@ for-parts-condition reads 0 hits because conditionIds already excludes 7000. Int
 - Remaining 132 partials: CPU marker with no model number and no ordinal. Intel derivable from generation + vendor, but that makes bucket_require satisfiable by inference and a wrong generation would manufacture a cpu_family. Separate design session.
 - Two disagreement listings produced impossible buckets (1|intel-11th, 1|intel-12th). V0.8 wants a sanity check on generation/CPU pairs that can't exist.
 - First resurrection observed on deploy: lifespan_mins=1082, ~18h. §4.2 says count these; they're the only evidence about whether N=3 is right.
+- Second resurrection cohort: 7 items, all with identical lifespan_mins=2836 — same value across all 7 reads as one relist event, not 7 independent index-inconsistency reads. Likely a single seller's batch relist. Still counts per §4.2; the running total, not any one cohort, is what tells us whether N=3 holds.

@@ -6,8 +6,10 @@ persistence and the disappearance bookkeeping are the entire point of this
 milestone. No network.
 """
 
+import json
 import logging
 
+from dealwatch.normalize.engine import SpecResult
 from dealwatch.storage.sqlite import (
     MISS_THRESHOLD,
     connect,
@@ -16,6 +18,7 @@ from dealwatch.storage.sqlite import (
     get_observations,
     record_sighting,
     record_sweep,
+    store_spec,
 )
 
 PROFILE_ID = "thinkpad-t14"
@@ -301,6 +304,64 @@ def test_count_active_listings_excludes_gone_items(tmp_path):
     record_sweep(conn, ["item-2"], PROFILE_ID, swept_at=4000)  # item-1 gone
 
     assert count_active_listings(conn, PROFILE_ID) == 1
+
+
+def test_store_spec_writes_all_four_fields(tmp_path):
+    conn = make_conn(tmp_path)
+    sight(conn, "item-1", 1000)
+
+    result = SpecResult(
+        spec={"generation": "1", "cpu_family": "intel-10th"},
+        spec_status="ok",
+        reject_rule_id=None,
+        bucket_key="1|intel-10th|16|256",
+    )
+    store_spec(conn, "item-1", result)
+
+    row = conn.execute(
+        "SELECT spec_json, bucket_key, spec_status, reject_rule_id "
+        "FROM listings WHERE item_id = 'item-1'"
+    ).fetchone()
+    assert json.loads(row["spec_json"]) == {"generation": "1", "cpu_family": "intel-10th"}
+    assert row["bucket_key"] == "1|intel-10th|16|256"
+    assert row["spec_status"] == "ok"
+    assert row["reject_rule_id"] is None
+
+
+def test_store_spec_writes_reject_rule_id_when_rejected(tmp_path):
+    conn = make_conn(tmp_path)
+    sight(conn, "item-1", 1000)
+
+    result = SpecResult(spec={}, spec_status="rejected", reject_rule_id="lot-listing", bucket_key=None)
+    store_spec(conn, "item-1", result)
+
+    row = conn.execute(
+        "SELECT spec_json, bucket_key, spec_status, reject_rule_id "
+        "FROM listings WHERE item_id = 'item-1'"
+    ).fetchone()
+    # The empty dict a rejected result carries is a real recorded fact
+    # ("normalize ran and stopped here"), not the same thing as never
+    # having run at all - so this is '{}', not NULL.
+    assert row["spec_json"] == "{}"
+    assert row["bucket_key"] is None
+    assert row["spec_status"] == "rejected"
+    assert row["reject_rule_id"] == "lot-listing"
+
+
+def test_store_spec_is_idempotent(tmp_path):
+    conn = make_conn(tmp_path)
+    sight(conn, "item-1", 1000)
+    result = SpecResult(
+        spec={"generation": "2"}, spec_status="partial", reject_rule_id=None, bucket_key="2|?|?|?"
+    )
+
+    store_spec(conn, "item-1", result)
+    first = dict(conn.execute("SELECT * FROM listings WHERE item_id = 'item-1'").fetchone())
+
+    store_spec(conn, "item-1", result)
+    second = dict(conn.execute("SELECT * FROM listings WHERE item_id = 'item-1'").fetchone())
+
+    assert first == second
 
 
 def test_migration_runs_twice_cleanly_and_leaves_budget_intact(tmp_path):

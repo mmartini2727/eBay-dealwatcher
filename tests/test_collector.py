@@ -280,7 +280,13 @@ async def _unmappable_item_with_no_price_still_writes_both_rows(tmp_path):
     ).fetchone()
     assert row is not None
     assert row["title"] == bad_item["title"]
-    assert row["spec_status"] == "pending"  # a mapping failure, not a normalization outcome
+    # V0.7b: spec and price are independent - a mapping failure still has a
+    # title, so it still gets normalized. make_profile()'s empty
+    # bucket_require makes every normalize() call land on 'ok' (vacuously -
+    # see test_collector_sighting_produces_a_normalized_row_not_pending for
+    # the real profile's more informative case); the point here is just
+    # that it is no longer left at 'pending'.
+    assert row["spec_status"] != "pending"
 
     obs = get_latest_observation(conn, "v1|1|0")
     assert obs is not None
@@ -484,26 +490,114 @@ async def _two_identical_cycles_write_one_observation_per_item(tmp_path):
     assert stats.poll_count == 2
 
 
-def test_every_row_written_carries_spec_status(tmp_path):
-    run(_every_row_written_carries_spec_status(tmp_path))
+def test_collector_sighting_produces_a_normalized_row_not_pending(tmp_path):
+    run(_collector_sighting_produces_a_normalized_row_not_pending(tmp_path))
 
 
-async def _every_row_written_carries_spec_status(tmp_path):
-    # record_sighting (storage/sqlite.py) now defaults spec_status to
-    # 'pending' for a brand-new row when the caller doesn't specify one -
-    # the collector doesn't pass spec_status at all, so every row it writes
-    # gets that default. (Previously this hardcoded 'stale', which is
-    # wrong for a listing that has never been normalized; fixed in the
-    # V0.5 correction.)
+async def _collector_sighting_produces_a_normalized_row_not_pending(tmp_path):
+    # V0.7b: the collector now calls normalize() inline on every sighting.
+    # record_sighting's own 'pending' default (storage/sqlite.py; still
+    # covered directly by test_storage_listings.py) is what a brand-new row
+    # starts at before that call - it must not be what it's LEFT at once
+    # the collector has actually run. Uses the real profile, not
+    # make_profile()'s empty one, so the assertion says something (a
+    # profile with no bucket_require would vacuously call everything 'ok').
     conn = connect(tmp_path / "dealwatch.db")
     provider = FakeProvider()
-    provider.queue_items([raw_item()])
-    profile = make_profile()
+    provider.queue_items([raw_item()])  # "Lenovo ThinkPad T14 Gen 1 16GB 256GB"
+    profile = load_profile(Path(__file__).parent.parent / "profiles" / "thinkpad-t14.yaml")
     stats = CollectorStats()
 
     await run_fast_poll_cycle(provider, profile, conn, stats)
 
     row = conn.execute(
+        "SELECT spec_status, spec_json, bucket_key FROM listings WHERE item_id = 'v1|1|0'"
+    ).fetchone()
+    # No CPU model in this title - generation extracts ("Gen 1") but
+    # cpu_family doesn't, so bucket_require is unsatisfied: 'partial'.
+    assert row["spec_status"] == "partial"
+
+
+def test_title_change_goes_stale_and_is_renormalized_in_the_same_sighting(tmp_path):
+    run(_title_change_goes_stale_and_is_renormalized_in_the_same_sighting(tmp_path))
+
+
+async def _title_change_goes_stale_and_is_renormalized_in_the_same_sighting(tmp_path):
+    # record_sighting's title-change -> 'stale' path (storage/sqlite.py) is
+    # untouched by V0.7b. What's new is that the collector immediately
+    # re-normalizes in the same call, so 'stale' never survives past the
+    # sighting that produced it.
+    conn = connect(tmp_path / "dealwatch.db")
+    provider = FakeProvider()
+    provider.queue_items(
+        [raw_item(item_id="v1|1|0", title="Lenovo ThinkPad T14 Gen 1 16GB 256GB")]
+    )
+    provider.queue_items(
+        [raw_item(item_id="v1|1|0", title="Lenovo ThinkPad T14 Gen 1 i5-10310U 16GB RAM 256GB SSD")]
+    )
+    profile = load_profile(Path(__file__).parent.parent / "profiles" / "thinkpad-t14.yaml")
+    stats = CollectorStats()
+
+    await run_fast_poll_cycle(provider, profile, conn, stats)
+    first = conn.execute(
         "SELECT spec_status FROM listings WHERE item_id = 'v1|1|0'"
     ).fetchone()
-    assert row["spec_status"] == "pending"
+    assert first["spec_status"] == "partial"  # no cpu_family in the first title
+
+    await run_fast_poll_cycle(provider, profile, conn, stats)
+    second = conn.execute(
+        "SELECT title, spec_status FROM listings WHERE item_id = 'v1|1|0'"
+    ).fetchone()
+
+    assert second["title"] == "Lenovo ThinkPad T14 Gen 1 i5-10310U 16GB RAM 256GB SSD"
+    # Re-normalized against the NEW title (which now has a cpu_family, so
+    # this can only be 'ok' if re-normalization actually ran against it -
+    # a leftover 'partial' or a bare 'stale' would both be wrong).
+    assert second["spec_status"] == "ok"
+
+
+def test_normalize_error_on_one_item_does_not_abort_the_sweep(tmp_path, monkeypatch):
+    run(_normalize_error_on_one_item_does_not_abort_the_sweep(tmp_path, monkeypatch))
+
+
+async def _normalize_error_on_one_item_does_not_abort_the_sweep(tmp_path, monkeypatch):
+    import dealwatch.engine.collector as collector_module
+
+    real_normalize = collector_module.normalize
+
+    def flaky_normalize(profile, listing_fields):
+        if listing_fields.get("title") == "poison pill":
+            raise RuntimeError("boom")
+        return real_normalize(profile, listing_fields)
+
+    monkeypatch.setattr(collector_module, "normalize", flaky_normalize)
+
+    conn = connect(tmp_path / "dealwatch.db")
+    budget = DailyBudget(make_settings(tmp_path))
+    provider = FakeProvider(budget)
+    provider.queue_items(
+        [
+            raw_item(item_id="v1|1|0"),
+            raw_item(item_id="v1|2|0", title="poison pill"),
+            raw_item(item_id="v1|3|0"),
+        ],
+        reserve=1,
+    )
+    profile = make_profile()
+    stats = CollectorStats()
+
+    await run_sweep_cycle(provider, profile, budget, conn, stats)
+
+    # The sighting (record_sighting) still landed for the poisoned item -
+    # only its normalization was skipped, not the whole item.
+    assert get_latest_observation(conn, "v1|1|0") is not None
+    assert get_latest_observation(conn, "v1|2|0") is not None
+    # And the sweep kept going past the poisoned item to the next one.
+    assert get_latest_observation(conn, "v1|3|0") is not None
+
+    poisoned = conn.execute(
+        "SELECT spec_status FROM listings WHERE item_id = 'v1|2|0'"
+    ).fetchone()
+    assert poisoned["spec_status"] == "pending"  # left untouched, recoverable by backfill
+
+    assert stats.normalize_error_count == 1

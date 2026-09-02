@@ -24,6 +24,7 @@ from pathlib import Path
 import yaml
 
 from dealwatch.config import Settings
+from dealwatch.normalize.engine import normalize
 from dealwatch.normalize.listing import (
     Listing,
     ListingMappingError,
@@ -36,7 +37,13 @@ from dealwatch.normalize.schema import Profile
 from dealwatch.providers.ebay import EbayBrowseProvider
 from dealwatch.providers.ebay_auth import TokenManager
 from dealwatch.providers.ratelimit import BudgetExhausted, DailyBudget
-from dealwatch.storage.sqlite import connect, default_db_path, record_sighting, record_sweep
+from dealwatch.storage.sqlite import (
+    connect,
+    default_db_path,
+    record_sighting,
+    record_sweep,
+    store_spec,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +72,7 @@ class CollectorStats:
     poll_count: int = 0
     sweep_count: int = 0
     mapping_error_count: int = 0
+    normalize_error_count: int = 0
     cycle_error_count: int = 0
 
     def to_dict(self) -> dict:
@@ -74,6 +82,7 @@ class CollectorStats:
             "poll_count": self.poll_count,
             "sweep_count": self.sweep_count,
             "mapping_error_count": self.mapping_error_count,
+            "normalize_error_count": self.normalize_error_count,
             "cycle_error_count": self.cycle_error_count,
         }
 
@@ -121,6 +130,57 @@ def _raw_only_listing_fields(raw: dict, title: str, profile_id: str) -> dict:
         "seller_feedback_score": _to_int(_get(raw, "seller", "feedbackScore")),
         "condition_id": _to_int(raw.get("conditionId")),
     }
+
+
+def _normalize_input_fields(title: str, raw: dict) -> dict:
+    """The dict shape normalize() expects, built from a raw dict that
+    failed to map - so a mapping failure (V0.7a: still gets a listings row,
+    still has a title) can still get a spec. condition_id/subtitle read the
+    same way map_item_summary does; a missing price says nothing about
+    whether the profile's reject/require/extract rules have what they need.
+    subtitle is always None in practice (Browse returns none, design.md
+    §5.1) but the key stays present rather than absent, matching what
+    listing.model_dump() would give the success path - a rule naming
+    `subtitle` should see "never matches", not a dict lookup miss.
+    """
+    return {
+        "title": title,
+        "subtitle": raw.get("subtitle"),
+        "condition_id": _to_int(raw.get("conditionId")),
+    }
+
+
+def _normalize_and_store(
+    conn,
+    profile: Profile,
+    item_id: str,
+    listing_fields: dict,
+    stats: CollectorStats,
+) -> None:
+    """Run the profile's normalize() over one listing's fields and persist
+    the result via store_spec. Called after every record_sighting - both on
+    a fresh insert and on an existing row, including one record_sighting
+    just marked 'stale' on a title change, so 'stale' never survives past
+    the sighting that produced it.
+
+    Never raises: a normalize() failure (a regex edge case, a malformed
+    listing_fields shape) must not abort the sweep it's part of - one bad
+    listing left at its current spec_status (still 'pending' on a fresh
+    insert) is recoverable by scripts/backfill_normalize.py once the shape
+    is understood; a sweep that dies halfway loses the rest of that sweep's
+    history. Same reasoning as V0.7a's persist-raw-before-mapping fix.
+    """
+    try:
+        result = normalize(profile, listing_fields)
+    except Exception:
+        logger.warning(
+            "normalize() failed for item_id=%s, profile=%s", item_id, profile.id,
+            exc_info=True,
+        )
+        stats.normalize_error_count += 1
+        return
+
+    store_spec(conn, item_id, result)
 
 
 def _process_raw_item(
@@ -188,6 +248,10 @@ def _process_raw_item(
              "raw_json": json.dumps(raw)},
             seen_at_ts,
         )
+        # Spec and price are independent (V0.7b): a known spec with an
+        # unknown price is still useful for bucket membership, it just
+        # can't vote on a baseline. Normalize this row too.
+        _normalize_and_store(conn, profile, item_id, _normalize_input_fields(title, raw), stats)
         return item_id
 
     record_sighting(
@@ -197,6 +261,7 @@ def _process_raw_item(
         _observation_fields(listing, raw),
         seen_at_ts,
     )
+    _normalize_and_store(conn, profile, listing.item_id, listing.model_dump(), stats)
     return listing.item_id
 
 

@@ -7,9 +7,13 @@ schema is forward-only: each migration is a plain SQL script, applied once
 and recorded in schema_version. No ORM, no Alembic.
 
 This module does not normalize. record_sighting() takes already-mapped
-values and never touches normalize/ or providers/ - see design.md §4.1's
-note that raw_json lives on the observation precisely so re-normalization
-can happen later without this module's involvement.
+values and never touches providers/ - see design.md §4.1's note that
+raw_json lives on the observation precisely so re-normalization can happen
+later without this module's involvement. store_spec() (V0.7b) is the one
+exception to "never touches normalize/": it imports SpecResult purely as a
+plain data carrier for its parameter type, and still doesn't call
+normalize() or decide when to - that's entirely the caller's job (see
+store_spec's own docstring).
 """
 
 import json
@@ -19,6 +23,7 @@ from collections.abc import Iterable
 from pathlib import Path
 
 from dealwatch.config import Settings
+from dealwatch.normalize.engine import SpecResult
 
 logger = logging.getLogger(__name__)
 
@@ -261,6 +266,45 @@ def record_sighting(
     except BaseException:
         conn.execute("ROLLBACK")
         raise
+
+
+def store_spec(conn: sqlite3.Connection, item_id: str, result: SpecResult) -> None:
+    """Write one listing's normalization result: spec_json, bucket_key,
+    spec_status, reject_rule_id.
+
+    This is the one function both the collector (inline, on every sighting)
+    and scripts/backfill_normalize.py (over history) call to persist a
+    SpecResult - one implementation so the two can't drift apart from each
+    other by being edited at different times (design.md §5, V0.7b). Neither
+    WHEN to normalize nor WHAT to normalize from is this function's
+    decision: the collector already has mapped listing fields in hand: the
+    backfill reads and maps raw_json itself. This only writes what it's
+    handed.
+
+    spec_json is `result.spec` verbatim, including the empty dict a
+    rejected or not_target result carries - that's a real recorded fact
+    ("normalize ran and stopped here"), not the same thing as 'pending'
+    ("normalize has never run").
+
+    One UPDATE, no explicit BEGIN/COMMIT - a single statement is already
+    atomic under SQLite's own autocommit (see connect()'s isolation_level
+    comment), and a caller doing this right after record_sighting (which
+    does manage its own transaction) doesn't get a surprise nested one.
+    """
+    conn.execute(
+        """
+        UPDATE listings
+        SET spec_json = ?, bucket_key = ?, spec_status = ?, reject_rule_id = ?
+        WHERE item_id = ?
+        """,
+        (
+            json.dumps(result.spec),
+            result.bucket_key,
+            result.spec_status,
+            result.reject_rule_id,
+            item_id,
+        ),
+    )
 
 
 def record_sweep(
