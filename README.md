@@ -129,8 +129,8 @@ be recovered.
 | V0.4 | Normalized `Listing` model | done |
 | V0.5 | SQLite + listing history (WAL) | done |
 | V0.6 | **Dumb collector loop — poll and persist, no scoring** | done |
-| V0.7 | ThinkPad T14 profile + normalize engine | next |
-| V0.8 | Scoring engine | |
+| V0.7 | ThinkPad T14 profile + normalize engine | done |
+| V0.8 | Scoring engine | next |
 | V0.9 | Discord alerts | |
 | V1.0 | MCP server (streamable HTTP, LAN only) | |
 

@@ -183,21 +183,79 @@ when credentials are absent.
 
 ## Current status
 
-- **V0.7 complete:** engine is pure (normalize(profile, listing_fields) -> SpecResult), not wired to the DB. Deployed and live-verified.
-- Report over 1,094 collected listings: 48.7% ok, 36.7% rejected, 12.1% partial, 2.6% not_target. 0 mapping failures in the snapshot.
-139 distinct buckets; 14 ok-only reach min_samples=12; 33 are singletons.
-- Generation disagreement (title text vs. CPU-implied): 428 agree, 2 disagree (~0.5%). Derive stays fill-null; do not add overwrite: true without new evidence.
-- Accessory rule was rejecting Core Ultra machines on webcam; fixed. Rule now reads 0 hits — category_ids: 177 does most of the accessory filtering. Do not delete it as dead weight.
-for-parts-condition reads 0 hits because conditionIds already excludes 7000. Intentional.
-- **Persist raw before mapping is complete** (V0.7a-fix) and paid for itself immediately: it diagnosed the `buyingOptions` bug below on its first sweep after deploy. Without raw_json on the unmappable rows, that cause would have stayed a guess.
-- **The ~6/sweep fixed-price-mapping-failure open item is closed.** Not a mapper bug — the mapper was right to refuse a raw dict with no `price` field. Cause: eBay's set filter is OR, not AND. `buyingOptions: [FIXED_PRICE, BEST_OFFER]` was admitting `["AUCTION","BEST_OFFER"]` listings — an auction whose offer channel includes Best Offer, no `price` field, only `currentBidPrice`. Fixed by narrowing the filter to `[FIXED_PRICE]` alone. See design.md §7 (the OR-semantics finding, general) and §5.5 (what this means for auction+BIN listings, which still get through and are fine).
+- **V0.7b complete.** The normalize engine is wired to the database. The
+  collector calls `normalize()` inline after every `record_sighting` (both the
+  mapped path and V0.7a's raw-only mapping-failure path) and writes via
+  `store_spec()`. `scripts/backfill_normalize.py` re-normalizes
+  `pending`/`stale` rows using the same `store_spec()`; `--all` re-runs
+  everything after a profile change. Idempotent — verified by running it three
+  times against the same snapshot.
+- Live database, 1,317 listings, all normalized: **ok 638, rejected 473,
+  partial 166, not_target 35, pending 5.** The 5 pending are the mapping
+  failures below; nothing is `stale` — the collector's inline normalize
+  resolves a title change within the same sighting, so `stale` never survives
+  past the sighting that produced it.
+- Backfill output was verified against `scripts/normalize_report.py` over the
+  same snapshot: identical distribution. Same engine, same input, so the write
+  path adds nothing the pure function doesn't.
+- **`buyingOptions` filter fixed.** eBay's set filters are **OR, not AND** —
+  `[FIXED_PRICE, BEST_OFFER]` admitted `["AUCTION","BEST_OFFER"]` listings,
+  which carry no `price` field (only `currentBidPrice`) and failed to map at
+  ~5/sweep. Narrowed to `[FIXED_PRICE]`; BIN-with-Best-Offer still matches,
+  auction+BIN still comes through with a real BIN price. Diagnosed from
+  `raw_json` on disk — persist-raw earned its keep on its first sweep.
+- **Profile edits need `docker compose restart`, not `up -d --build`.**
+  `profiles/` is a read-only bind mount, so the file updates on disk while the
+  running process keeps the profile it read at startup. `docker compose exec
+  dealwatch grep ... /app/profiles/*.yaml` shows the *file*, not what the
+  process is using — check the request URL in the logs instead. This cost an
+  hour: the fix looked deployed and wasn't.
+- Price ceiling raised to `[80, 2000]` and live-verified: 35 observations above
+  $1,200 within two sweeps, including Gen 5 Ryzen 8540U, Gen 6 Ultra 258V, and
+  Gen 6 Ryzen AI 350 — target machines that were invisible under the old
+  filter. `alerts.max_price_usd: 1200` is the buying ceiling; the search filter
+  is not.
+- Accessory rule was rejecting Core Ultra machines on `webcam`; fixed, now 0
+  hits. `category_ids: 177` does most of the accessory filtering.
+  `for-parts-condition` reads 0 because `conditionIds` already excludes 7000.
+  Both intentional — do not prune as dead weight.
+- Generation disagreement (title text vs. CPU-implied): 479 agree, 2 disagree
+  (~0.4%). Derive stays fill-null; do not add `overwrite: true` without new
+  evidence.
+- 153 distinct buckets; 15 ok-only reach `min_samples=12`; 35 are singletons.
 
 ## Open items before V0.8
 
-- **Correct design.md §7's budget math.** It assumes ~2 calls per cycle against a 150-listing active set. Measured: ~1,000 active listings, sweep costs ~11 calls, ~264/day for one watch. Still comfortable at 4,750, but the old figure would badly under-estimate five watches.
+- **Backfill can't normalize mapping-failure rows.** It calls
+  `map_item_summary()` first, which throws, so those 5 rows stay `pending`
+  forever. The collector handles the same case fine by reading title /
+  condition_id straight from the raw dict. Two triggers, one store path, two
+  different "what do I normalize from" paths — make the backfill fall back the
+  way the collector does.
+- **Remaining ~166 partials: CPU marker with no model number and no ordinal**
+  ("Core i5", "Ryzen 5"). Intel is derivable from generation + vendor, but that
+  makes `bucket_require` satisfiable by inference, and a wrong generation would
+  then manufacture a `cpu_family` too. Separate design session, not a pattern
+  tweak.
+- **`Ryzen PRO 8540U` pattern gap.** No digit between "Ryzen" and "PRO", so
+  `\bryzen\s*[3579]\s*(?:pro\s*)?8\d{3}` misses it. Unlike the bare-marker
+  cases this one is fixable — the model number is right there.
+- **Two disagreement listings produce impossible buckets** (`1|intel-11th`,
+  `1|intel-12th`). V0.8 wants a sanity check on generation/CPU pairs that
+  cannot exist.
+- **Resurrections.** First observed on the V0.7a deploy (`lifespan_mins=1082`).
+  Later, 7 items with identical `lifespan_mins=2836` (~47h) — most likely one
+  seller's batch listed and pulled together, not index inconsistency.
+  `gone_at` otherwise clusters in groups of 1–6 per hourly sweep, which is
+  expected since only the sweep writes `last_seen`. §4.2 says count these;
+  the running total is the only evidence about whether N=3 is right.
+- **Correct design.md §7's budget math.** It assumes ~2 calls per cycle against
+  a 150-listing active set. Measured: ~1,300 active listings, sweep costs ~11
+  calls, ~450/day for one watch. Comfortable at 4,750, but the old figure would
+  badly under-estimate five watches.
 - Delete `reserve(n)`'s unused `n` parameter.
-- **WAL high-water is ~4 MB** after the initial full sweeps. Checkpoints are clean (`wal_checkpoint(PASSIVE)` returns `(0, n, n)`). Re-check after a day of steady state; if it has grown an order of magnitude, something is holding a read snapshot.
-- Remaining 132 partials: CPU marker with no model number and no ordinal. Intel derivable from generation + vendor, but that makes bucket_require satisfiable by inference and a wrong generation would manufacture a cpu_family. Separate design session.
-- Two disagreement listings produced impossible buckets (1|intel-11th, 1|intel-12th). V0.8 wants a sanity check on generation/CPU pairs that can't exist.
-- First resurrection observed on deploy: lifespan_mins=1082, ~18h. §4.2 says count these; they're the only evidence about whether N=3 is right.
-- Second resurrection cohort: 7 items, all with identical lifespan_mins=2836 — same value across all 7 reads as one relist event, not 7 independent index-inconsistency reads. Likely a single seller's batch relist. Still counts per §4.2; the running total, not any one cohort, is what tells us whether N=3 holds.
+- **WAL high-water was ~4 MB** after the initial full sweeps. Re-check now that
+  the backfill has written every row; if it has grown an order of magnitude,
+  something is holding a read snapshot.
+- `VACUUM INTO` refuses to overwrite an existing file. `rm -f` the target
+  first, or the snapshot silently doesn't happen and you deploy without one.
