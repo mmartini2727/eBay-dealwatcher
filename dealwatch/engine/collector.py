@@ -32,6 +32,7 @@ from dealwatch.normalize.listing import (
     _to_float,
     _to_int,
     map_item_summary,
+    normalize_input_fields,
 )
 from dealwatch.normalize.schema import Profile
 from dealwatch.providers.ebay import EbayBrowseProvider
@@ -128,24 +129,6 @@ def _raw_only_listing_fields(raw: dict, title: str, profile_id: str) -> dict:
         "seller": _get(raw, "seller", "username"),
         "seller_feedback_pct": _to_float(_get(raw, "seller", "feedbackPercentage")),
         "seller_feedback_score": _to_int(_get(raw, "seller", "feedbackScore")),
-        "condition_id": _to_int(raw.get("conditionId")),
-    }
-
-
-def _normalize_input_fields(title: str, raw: dict) -> dict:
-    """The dict shape normalize() expects, built from a raw dict that
-    failed to map - so a mapping failure (V0.7a: still gets a listings row,
-    still has a title) can still get a spec. condition_id/subtitle read the
-    same way map_item_summary does; a missing price says nothing about
-    whether the profile's reject/require/extract rules have what they need.
-    subtitle is always None in practice (Browse returns none, design.md
-    §5.1) but the key stays present rather than absent, matching what
-    listing.model_dump() would give the success path - a rule naming
-    `subtitle` should see "never matches", not a dict lookup miss.
-    """
-    return {
-        "title": title,
-        "subtitle": raw.get("subtitle"),
         "condition_id": _to_int(raw.get("conditionId")),
     }
 
@@ -251,7 +234,7 @@ def _process_raw_item(
         # Spec and price are independent (V0.7b): a known spec with an
         # unknown price is still useful for bucket membership, it just
         # can't vote on a baseline. Normalize this row too.
-        _normalize_and_store(conn, profile, item_id, _normalize_input_fields(title, raw), stats)
+        _normalize_and_store(conn, profile, item_id, normalize_input_fields(title, raw), stats)
         return item_id
 
     record_sighting(

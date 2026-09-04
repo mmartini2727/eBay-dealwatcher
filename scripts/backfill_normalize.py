@@ -17,21 +17,31 @@ title has changed since" (design.md §4.1). --all re-normalizes every
 listing regardless of current status, for use after a profile/regex change
 whose effects need to replace a previous run's results wholesale.
 
-For each selected listing, reads its most recent observation's raw_json,
-maps it with map_item_summary(), runs normalize(), and calls store_spec() -
-the same function dealwatch.engine.collector calls inline on every new
-sighting. One implementation, two callers: a listing normalized by the
-live collector and one normalized by this backfill can never compute a
-spec_json differently just because they went through different code paths.
+For each selected listing, reads its most recent observation's raw_json and
+maps it with map_item_summary(). On success, normalize() runs against the
+mapped Listing. On a ListingMappingError (V0.7c: the known real case is a
+missing/malformed `price`), this falls back to the same raw-dict field
+extraction dealwatch.engine.collector uses inline for the same situation
+(normalize_input_fields(), dealwatch.normalize.listing) - a mapping failure
+still has a title, and a known spec with an unknown price is still useful
+for bucket membership even though it can't vote on a baseline. Either way,
+store_spec() writes the result - the same function the live collector
+calls. One implementation of "how to get from a raw dict to a spec",
+shared by both callers, so they can never compute a spec_json differently
+just because they went through different code paths.
 
 Idempotent: normalize() and store_spec() are both pure functions of their
 inputs, so running this twice with no data changes in between produces
 identical rows both times. With the default filter, the second run also
 simply selects nothing (nothing is left pending/stale).
 
-A listing with no observations at all, or whose latest raw_json fails to
-map, is left completely untouched - not even a status flip - and counted
-separately in the summary. Never skipped silently.
+A listing is left completely untouched - not even a status flip - only
+when there's truly nothing to normalize from: no observations at all, or a
+raw dict with no `title` (map_item_summary's other two required fields,
+item_id/price, have fallbacks here or don't matter for normalizing; title
+does not - there's no rule input to build without it). Both are counted
+separately in the summary, distinct from ordinary mapped/raw-fallback
+counts. Never skipped silently.
 """
 
 import argparse
@@ -41,7 +51,11 @@ from datetime import datetime, timezone
 
 from dealwatch.engine.collector import load_profile
 from dealwatch.normalize.engine import compile_profile, normalize
-from dealwatch.normalize.listing import ListingMappingError, map_item_summary
+from dealwatch.normalize.listing import (
+    ListingMappingError,
+    map_item_summary,
+    normalize_input_fields,
+)
 from dealwatch.storage.sqlite import connect, store_spec
 
 # Mirrors scripts/normalize_report.py's LATEST_OBSERVATION_PER_LISTING, plus
@@ -75,7 +89,9 @@ def run_backfill(profile, conn, *, all_listings: bool) -> str:
 
     status_counts: Counter = Counter()
     no_observations = 0
-    mapping_failures = 0
+    unprocessable = 0  # ListingMappingError AND no title - nothing to normalize from
+    mapped_normally = 0
+    raw_fallback = 0
     now = datetime.now(timezone.utc)
 
     for row in rows:
@@ -87,11 +103,19 @@ def run_backfill(profile, conn, *, all_listings: bool) -> str:
         try:
             listing = map_item_summary(raw, now)
         except ListingMappingError:
-            mapping_failures += 1
+            title = raw.get("title")
+            if not title:
+                unprocessable += 1
+                continue
+            result = normalize(profile, normalize_input_fields(title, raw))
+            store_spec(conn, row["item_id"], result)
+            raw_fallback += 1
+            status_counts[result.spec_status] += 1
             continue
 
         result = normalize(profile, listing.model_dump())
         store_spec(conn, row["item_id"], result)
+        mapped_normally += 1
         status_counts[result.spec_status] += 1
 
     total = sum(status_counts.values())
@@ -100,9 +124,10 @@ def run_backfill(profile, conn, *, all_listings: bool) -> str:
         pct = (100 * count / total) if total else 0.0
         lines.append(f"  {status:12s} {count:5d}  ({pct:5.1f}%)")
     lines.append(
-        f"  ({total} listings normalized and written; {len(rows)} selected, "
-        f"{no_observations} had no observations, {mapping_failures} failed "
-        f"map_item_summary() - all left untouched)"
+        f"  ({total} listings normalized and written: {mapped_normally} mapped "
+        f"normally, {raw_fallback} normalized from raw fields; {len(rows)} "
+        f"selected, {no_observations} had no observations, {unprocessable} "
+        f"had no title to normalize from - both left untouched)"
     )
     return "\n".join(lines)
 

@@ -10,7 +10,11 @@ from pathlib import Path
 
 import pytest
 
-from dealwatch.normalize.listing import ListingMappingError, map_item_summary
+from dealwatch.normalize.listing import (
+    ListingMappingError,
+    map_item_summary,
+    normalize_input_fields,
+)
 
 def _load_titles() -> list[str]:
     lines = (Path(__file__).parent / "fixtures" / "titles.txt").read_text().splitlines()
@@ -215,6 +219,27 @@ def test_missing_buying_options_is_empty_list_not_none():
     listing = map_item_summary(raw, seen_at=SEEN_AT)
 
     assert listing.buying_options == []
+
+
+def test_normalize_input_fields_extracts_subtitle_and_condition_id():
+    # The raw-dict fallback dealwatch.engine.collector and
+    # scripts/backfill_normalize.py both use when map_item_summary() fails
+    # (V0.7b/V0.7c) - condition_id must convert to int the same way
+    # map_item_summary does, since for-parts-condition's reject rule
+    # matches on the int value 7000, not the string "7000".
+    raw = {"subtitle": "a subtitle", "conditionId": "7000"}
+    result = normalize_input_fields("Lenovo ThinkPad T14 Gen 1", raw)
+    assert result == {
+        "title": "Lenovo ThinkPad T14 Gen 1",
+        "subtitle": "a subtitle",
+        "condition_id": 7000,
+    }
+
+
+def test_normalize_input_fields_defaults_subtitle_and_condition_id_to_none():
+    result = normalize_input_fields("Lenovo ThinkPad T14 Gen 1", {})
+    assert result["subtitle"] is None
+    assert result["condition_id"] is None
 
 
 @pytest.mark.parametrize("title", TITLES)

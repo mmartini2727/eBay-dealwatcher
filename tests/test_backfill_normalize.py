@@ -100,6 +100,20 @@ def test_backfill_run_twice_produces_identical_state(tmp_path):
     seed(conn, "v1|2|0", "Lenovo ThinkPad T14 Gen 1 16GB 256GB", 1001)  # -> partial
     seed(conn, "v1|3|0", "Lenovo ThinkPad T480 Core i5 16GB 256GB", 1002)  # -> not_target
 
+    # Also cover the raw-fallback path (V0.7c) in the idempotency check -
+    # not just the normally-mapped one above.
+    bad_raw = {"itemId": "v1|4|0", "title": "Lenovo ThinkPad T14 Gen 1 i5-10310U 16GB 256GB"}
+    conn.execute(
+        "INSERT INTO listings (item_id, profile_id, title, spec_status, "
+        "first_seen, last_seen, miss_count) VALUES (?, ?, ?, 'pending', 1000, 1000, 0)",
+        ("v1|4|0", PROFILE.id, bad_raw["title"]),
+    )
+    conn.execute(
+        "INSERT INTO observations (item_id, observed_at, buying_options, raw_json) "
+        "VALUES (?, ?, ?, ?)",
+        ("v1|4|0", 1000, "[]", json.dumps(bad_raw)),
+    )
+
     run_backfill(PROFILE, conn, all_listings=False)
     first = [dict(row) for row in conn.execute("SELECT * FROM listings ORDER BY item_id")]
 
@@ -155,13 +169,20 @@ def test_backfill_fails_fast_on_a_bad_profile_even_with_nothing_selected(tmp_pat
         run_backfill(bad_profile, conn, all_listings=False)
 
 
-def test_backfill_leaves_a_mapping_failure_untouched_and_counts_it(tmp_path):
+def test_backfill_normalizes_a_mapping_failure_from_raw_fields_when_title_present(tmp_path):
+    # V0.7c fix 1: a mapping-failure row with a title (the real case: 5
+    # live rows, all missing `price`) is no longer left pending forever -
+    # it gets normalized the same way the collector does, from the raw
+    # dict's title/subtitle/condition_id directly.
     conn = connect(tmp_path / "dealwatch.db")
-    bad_raw = {"itemId": "v1|bad|0", "title": "Broken listing"}  # no price
+    bad_raw = {
+        "itemId": "v1|bad|0",
+        "title": "Lenovo ThinkPad T480 Core i5 16GB 256GB",  # no price
+    }
     conn.execute(
         "INSERT INTO listings (item_id, profile_id, title, spec_status, "
         "first_seen, last_seen, miss_count) VALUES (?, ?, ?, 'pending', 1000, 1000, 0)",
-        ("v1|bad|0", PROFILE.id, "Broken listing"),
+        ("v1|bad|0", PROFILE.id, bad_raw["title"]),
     )
     conn.execute(
         "INSERT INTO observations (item_id, observed_at, buying_options, raw_json) "
@@ -171,5 +192,53 @@ def test_backfill_leaves_a_mapping_failure_untouched_and_counts_it(tmp_path):
 
     output = run_backfill(PROFILE, conn, all_listings=False)
 
-    assert status_of(conn, "v1|bad|0") == "pending"
-    assert "1 failed map_item_summary()" in output
+    # T480 fails the is-t14 require rule regardless of price - proves
+    # normalize() actually ran against the raw-fallback fields, not just
+    # that SOME status got written.
+    assert status_of(conn, "v1|bad|0") == "not_target"
+    assert "1 normalized from raw fields" in output
+
+
+def test_backfill_reports_a_listing_with_no_title_as_unprocessable(tmp_path):
+    # The genuinely unrecoverable case: no title anywhere to normalize
+    # from (map_item_summary's other required fields, item_id/price, have
+    # a fallback or don't matter here - title doesn't).
+    conn = connect(tmp_path / "dealwatch.db")
+    bad_raw = {"itemId": "v1|bad|0"}  # no title, no price
+    conn.execute(
+        "INSERT INTO listings (item_id, profile_id, title, spec_status, "
+        "first_seen, last_seen, miss_count) VALUES (?, ?, ?, 'pending', 1000, 1000, 0)",
+        ("v1|bad|0", PROFILE.id, "(unknown)"),
+    )
+    conn.execute(
+        "INSERT INTO observations (item_id, observed_at, buying_options, raw_json) "
+        "VALUES (?, ?, ?, ?)",
+        ("v1|bad|0", 1000, "[]", json.dumps(bad_raw)),
+    )
+
+    output = run_backfill(PROFILE, conn, all_listings=False)
+
+    assert status_of(conn, "v1|bad|0") == "pending"  # untouched, not crashed on
+    assert "1 had no title to normalize from" in output
+
+
+def test_backfill_summary_distinguishes_mapped_from_raw_fallback(tmp_path):
+    conn = connect(tmp_path / "dealwatch.db")
+    seed(conn, "v1|1|0", "Lenovo ThinkPad T14 Gen 1 i5-10310U 16GB RAM 256GB SSD", 1000)
+
+    bad_raw = {"itemId": "v1|2|0", "title": "Lenovo ThinkPad T480 Core i5 16GB 256GB"}
+    conn.execute(
+        "INSERT INTO listings (item_id, profile_id, title, spec_status, "
+        "first_seen, last_seen, miss_count) VALUES (?, ?, ?, 'pending', 1000, 1000, 0)",
+        ("v1|2|0", PROFILE.id, bad_raw["title"]),
+    )
+    conn.execute(
+        "INSERT INTO observations (item_id, observed_at, buying_options, raw_json) "
+        "VALUES (?, ?, ?, ?)",
+        ("v1|2|0", 1000, "[]", json.dumps(bad_raw)),
+    )
+
+    output = run_backfill(PROFILE, conn, all_listings=False)
+
+    assert "1 mapped normally" in output
+    assert "1 normalized from raw fields" in output

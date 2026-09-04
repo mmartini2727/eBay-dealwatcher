@@ -148,3 +148,32 @@ def map_item_summary(raw: dict, seen_at: datetime) -> Listing:
         current_bid_cents=_optional_cents(_get(raw, "currentBidPrice", "value")),
         bid_count=_to_int(raw.get("bidCount")),
     )
+
+
+def normalize_input_fields(title: str, raw: dict) -> dict:
+    """The dict shape dealwatch.normalize.engine.normalize() expects, built
+    directly from a raw itemSummary dict that failed map_item_summary() -
+    so a mapping failure (missing/malformed price is the known real case;
+    design.md "persist raw before mapping") can still get a spec. Shared by
+    dealwatch.engine.collector (inline, on every sighting) and
+    scripts/backfill_normalize.py (over history) - one implementation, so
+    the two can't drift into extracting title/subtitle/condition_id
+    differently just because they're edited at different times.
+
+    condition_id/subtitle read the same way map_item_summary does; a
+    missing price says nothing about whether the profile's reject/require/
+    extract rules have what they need. subtitle is always None in practice
+    (Browse returns none, design.md §5.1) but the key stays present rather
+    than absent, matching what a mapped Listing's model_dump() would give
+    on the success path - a rule naming `subtitle` should see "never
+    matches", not a dict lookup miss.
+
+    Callers are responsible for confirming `title` is present before
+    calling this - there is no fallback for a missing title, the same way
+    map_item_summary itself has none.
+    """
+    return {
+        "title": title,
+        "subtitle": raw.get("subtitle"),
+        "condition_id": _to_int(raw.get("conditionId")),
+    }

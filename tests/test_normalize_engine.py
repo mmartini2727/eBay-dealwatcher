@@ -335,6 +335,80 @@ def test_ryzen_ai_is_not_misread_as_a_digit_series_family():
 
 
 # ---------------------------------------------------------------------------
+# V0.7c fix 2: the AMD series digit ([3579]) is optional across the
+# model-number patterns - "Ryzen PRO 8540U" (no series digit at all) was
+# coming back cpu_family=None. The four-digit model number stays mandatory.
+# ---------------------------------------------------------------------------
+
+
+def test_ryzen_pro_with_no_series_digit_matches_the_real_listing():
+    title = title_containing("Ryzen PRO 8540U")
+    result = normalize(PROFILE, fields(title))
+    assert result.spec["cpu_family"] == "amd-ryzen-8000"
+
+
+def test_ryzen_pro_with_no_series_digit_derives_generation_via_derive_rule():
+    # Isolates the derive rule from extraction, same convention as
+    # test_generation_derive_rule_fills_in_when_title_has_no_gen_marker
+    # above: no "Gen N" text anywhere in this constructed title, so
+    # generation starts null after extraction and only the derive rule
+    # (keyed on cpu_family) can fill it in.
+    title = "Lenovo ThinkPad T14 AMD Ryzen PRO 8540U 16GB 256GB"
+    result = normalize(PROFILE, fields(title))
+    assert result.spec["cpu_family"] == "amd-ryzen-8000"
+    assert result.spec["generation"] == "5"
+
+
+def test_ryzen_5_pro_8540u_with_series_digit_still_matches():
+    # Regression check: the already-working case (series digit present)
+    # must still work once the digit is made optional, not just the new
+    # no-digit case.
+    title = "Lenovo ThinkPad T14 AMD Ryzen 5 PRO 8540U 16GB 256GB"
+    result = normalize(PROFILE, fields(title))
+    assert result.spec["cpu_family"] == "amd-ryzen-8000"
+
+
+def test_ryzen_5_pro_with_no_model_number_still_yields_none():
+    # The line this fix must not cross: a bare CPU marker with no model
+    # number is a separate inference decision (out of scope), not a
+    # pattern fix. Making the series digit optional must not turn this
+    # into an accidental match.
+    title = "Lenovo ThinkPad T14 AMD Ryzen 5 PRO 16GB 256GB"
+    result = normalize(PROFILE, fields(title))
+    assert result.spec["cpu_family"] is None
+
+
+@pytest.mark.parametrize(
+    "model_number,expected_family",
+    [
+        ("4680U", "amd-ryzen-4000"),
+        ("5625U", "amd-ryzen-5000"),
+        ("6850U", "amd-ryzen-6000"),
+        ("7735U", "amd-ryzen-7000"),
+    ],
+)
+def test_ryzen_pro_with_no_series_digit_matches_other_series_for_consistency(
+    model_number, expected_family
+):
+    # The task named 8000 as the motivating case but asked for the same
+    # treatment on 4000/5000/6000/7000 "for consistency - the same seller
+    # habit will show up on those." No real fixture title for these yet,
+    # constructed directly.
+    title = f"Lenovo ThinkPad T14 AMD Ryzen PRO {model_number} 16GB 256GB"
+    result = normalize(PROFILE, fields(title))
+    assert result.spec["cpu_family"] == expected_family
+
+
+def test_ryzen_ai_9_365_still_resolves_to_amd_ryzen_ai_not_a_loosened_digit_pattern():
+    # The exact title named in the V0.7c task: confirms the ryzen-ai
+    # pattern still takes precedence now that the digit-series patterns
+    # below it no longer require a series digit either.
+    title = "Lenovo ThinkPad T14 AMD Ryzen AI 9 365 16GB 256GB"
+    result = normalize(PROFILE, fields(title))
+    assert result.spec["cpu_family"] == "amd-ryzen-ai"
+
+
+# ---------------------------------------------------------------------------
 # V0.7a fix 2: cpu_family ordinal fallbacks ("i5 10th Gen", "12Gen Intel
 # i5", bare "10610U" with no i-series adjacency). 204/1094 real listings
 # came back partial with cpu_family null before this fix; real titles below.

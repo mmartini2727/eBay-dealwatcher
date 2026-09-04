@@ -38,6 +38,11 @@
   - Lenovo ThinkPad T14 1st Gen 14" (256GB SSD, Intel Core i5 10th Gen., 16GB Ram)
   - Lenovo ThinkPad T14 Intel Core i7 vPRO 10610U CPU/512GB SSD/16GB RAM Laptop
 
+  # V0.7c addition: real listing, currently partial - "Ryzen PRO 8540U" has
+  # no series digit between "Ryzen" and "PRO" at all, missing the old
+  # cpu_family patterns entirely.
+  - Lenovo ThinkPad T14 Gen 5 | 14" Ryzen PRO 8540U Radeon 740M 16GB 1TB Win 11 Pro
+
   # No real observed example on file yet for these reject rules (the V0.7a
   # report output quoted in the task didn't include one) - the tests below
   # construct a title inline rather than inventing a fake "real" fixture

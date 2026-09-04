@@ -169,26 +169,38 @@ extract:
   cpu_family:
     from: title
     rules:
-      # AMD — generation is inferable from the Ryzen series, see derive below
-      - pattern: '\bryzen\s*[3579]\s*pro\s*4\d{3}'
+      # AMD — generation is inferable from the Ryzen series, see derive below.
+      # The series digit ([3579]) is OPTIONAL (V0.7c) - real sellers write
+      # "Ryzen PRO 8540U" with no series digit at all ("Lenovo ThinkPad
+      # T14 Gen 5 | 14" Ryzen PRO 8540U Radeon 740M 16GB 1TB Win 11 Pro",
+      # tests/fixtures/titles.txt). The four-digit model number stays
+      # mandatory - "Ryzen 5 PRO" alone, with no model number, still
+      # matches nothing here and cpu_family stays null. Bare CPU markers
+      # with no model number are a separate inference decision, out of
+      # scope for a pattern fix (see the V0.7c task).
+      - pattern: '\bryzen\s*[3579]?\s*pro\s*4\d{3}'
         value: amd-ryzen-4000
-      - pattern: '\bryzen\s*[3579]\s*pro\s*5\d{3}'
+      - pattern: '\bryzen\s*[3579]?\s*pro\s*5\d{3}'
         value: amd-ryzen-5000
-      - pattern: '\bryzen\s*[3579]\s*4\d{3}'
+      - pattern: '\bryzen\s*[3579]?\s*4\d{3}'
         value: amd-ryzen-4000
-      - pattern: '\bryzen\s*[3579]\s*5\d{3}'
+      - pattern: '\bryzen\s*[3579]?\s*5\d{3}'
         value: amd-ryzen-5000
       # "Ryzen AI" model names carry their own series digit after "AI"
       # (e.g. "Ryzen AI 9 365") - this must be checked before the
       # digit-series patterns below so an AI chip is never misread as a
-      # plain 6000/7000/8000-series part.
+      # plain 6000/7000/8000-series part. Still true with the series digit
+      # now optional on those patterns: none of them can match through the
+      # literal "AI" text between "Ryzen" and the model number anyway, but
+      # this rule staying first is what makes that true by construction
+      # rather than by accident of what "AI" happens to look like.
       - pattern: '\bryzen\s*ai\b'
         value: amd-ryzen-ai
-      - pattern: '\bryzen\s*[3579]\s*(?:pro\s*)?6\d{3}'
+      - pattern: '\bryzen\s*[3579]?\s*(?:pro\s*)?6\d{3}'
         value: amd-ryzen-6000
-      - pattern: '\bryzen\s*[3579]\s*(?:pro\s*)?7\d{3}'
+      - pattern: '\bryzen\s*[3579]?\s*(?:pro\s*)?7\d{3}'
         value: amd-ryzen-7000
-      - pattern: '\bryzen\s*[3579]\s*(?:pro\s*)?8\d{3}'
+      - pattern: '\bryzen\s*[3579]?\s*(?:pro\s*)?8\d{3}'
         value: amd-ryzen-8000
       # Intel — 4-digit model numbers, 10th gen onward
       - pattern: '\bi[3579][\s-]?10\d{2,3}'
