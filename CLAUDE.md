@@ -108,6 +108,7 @@ plus a normalizer module — nothing else.
   it should not instantiate a `DailyBudget`-style per-call wrapper around
   the listings/observations write path.
 - Tests do not ship in the image. tests/ is deliberately not copied into the Dockerfile and pytest is not installed there — the Mac venv is the authoritative test environment. Do not add COPY tests ./tests or pip install '.[dev]' to the Dockerfile.
+- Two triggers, one path. The collector and scripts/backfill_normalize.py both normalize, and both build their input via normalize_input_fields() in normalize/listing.py. If one grows a new way of extracting fields from a raw dict, the other gets it too — they drifted once, and the backfill silently couldn't repair a class of row for a week.
 
 ---
 
@@ -155,6 +156,7 @@ re-mappable once the shape is understood. Mapping first and dropping failures
 loses history permanently: 5 of 150 live listings currently fail to map
 (auction-only, no `price` field), and that is 3% of comps gone for a bug that
 takes ten minutes to fix afterward.
+
 ---
 
 ## Operational notes
@@ -190,11 +192,7 @@ when credentials are absent.
   `pending`/`stale` rows using the same `store_spec()`; `--all` re-runs
   everything after a profile change. Idempotent — verified by running it three
   times against the same snapshot.
-- Live database, 1,317 listings, all normalized: **ok 638, rejected 473,
-  partial 166, not_target 35, pending 5.** The 5 pending are the mapping
-  failures below; nothing is `stale` — the collector's inline normalize
-  resolves a title change within the same sighting, so `stale` never survives
-  past the sighting that produced it.
+- Live database, 1,386 listings, all normalized: ok 677, rejected 502, partial 168, not_target 39. Zero pending, zero stale. The 5 former mapping-failure rows now normalize from raw fields via the backfill's fallback.
 - Backfill output was verified against `scripts/normalize_report.py` over the
   same snapshot: identical distribution. Same engine, same input, so the write
   path adds nothing the pure function doesn't.
@@ -223,32 +221,19 @@ when credentials are absent.
   (~0.4%). Derive stays fill-null; do not add `overwrite: true` without new
   evidence.
 - 153 distinct buckets; 15 ok-only reach `min_samples=12`; 35 are singletons.
+- V0.7c complete. Backfill gained the collector's raw-field fallback — normalize_input_fields() now lives in normalize/listing.py and both callers use it. AMD model-number patterns had the series digit made optional ([3579]?) so "Ryzen PRO 8540U" matches; the four-digit model number stays mandatory, so bare "Ryzen 5 PRO" is still None.
 
 ## Open items before V0.8
 
-- **Backfill can't normalize mapping-failure rows.** It calls
-  `map_item_summary()` first, which throws, so those 5 rows stay `pending`
-  forever. The collector handles the same case fine by reading title /
-  condition_id straight from the raw dict. Two triggers, one store path, two
-  different "what do I normalize from" paths — make the backfill fall back the
-  way the collector does.
 - **Remaining ~166 partials: CPU marker with no model number and no ordinal**
   ("Core i5", "Ryzen 5"). Intel is derivable from generation + vendor, but that
   makes `bucket_require` satisfiable by inference, and a wrong generation would
   then manufacture a `cpu_family` too. Separate design session, not a pattern
   tweak.
-- **`Ryzen PRO 8540U` pattern gap.** No digit between "Ryzen" and "PRO", so
-  `\bryzen\s*[3579]\s*(?:pro\s*)?8\d{3}` misses it. Unlike the bare-marker
-  cases this one is fixable — the model number is right there.
 - **Two disagreement listings produce impossible buckets** (`1|intel-11th`,
   `1|intel-12th`). V0.8 wants a sanity check on generation/CPU pairs that
   cannot exist.
-- **Resurrections.** First observed on the V0.7a deploy (`lifespan_mins=1082`).
-  Later, 7 items with identical `lifespan_mins=2836` (~47h) — most likely one
-  seller's batch listed and pulled together, not index inconsistency.
-  `gone_at` otherwise clusters in groups of 1–6 per hourly sweep, which is
-  expected since only the sweep writes `last_seen`. §4.2 says count these;
-  the running total is the only evidence about whether N=3 is right.
+- **Resurrections.** Three cohorts observed so far (lifespan_mins 1082; 2836 ×7; 5670 ×3). Identical lifespans within a cohort are expected, not suspicious — last_seen is sweep-only and first_seen is usually a sweep, so hourly quantization makes matching values common. The 5670 cohort spanned two different sellers, ruling out batch-relisting. Most likely cause is pagination instability: ~1,400 active listings over 14 pages, and eBay's ordering shifts as new items arrive mid-sweep, so boundary items can fall through the gap. Resurrection is the visible case and the code handles it. The invisible case is the problem — a listing dropped by pagination that never returns keeps a fabricated gone_at and a fabricated short lifespan, with nothing to contradict it, and short lifespans are what the survival baseline weighs most heavily. Running count is low (3 in the current container's logs). Note that docker compose logs | grep -c resurrected resets on rebuild; a durable count needs a counter in code.
 - **Correct design.md §7's budget math.** It assumes ~2 calls per cycle against
   a 150-listing active set. Measured: ~1,300 active listings, sweep costs ~11
   calls, ~450/day for one watch. Comfortable at 4,750, but the old figure would
