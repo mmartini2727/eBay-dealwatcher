@@ -62,7 +62,8 @@ dealwatch/
 │ └── explain.py (V0.7) CLI: trace one title through the pipeline
 ├── engine/
 │ ├── collector.py (V0.6) poll → persist raw → map → persist
-│ └── scoring.py (V0.8) baselines → deal score
+│ ├── baselines.py (V0.8a) survival-derived candidates → percentiles
+│ └── scoring.py (V0.8b) baselines → deal score
 ├── notify/
 │ └── discord.py (V0.9)
 ├── storage/
@@ -222,6 +223,32 @@ when credentials are absent.
   evidence.
 - 153 distinct buckets; 15 ok-only reach `min_samples=12`; 35 are singletons.
 - V0.7c complete. Backfill gained the collector's raw-field fallback — normalize_input_fields() now lives in normalize/listing.py and both callers use it. AMD model-number patterns had the series digit made optional ([3579]?) so "Ryzen PRO 8540U" matches; the four-digit model number stays mandatory, so bare "Ryzen 5 PRO" is still None.
+- **V0.8a complete: survival-derived baseline computation, no scoring yet.**
+  `engine/baselines.py` derives one candidate per dead `spec_status='ok'`
+  listing from its LAST observation only (design.md §2.1 — an earlier price
+  point was ended by a cut, not a sale, and is not evidence about anything).
+  `scripts/recompute_baselines.py` DELETEs+INSERTs the `baselines` table per
+  profile; `scripts/baseline_report.py` is the actual deliverable — candidate
+  pool breakdown, threshold sensitivity, per-bucket near-misses, and a
+  falsification check on whether fast-selling prices are actually lower.
+  Given reality (186 dead 'ok' listings, zero buckets at `min_samples=12`),
+  this milestone is expected to write zero or near-zero baseline rows on
+  first run — that's the correct outcome, not a bug. Could not run the
+  report against real data in this checkout (`data/dealwatch.db` is empty
+  here); verified end-to-end against synthetic fixtures instead — run it on
+  the LXC for real numbers.
+- **Found and fixed a real concurrency bug in `_apply_migrations` while
+  building V0.8a's migration.** `ALTER TABLE ADD COLUMN` (no `IF NOT EXISTS`
+  in SQLite) exposed a latent race: `DailyBudget` opens a fresh connection
+  per call by design, and several threads hitting a brand-new database file
+  at once could all decide to apply the same migration — the loser crashed,
+  which hung `test_ratelimit.py`'s concurrency tests (a thread dying before
+  it reaches a `threading.Barrier` leaves every other thread waiting
+  forever). `_apply_migrations` now runs the whole read-version → apply →
+  write-version sequence as one `BEGIN IMMEDIATE` transaction, statement by
+  statement rather than via `executescript()` (which silently commits any
+  open transaction before it runs, so wrapping it in `BEGIN IMMEDIATE`
+  wouldn't have worked). Migrations 1 and 2's content is unchanged.
 
 ## Open items before V0.8
 

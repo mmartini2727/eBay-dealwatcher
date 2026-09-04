@@ -378,3 +378,43 @@ def test_migration_runs_twice_cleanly_and_leaves_budget_intact(tmp_path):
     # And the new tables are genuinely usable, not just present.
     sight(conn2, "item-1", 1000)
     assert get_latest_observation(conn2, "item-1") is not None
+
+
+def test_concurrent_first_connect_against_a_fresh_file_does_not_crash_or_hang(tmp_path):
+    # V0.8a regression: migration 3 (ALTER TABLE ADD COLUMN, no IF NOT
+    # EXISTS equivalent in SQLite) exposed a latent race in
+    # _apply_migrations - many connections opening the SAME brand-new file
+    # at once could all decide to apply the same migration, and the loser
+    # crashed with "duplicate column name". That's not hypothetical:
+    # DailyBudget (providers/ratelimit.py) opens a fresh connection per
+    # call by design and is used from many threads at once
+    # (tests/test_ratelimit.py's concurrent-reservation tests hung on
+    # exactly this before _apply_migrations was made to run the whole
+    # read-version/apply/write-version sequence as one BEGIN
+    # IMMEDIATE...COMMIT transaction). This test targets the migration
+    # system directly rather than relying on DailyBudget's tests to catch
+    # a regression here incidentally.
+    #
+    # join(timeout=...) rather than a bare join() is deliberate: a
+    # reintroduced deadlock must fail this test, not hang the whole suite.
+    import threading
+
+    db_path = tmp_path / "dealwatch.db"
+    errors = []
+    barrier = threading.Barrier(20)
+
+    def worker():
+        barrier.wait()
+        try:
+            connect(db_path).close()
+        except Exception as exc:  # noqa: BLE001 - captured for the assertion, not swallowed
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(20)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert not any(t.is_alive() for t in threads), "a thread is still stuck - deadlock reintroduced"
+    assert errors == []

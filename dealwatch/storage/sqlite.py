@@ -23,6 +23,7 @@ from collections.abc import Iterable
 from pathlib import Path
 
 from dealwatch.config import Settings
+from dealwatch.engine.baselines import Baseline
 from dealwatch.normalize.engine import SpecResult
 
 logger = logging.getLogger(__name__)
@@ -91,6 +92,40 @@ _MIGRATIONS: list[tuple[int, str]] = [
             ON listings(bucket_key, gone_at);
         """,
     ),
+    (
+        3,
+        """
+        -- item_web_url exists today only inside raw_json - V0.9's alerts
+        -- need it as a real column. SQLite has no ADD COLUMN IF NOT EXISTS,
+        -- so this ALTER is only "idempotent" in the same sense migrations 1
+        -- and 2 are: the schema_version gate above means this whole script
+        -- runs exactly once per database file, ever, in normal operation.
+        -- Re-running it against an already-migrated file (the scenario the
+        -- CREATE TABLE IF NOT EXISTS statements below guard against) would
+        -- fail on this one line - that's a real, deliberate gap, not an
+        -- oversight, because guarding it would mean teaching the migration
+        -- runner to check column existence in Python for one column that
+        -- will only ever be added once.
+        ALTER TABLE listings ADD COLUMN item_web_url TEXT;
+
+        -- Survival-derived baselines (design.md §2.1, V0.8a). Fully
+        -- recomputable from listings/observations - see
+        -- scripts/recompute_baselines.py, which DELETEs and re-INSERTs
+        -- every row for a profile rather than updating in place.
+        CREATE TABLE IF NOT EXISTS baselines (
+            profile_id        TEXT NOT NULL,
+            bucket_key        TEXT NOT NULL,
+            n                 INTEGER NOT NULL,
+            n_price_only      INTEGER NOT NULL,
+            p10_cents         INTEGER NOT NULL,
+            p25_cents         INTEGER NOT NULL,
+            p50_cents         INTEGER NOT NULL,
+            fast_hours        INTEGER NOT NULL,
+            computed_at       INTEGER NOT NULL,
+            PRIMARY KEY (profile_id, bucket_key)
+        );
+        """,
+    ),
 ]
 
 
@@ -119,25 +154,62 @@ def connect(db_path: Path | str) -> sqlite3.Connection:
     return conn
 
 
+def _split_statements(script: str) -> list[str]:
+    # Every migration script is semicolon-terminated CREATE/ALTER statements
+    # with only `--` line comments (no semicolons inside a comment or string
+    # literal anywhere in _MIGRATIONS) - safe to split on literal `;`. A
+    # comment line ends up prepended to the following fragment rather than
+    # its own; that's fine, SQLite's parser skips comments in an execute()
+    # string the same as inside a script.
+    return [s.strip() for s in script.split(";") if s.strip()]
+
+
 def _apply_migrations(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)"
     )
-    row = conn.execute("SELECT version FROM schema_version").fetchone()
-    current = row[0] if row else 0
 
-    for version, script in _MIGRATIONS:
-        if version <= current:
-            continue
-        conn.executescript(script)
-        if row is None:
-            conn.execute(
-                "INSERT INTO schema_version (version) VALUES (?)", (version,)
-            )
-            row = (version,)
-        else:
-            conn.execute("UPDATE schema_version SET version = ?", (version,))
-        current = version
+    # BEGIN IMMEDIATE around the whole read-current-version -> apply ->
+    # write-new-version sequence, executing each migration statement with
+    # plain execute() rather than executescript(), is load-bearing, not
+    # decoration. DailyBudget (providers/ratelimit.py) opens a fresh
+    # connection per call by design and is exercised from many threads at
+    # once (tests/test_ratelimit.py's concurrent-reservation tests) - a
+    # brand-new database file can genuinely get several concurrent
+    # first-time connect() calls. executescript() unconditionally commits
+    # any open transaction before it runs and then autocommits its own
+    # statements one at a time, so wrapping executescript() calls in
+    # BEGIN IMMEDIATE would silently do nothing - the transaction ends
+    # before the script's DDL even starts, and two connections can both
+    # read current=N and both attempt the same migration. CREATE TABLE IF
+    # NOT EXISTS tolerated that (migrations 1 and 2, unchanged); ALTER
+    # TABLE ADD COLUMN (migration 3) does not - SQLite has no ADD COLUMN
+    # IF NOT EXISTS, so the loser got a real "duplicate column" error,
+    # discovered via this exact concurrency test hanging (a thread dying
+    # before it reaches the test's Barrier leaves the other 49 waiting
+    # forever - not a timeout, an actual deadlock).
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute("SELECT version FROM schema_version").fetchone()
+        current = row[0] if row else 0
+
+        for version, script in _MIGRATIONS:
+            if version <= current:
+                continue
+            for statement in _split_statements(script):
+                conn.execute(statement)
+            if row is None:
+                conn.execute(
+                    "INSERT INTO schema_version (version) VALUES (?)", (version,)
+                )
+                row = (version,)
+            else:
+                conn.execute("UPDATE schema_version SET version = ?", (version,))
+            current = version
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
 
 
 def default_db_path(settings: Settings) -> Path:
@@ -305,6 +377,53 @@ def store_spec(conn: sqlite3.Connection, item_id: str, result: SpecResult) -> No
             item_id,
         ),
     )
+
+
+def store_baselines(
+    conn: sqlite3.Connection,
+    profile_id: str,
+    baselines: list[Baseline],
+    computed_at: int,
+) -> None:
+    """Replace every baselines row for profile_id in one transaction.
+
+    Baselines are fully recomputable from listings/observations history
+    (design.md §2.1, V0.8a) - there is no incremental-update case to
+    support, so this always DELETEs the profile's existing rows before
+    INSERTing the freshly computed set, the same "derived data, not
+    observed data" treatment CLAUDE.md's Conventions section already
+    applies elsewhere. Called by scripts/recompute_baselines.py; nothing
+    else writes this table.
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute("DELETE FROM baselines WHERE profile_id = ?", (profile_id,))
+        conn.executemany(
+            """
+            INSERT INTO baselines (
+                profile_id, bucket_key, n, n_price_only,
+                p10_cents, p25_cents, p50_cents, fast_hours, computed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    profile_id,
+                    b.bucket_key,
+                    b.n,
+                    b.n_price_only,
+                    b.p10_cents,
+                    b.p25_cents,
+                    b.p50_cents,
+                    b.fast_hours,
+                    computed_at,
+                )
+                for b in baselines
+            ],
+        )
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
 
 
 def record_sweep(

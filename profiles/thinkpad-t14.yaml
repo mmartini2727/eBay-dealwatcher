@@ -374,6 +374,11 @@ scoring:
   sanity_floor_pct: 25         # under this % of median => flag, do not alert
   best_offer_weight: 0.85      # BIN with Best Offer is an anchor, not a price
   include_shipping: true
+  fast_lifespan_hours: 24    # V0.8a: threshold is provisional. The
+                             # measured lifespan distribution is flat
+                             # (43/20/41/44/38 across 0-2h/2-6h/6-24h/
+                             # 1-3d/3d+, n=186, 7 days). Retune with a
+                             # month of data.
 
 # ---------------------------------------------------------------------------
 # 7. SEED BASELINES — day-0 thresholds from the maintainer's own chart.

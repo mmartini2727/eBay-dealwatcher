@@ -192,7 +192,20 @@ observations(
   raw_json          TEXT NOT NULL
 )
 
-baselines(watch_id, bucket_key, n, p10, p25, p50, computed_at)
+-- survival-derived, V0.8a. Fully recomputable; scripts/recompute_baselines.py
+-- DELETEs and re-INSERTs every row for a profile rather than updating in place.
+baselines(
+  profile_id    TEXT NOT NULL,
+  bucket_key    TEXT NOT NULL,
+  n             INTEGER NOT NULL,     -- fast-population count, not the dead count
+  n_price_only  INTEGER NOT NULL,     -- of n, how many used price_cents (total_cents NULL)
+  p10_cents     INTEGER NOT NULL,
+  p25_cents     INTEGER NOT NULL,
+  p50_cents     INTEGER NOT NULL,
+  fast_hours    INTEGER NOT NULL,     -- the fast_lifespan_hours this row was computed with
+  computed_at   INTEGER NOT NULL,
+  PRIMARY KEY (profile_id, bucket_key)
+)
 alerts(item_id, watch_id, sent_at, price_at_alert)
 ```
 
@@ -203,8 +216,15 @@ Indexes: `observations(item_id, observed_at)`, `listings(bucket_key, gone_at)`.
 - **Money is integer cents.** Floats accumulate rounding error across
   percentile math and "N% below last alert" comparisons.
 - `shipping_cents` NULL means **unknown**, not free. Free shipping is `0`.
-  ~15% of live listings carry no shipping cost. A NULL `total_cents` must be
-  excluded from baseline computation — same rule as an unparseable spec (§5.2).
+  ~15% of live listings carry no shipping cost. **Revised at V0.8a:** a NULL
+  `total_cents` is no longer excluded from baseline computation. It falls back
+  to `price_cents` instead, and the row is counted separately
+  (`baselines.n_price_only`) rather than dropped — an unresolved shipping cost
+  says nothing about whether the *price* itself is a valid comparison point,
+  and dropping it discarded real signal for no benefit. An unparseable spec
+  (§5.2) is a different case and is still excluded outright: there's no
+  fallback for "which bucket does this belong to" the way there is for
+  "what did shipping actually cost."
 - **`raw_json` lives on the observation, not the listing.** Sellers edit titles.
   When that happens the stored `spec_json` silently describes a machine the
   listing no longer claims to be. `title` is therefore a watched field: a change
