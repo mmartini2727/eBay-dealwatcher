@@ -393,24 +393,137 @@ scoring:
                              # month of data.
 
 # ---------------------------------------------------------------------------
-# 7. SEED BASELINES — day-0 thresholds from the maintainer's own chart.
-#    Used until a bucket reaches scoring.min_samples. Partial matches allowed;
-#    most specific match wins.
+# 7. Seed baseline provenance — 2026-09-05
+  #
+  # Semantics: fast-sale pricing — "at this price, a good listing is likely
+  # to get sniped" — NOT normal asking/market value.
+  #
+  # Seeds bootstrap sparse buckets until observed fast-sale data reaches the
+  # sample threshold and replaces them.
+  #
+  # Calibration anchor:
+  #   2|intel-11th|16|512
+  #   observed/computed ~= p25 $229.50 / p50 $249
+  #
+  # All other values are estimates using the same fast-sale semantics.
+
+  # ----------------------------------------------------------
+  # Coarse fallbacks
+  # Roughly assume a mid-spec 16GB / 512GB machine.
+  # ----------------------------------------------------------
+
 # ---------------------------------------------------------------------------
 seed_baselines:
-  - match: {generation: "1", cpu_family: intel-10th, ram_tier: "16", storage_tier: "512"}
-    p25: 220
-    p50: 280
-  - match: {generation: "2", cpu_family: intel-11th, ram_tier: "16", storage_tier: "512"}
-    p25: 300
-    p50: 380
-  - match: {generation: "2", cpu_family: amd-ryzen-5000, ram_tier: "16", storage_tier: "512"}
-    p25: 320
-    p50: 400
-  # Fallback for anything not listed above
-  - match: {}
+  - match: {generation: "1", cpu_family: intel-10th}
+    p25: 160
+    p50: 200
+
+  - match: {generation: "1", cpu_family: amd-ryzen-4000}
+    p25: 190
+    p50: 230
+
+  - match: {generation: "2", cpu_family: intel-11th}
+    p25: 230
+    p50: 250
+
+  - match: {generation: "2", cpu_family: amd-ryzen-5000}
     p25: 250
-    p50: 350
+    p50: 290
+
+  - match: {generation: "3", cpu_family: intel-12th}
+    p25: 275
+    p50: 330
+
+  - match: {generation: "3", cpu_family: amd-ryzen-6000}
+    p25: 350
+    p50: 420
+
+  - match: {generation: "4", cpu_family: intel-13th}
+    p25: 350
+    p50: 425
+
+  - match: {generation: "4", cpu_family: amd-ryzen-7000}
+    p25: 440
+    p50: 525
+
+  - match: {generation: "5", cpu_family: intel-ultra-1}
+    p25: 475
+    p50: 575
+
+  - match: {generation: "5", cpu_family: amd-ryzen-8000}
+    p25: 525
+    p50: 650
+
+  - match: {generation: "6", cpu_family: intel-ultra-2}
+    p25: 600
+    p50: 700
+
+  - match: {generation: "6", cpu_family: amd-ryzen-ai}
+    p25: 675
+    p50: 800
+
+
+  # ----------------------------------------------------------
+  # Specific overrides
+  # ----------------------------------------------------------
+
+  # Real-data calibration anchor.
+  # Computed fast-sale baseline ~= p25 $229.50 / p50 $249.
+  - match: {generation: "2", cpu_family: intel-11th, ram_tier: "16", storage_tier: "512"}
+    p25: 230
+    p50: 250
+
+  - match: {generation: "3", cpu_family: amd-ryzen-6000, ram_tier: "32", storage_tier: "512"}
+    p25: 390
+    p50: 460
+
+  - match: {generation: "4", cpu_family: amd-ryzen-7000, ram_tier: "32", storage_tier: "512"}
+    p25: 475
+    p50: 575
+
+  - match: {generation: "4", cpu_family: intel-13th, ram_tier: "32", storage_tier: "512"}
+    p25: 400
+    p50: 475
+
+  - match: {generation: "5", cpu_family: intel-ultra-1, ram_tier: "32", storage_tier: "512"}
+    p25: 525
+    p50: 625
+
+  # Deliberately BELOW the Gen 5 AMD coarse fallback.
+  # 16GB/512 represents the lower-value Ryzen 8000 configurations,
+  # especially 8540U-class machines. G5 RAM is upgradeable, but the
+  # lower CPU/iGPU tier still warrants a lower fast-sale baseline.
+  - match: {generation: "5", cpu_family: amd-ryzen-8000, ram_tier: "16", storage_tier: "512"}
+    p25: 500
+    p50: 600
+
+  - match: {generation: "5", cpu_family: amd-ryzen-8000, ram_tier: "32", storage_tier: "512"}
+    p25: 620
+    p50: 720
+
+  - match: {generation: "6", cpu_family: intel-ultra-2, ram_tier: "32", storage_tier: "512"}
+    p25: 625
+    p50: 725
+
+  - match: {generation: "6", cpu_family: intel-ultra-2, ram_tier: "32", storage_tier: "1TB"}
+    p25: 750
+    p50: 875
+
+  - match: {generation: "6", cpu_family: amd-ryzen-ai, ram_tier: "32", storage_tier: "512"}
+    p25: 700
+    p50: 825
+
+
+  # ----------------------------------------------------------
+  # Final catch-all
+  # Handles null/unknown cpu_family and anything else that fails
+  # to match a generation/family seed above.
+  # Keep LAST because {} matches everything.
+  # ----------------------------------------------------------
+
+  - match: {}
+    p25: 200
+    p50: 250
 
 # ---------------------------------------------------------------------------
 # 8. ALERTS
