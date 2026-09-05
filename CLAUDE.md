@@ -158,6 +158,22 @@ loses history permanently: 5 of 150 live listings currently fail to map
 (auction-only, no `price` field), and that is 3% of comps gone for a bug that
 takes ten minutes to fix afterward.
 
+**The sweep's pagination ceiling must exceed the active set.** A sweep that
+stops paginating before it reaches every active listing never sees the
+listings past that horizon — they get marked gone on the miss_count timer
+even though they're still live on eBay. The symptom looks exactly like a
+fast sale (`last_seen == first_seen`, a short or zero lifespan), which is
+precisely the band the survival baseline weighs most heavily. `sweep_page_limit`
+/ `sweep_max_pages` (`profiles/*.yaml`, `search.poll`) must be sized against
+the actual active-listing count, not a guess — and the count grows, so a
+value that's adequate today can silently become inadequate later. The sweep
+coverage check in `run_sweep_cycle` (`engine/collector.py`) exists for
+exactly that reason: it logs a WARNING when the sweep returns materially
+fewer distinct items than `count_active_listings()` expects, so a repeat of
+this doesn't have to wait for someone to notice the baseline looks wrong.
+See `scripts/repair_false_gone.py` for repairing rows already corrupted by
+this before the fix.
+
 ---
 
 ## Operational notes
@@ -249,6 +265,25 @@ when credentials are absent.
   statement rather than via `executescript()` (which silently commits any
   open transaction before it runs, so wrapping it in `BEGIN IMMEDIATE`
   wouldn't have worked). Migrations 1 and 2's content is unchanged.
+- **V0.7c complete: sweep pagination ceiling fixed, coverage check added,
+  false-gone rows repaired.** The sweep's page size/depth moved from
+  hardcoded `collector.py` constants (100 × 10 = 1,000) to
+  `search.poll.sweep_page_limit` / `sweep_max_pages` in the profile
+  (`PollConfig`, defaults 200 × 10 = 2,000), because the active set
+  (measured ~1,013 and growing) had already outgrown the old ceiling:
+  34 of 217 dead listings (16%) had `last_seen == first_seen` — never
+  confirmed present by a single sweep — averaging $397 vs. $362 for
+  swept listings, i.e. an unbiased slice of the active set marked gone on
+  a timer, not genuine fast sales. `run_sweep_cycle` now logs a WARNING
+  (not a behavior change — record_sweep still runs regardless) when a
+  sweep returns fewer than 95% of `count_active_listings()`'s count, so a
+  future ceiling regression is caught by a log line instead of a slow
+  baseline corruption. `scripts/repair_false_gone.py` clears `gone_at` /
+  `lifespan_mins` / `miss_count` on exactly the never-confirmed rows
+  (`last_seen == first_seen`); anything genuinely gone gets re-marked
+  within three sweeps by the corrected collector. Not yet run against the
+  live database in this checkout — run it on the LXC after deploying the
+  page-limit fix.
 
 ## Open items before V0.8
 
@@ -260,11 +295,21 @@ when credentials are absent.
 - **Two disagreement listings produce impossible buckets** (`1|intel-11th`,
   `1|intel-12th`). V0.8 wants a sanity check on generation/CPU pairs that
   cannot exist.
-- **Resurrections.** Three cohorts observed so far (lifespan_mins 1082; 2836 ×7; 5670 ×3). Identical lifespans within a cohort are expected, not suspicious — last_seen is sweep-only and first_seen is usually a sweep, so hourly quantization makes matching values common. The 5670 cohort spanned two different sellers, ruling out batch-relisting. Most likely cause is pagination instability: ~1,400 active listings over 14 pages, and eBay's ordering shifts as new items arrive mid-sweep, so boundary items can fall through the gap. Resurrection is the visible case and the code handles it. The invisible case is the problem — a listing dropped by pagination that never returns keeps a fabricated gone_at and a fabricated short lifespan, with nothing to contradict it, and short lifespans are what the survival baseline weighs most heavily. Running count is low (3 in the current container's logs). Note that docker compose logs | grep -c resurrected resets on rebuild; a durable count needs a counter in code.
-- **Correct design.md §7's budget math.** It assumes ~2 calls per cycle against
-  a 150-listing active set. Measured: ~1,300 active listings, sweep costs ~11
-  calls, ~450/day for one watch. Comfortable at 4,750, but the old figure would
-  badly under-estimate five watches.
+- **Resurrections.** Three cohorts observed pre-V0.7c (lifespan_mins 1082;
+  2836 ×7; 5670 ×3). Identical lifespans within a cohort are expected, not
+  suspicious — last_seen is sweep-only and first_seen is usually a sweep, so
+  hourly quantization makes matching values common. The 5670 cohort spanned
+  two different sellers, ruling out batch-relisting. V0.7c found and fixed
+  the actual cause these were most consistent with: the old sweep ceiling
+  (1,000) was below the measured active set (~1,013+), so listings past the
+  pagination horizon were never seen by a sweep and got marked gone on the
+  miss_count timer. A resurrection is the *visible* case of that (the item
+  happens to come back within index range later); the invisible case — one
+  that never returns — is indistinguishable from a real fast sale and was
+  the actual risk to the baseline. Do not draw conclusions about whether
+  N=3 (the miss-count threshold) is right from this pre-fix data — re-count
+  resurrections after the fix has been running a while; a nonzero count
+  post-fix would be the real signal about N.
 - Delete `reserve(n)`'s unused `n` parameter.
 - **WAL high-water was ~4 MB** after the initial full sweeps. Re-check now that
   the backfill has written every row; if it has grown an order of magnitude,

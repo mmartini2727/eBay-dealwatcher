@@ -101,6 +101,92 @@ def run(coro):
     return asyncio.run(coro)
 
 
+def test_poll_config_defaults_give_a_2000_listing_sweep_ceiling():
+    poll = PollConfig()
+    assert poll.sweep_page_limit == 200
+    assert poll.sweep_max_pages == 10
+
+
+def test_sweep_cycle_passes_profile_page_limit_and_max_pages_to_search(tmp_path):
+    run(_sweep_cycle_passes_profile_page_limit_and_max_pages_to_search(tmp_path))
+
+
+async def _sweep_cycle_passes_profile_page_limit_and_max_pages_to_search(tmp_path):
+    # V0.7c: these used to be collector.py module constants
+    # (SWEEP_PAGE_LIMIT/SWEEP_MAX_PAGES); asserting on the actual values
+    # passed to search() is what would catch a regression back to a
+    # hardcoded constant that ignores the profile.
+    conn = connect(tmp_path / "dealwatch.db")
+    budget = DailyBudget(make_settings(tmp_path))
+    provider = FakeProvider(budget)
+    provider.queue_items([raw_item()], reserve=1)
+    profile = Profile(
+        id=PROFILE_ID,
+        name="Test Profile",
+        search=SearchConfig(
+            queries=["Lenovo ThinkPad T14"],
+            filters={},
+            poll=PollConfig(sweep_page_limit=77, sweep_max_pages=3),
+        ),
+    )
+    stats = CollectorStats()
+
+    await run_sweep_cycle(provider, profile, budget, conn, stats)
+
+    assert provider.calls == [("Lenovo ThinkPad T14", 77, 3)]
+
+
+def test_sweep_coverage_gap_logs_warning(tmp_path, caplog):
+    run(_sweep_coverage_gap_logs_warning(tmp_path, caplog))
+
+
+async def _sweep_coverage_gap_logs_warning(tmp_path, caplog):
+    conn = connect(tmp_path / "dealwatch.db")
+    # Seed 20 listings the DB believes are still active, but the sweep
+    # below will only return one of them - a coverage gap the pagination
+    # horizon should have caught.
+    for i in range(20):
+        record_sighting(
+            conn,
+            f"phantom-{i}",
+            dict(profile_id=PROFILE_ID, title="t"),
+            dict(price_cents=10000, raw_json="{}"),
+            1000,
+        )
+
+    budget = DailyBudget(make_settings(tmp_path))
+    provider = FakeProvider(budget)
+    provider.queue_items([raw_item(item_id="phantom-0")], reserve=1)
+    profile = make_profile()
+    stats = CollectorStats()
+
+    with caplog.at_level("WARNING"):
+        await run_sweep_cycle(provider, profile, budget, conn, stats)
+
+    assert any("coverage gap" in r.message for r in caplog.records)
+
+
+def test_sweep_with_adequate_coverage_does_not_log_warning(tmp_path, caplog):
+    run(_sweep_with_adequate_coverage_does_not_log_warning(tmp_path, caplog))
+
+
+async def _sweep_with_adequate_coverage_does_not_log_warning(tmp_path, caplog):
+    conn = connect(tmp_path / "dealwatch.db")
+    budget = DailyBudget(make_settings(tmp_path))
+    provider = FakeProvider(budget)
+    # Single listing, seeded fresh by record_sighting inside this very
+    # cycle - the DB's active count and the sweep's returned count end up
+    # identical, so this must NOT warn.
+    provider.queue_items([raw_item()], reserve=1)
+    profile = make_profile()
+    stats = CollectorStats()
+
+    with caplog.at_level("WARNING"):
+        await run_sweep_cycle(provider, profile, budget, conn, stats)
+
+    assert not any("coverage gap" in r.message for r in caplog.records)
+
+
 def test_load_profile_parses_the_real_profile_yaml():
     # Nothing else exercises Profile against the actual on-disk file - a
     # schema drift here would otherwise only surface at container startup.
@@ -111,6 +197,10 @@ def test_load_profile_parses_the_real_profile_yaml():
     assert profile.search.queries == ["Lenovo ThinkPad T14"]
     assert profile.search.poll.interval_minutes == 5
     assert profile.search.poll.sweep_interval_minutes == 60
+    # V0.7c: raised from a 100 x 10 = 1,000 ceiling that fell below the
+    # measured ~1,013-listing active set.
+    assert profile.search.poll.sweep_page_limit == 200
+    assert profile.search.poll.sweep_max_pages == 10
     # Raised from [80, 1200] at V0.7: the search filter is a fetch
     # threshold, not a buying ceiling - see alerts.max_price_usd for the
     # latter.

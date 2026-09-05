@@ -45,6 +45,13 @@ search:
     interval_minutes: 5
     sweep_interval_minutes: 60           # deep pagination, refreshes active set
     sort: newlyListed
+    # V0.7c: raised from a 100 x 10 = 1,000 ceiling. Active set is ~1,013
+    # and growing; anything past the pagination horizon was never seen by
+    # a sweep and got marked gone on the miss-count timer, manufacturing
+    # fake fast-sale lifespans (CLAUDE.md Traps). 200 is the Browse API's
+    # own page-size maximum.
+    sweep_page_limit: 200
+    sweep_max_pages: 10                  # 2,000-listing ceiling
 
 # ---------------------------------------------------------------------------
 # 2. REJECT — runs BEFORE require, deliberately: `\bT14\b` does not match

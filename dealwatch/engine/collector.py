@@ -40,6 +40,7 @@ from dealwatch.providers.ebay_auth import TokenManager
 from dealwatch.providers.ratelimit import BudgetExhausted, DailyBudget
 from dealwatch.storage.sqlite import (
     connect,
+    count_active_listings,
     default_db_path,
     record_sighting,
     record_sweep,
@@ -48,13 +49,17 @@ from dealwatch.storage.sqlite import (
 
 logger = logging.getLogger(__name__)
 
-# Page sizes and sweep depth are collector-level tuning knobs, not part of
-# the profile schema (that's out of scope for this milestone) - placeholder
-# values pending real volume data, same spirit as design.md §7's own
-# budget-math estimate.
+# The fast poll is itemStartDate-filtered (design.md §4.2) - one page is
+# correct for it regardless of active-set size, so unlike the sweep's page
+# size/depth (V0.7c: now profile.search.poll.sweep_page_limit/
+# sweep_max_pages, since those must track the active set), this one stays a
+# plain constant.
 FAST_POLL_PAGE_LIMIT = 50
-SWEEP_PAGE_LIMIT = 100
-SWEEP_MAX_PAGES = 10
+
+# V0.7c: a sweep that returns fewer distinct items than the DB's current
+# active-listing count is a coverage gap, not necessarily real
+# disappearances - see run_sweep_cycle's coverage check.
+_COVERAGE_WARNING_RATIO = 0.95
 
 
 def load_profile(path: Path | str) -> Profile:
@@ -324,7 +329,10 @@ async def run_sweep_cycle(
     for query in profile.search.queries:
         try:
             raw_items = await provider.search(
-                profile, query, limit=SWEEP_PAGE_LIMIT, max_pages=SWEEP_MAX_PAGES
+                profile,
+                query,
+                limit=profile.search.poll.sweep_page_limit,
+                max_pages=profile.search.poll.sweep_max_pages,
             )
         except BudgetExhausted:
             logger.info(
@@ -357,6 +365,26 @@ async def run_sweep_cycle(
         # record_sighting still land; only the absence-bookkeeping is
         # skipped.
         return
+
+    # Coverage check (V0.7c) - this is the durable protection, not the page
+    # limit above: an active set that outgrows sweep_page_limit *
+    # sweep_max_pages again in the future will silently reproduce the exact
+    # bug this milestone fixes unless something notices. Compared against
+    # count_active_listings() as it stands BEFORE record_sweep()'s
+    # miss_count/gone_at bookkeeping runs below - that count is exactly
+    # "how many listings the DB currently expects to still be out there."
+    # Purely observational: never skips or otherwise changes record_sweep's
+    # behavior, per this milestone's own instruction - deciding what to do
+    # about a coverage gap needs data first.
+    active_count = count_active_listings(conn, profile.id)
+    if active_count > 0 and len(seen_item_ids) < active_count * _COVERAGE_WARNING_RATIO:
+        logger.warning(
+            "sweep coverage gap for profile=%s: returned %d distinct items, "
+            "%d active listings expected",
+            profile.id,
+            len(seen_item_ids),
+            active_count,
+        )
 
     record_sweep(conn, seen_item_ids, profile.id, swept_at)
 

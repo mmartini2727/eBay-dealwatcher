@@ -21,6 +21,13 @@ class PollConfig(BaseModel):
     interval_minutes: int = 5
     sweep_interval_minutes: int = 60
     sort: str | None = None
+    # V0.7c: was a collector.py module constant. The sweep's pagination
+    # ceiling (sweep_page_limit * sweep_max_pages) must exceed the active
+    # set, or listings past the horizon are never seen and get marked gone
+    # on a miss-count timer - see CLAUDE.md's Traps. Defaults give a
+    # 2,000-listing ceiling against a measured ~1,013 active set.
+    sweep_page_limit: int = 200
+    sweep_max_pages: int = 10
 
 
 class SearchConfig(BaseModel):

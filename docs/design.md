@@ -391,7 +391,19 @@ Polling strategy:
   set so disappearance tracking stays accurate.
 - ~5 minutes is the useful polling floor — good ThinkPad deals are taken in
   minutes. Faster than that spends budget for little gain.
-- Budget math: 5 watches × 288 polls/day × ~2 calls ≈ 2,900/day. Comfortable.
+- **Budget math (corrected, V0.7c).** The original estimate here — "5
+  watches × 288 polls/day × ~2 calls ≈ 2,900/day" — assumed a ~150-listing
+  active set and ~2 calls per sweep cycle. Measured against the real active
+  set (~1,300 listings, deep-paginating at `sweep_page_limit` ×
+  `sweep_max_pages`), one hourly sweep costs ~11 calls, not ~2 — an active
+  set roughly 9x larger than assumed. One watch (5-minute fast polls +
+  hourly sweeps) measures at ~450 calls/day, comfortable against the
+  ~4,750/day usable after `daily_reserve_calls`. Five watches at that
+  measured per-watch rate is ~2,250/day — still comfortable — but only
+  because the corrected per-sweep figure is used; naively scaling the old
+  "~2 calls per cycle" formula to five watches would have looked fine
+  while being wrong by ~5.5x on the sweep term, and a sixth watch or a
+  larger active set is what would actually find the ceiling.
 
 **eBay's `filter=` set-parameters are OR across every value listed, not AND —
 undocumented in Browse's own reference, and it will bite again on the next
