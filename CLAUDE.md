@@ -63,7 +63,7 @@ dealwatch/
 ├── engine/
 │ ├── collector.py (V0.6) poll → persist raw → map → persist
 │ ├── baselines.py (V0.8a) survival-derived candidates → percentiles
-│ └── scoring.py (V0.8b) baselines → deal score
+│ └── scoring.py (V0.8b) baselines/seeds → deal score, fallback ladder
 ├── notify/
 │ └── discord.py (V0.9)
 ├── storage/
@@ -171,8 +171,12 @@ coverage check in `run_sweep_cycle` (`engine/collector.py`) exists for
 exactly that reason: it logs a WARNING when the sweep returns materially
 fewer distinct items than `count_active_listings()` expects, so a repeat of
 this doesn't have to wait for someone to notice the baseline looks wrong.
-See `scripts/repair_false_gone.py` for repairing rows already corrupted by
-this before the fix.
+`scripts/repair_false_gone.py` clears rows shaped this way
+(`last_seen == first_seen`) regardless of cause — but note the measured
+never-swept rate did NOT change after raising the ceiling (see Current
+status / the Resurrections open item), so pagination is a real, worth-
+fixing risk in its own right, not a confirmed explanation for the rows
+actually observed so far.
 
 ---
 
@@ -265,25 +269,45 @@ when credentials are absent.
   statement rather than via `executescript()` (which silently commits any
   open transaction before it runs, so wrapping it in `BEGIN IMMEDIATE`
   wouldn't have worked). Migrations 1 and 2's content is unchanged.
-- **V0.7c complete: sweep pagination ceiling fixed, coverage check added,
-  false-gone rows repaired.** The sweep's page size/depth moved from
-  hardcoded `collector.py` constants (100 × 10 = 1,000) to
-  `search.poll.sweep_page_limit` / `sweep_max_pages` in the profile
-  (`PollConfig`, defaults 200 × 10 = 2,000), because the active set
-  (measured ~1,013 and growing) had already outgrown the old ceiling:
-  34 of 217 dead listings (16%) had `last_seen == first_seen` — never
-  confirmed present by a single sweep — averaging $397 vs. $362 for
-  swept listings, i.e. an unbiased slice of the active set marked gone on
-  a timer, not genuine fast sales. `run_sweep_cycle` now logs a WARNING
-  (not a behavior change — record_sweep still runs regardless) when a
-  sweep returns fewer than 95% of `count_active_listings()`'s count, so a
-  future ceiling regression is caught by a log line instead of a slow
-  baseline corruption. `scripts/repair_false_gone.py` clears `gone_at` /
-  `lifespan_mins` / `miss_count` on exactly the never-confirmed rows
-  (`last_seen == first_seen`); anything genuinely gone gets re-marked
-  within three sweeps by the corrected collector. Not yet run against the
-  live database in this checkout — run it on the LXC after deploying the
-  page-limit fix.
+- **V0.7c: sweep pagination ceiling raised, coverage check added,
+  false-gone repair script shipped — but the fix did NOT do what it was
+  credited with.** The sweep's page size/depth moved from hardcoded
+  `collector.py` constants (100 × 10 = 1,000) to `search.poll.sweep_page_limit`
+  / `sweep_max_pages` in the profile (`PollConfig`, defaults 200 × 10 =
+  2,000), and `run_sweep_cycle` now logs a WARNING when a sweep returns
+  fewer than 95% of `count_active_listings()`'s count — both still correct,
+  still worth having, and both still in place. **Correction (measured
+  post-deploy):** the never-swept rate (`last_seen == first_seen` on dead
+  listings) is flat at ~8% of daily deaths both before and after this fix,
+  not improved by it. V0.7c's pagination-ceiling theory does not explain
+  the never-swept rows after all — see the Resurrections open item below,
+  reopened rather than treated as resolved. `scripts/repair_false_gone.py`
+  and V0.8b's baseline-candidate exclusion (next bullet) are still correct
+  responses to "these rows are unreliable," independent of what's actually
+  causing them.
+- **V0.8b complete: scoring engine.** `engine/scoring.py` resolves a
+  baseline via a two-layer ladder — the `baselines` table (V0.8a) if a row
+  exists for the exact `bucket_key`, else the best-matching `seed_baselines`
+  entry (most matched keys wins, ties by file order) — and scores a
+  listing's price against it. No bucket-coarsening step: partial seed
+  matching already plays that role. `baselines.py` gained a second
+  candidate-pool exclusion: a dead listing with `first_seen == last_seen`
+  was never confirmed by a sweep, so its 0.0-lifespan is unmeasured, not
+  fast (measured ~8% of daily deaths, avg. final price $378.95 vs. $362 for
+  swept listings — not cheap fast-sellers). `best_offer_weight` deleted from
+  the profile as dead config. `sanity_floor_pct` raised 25 → 35 (units: % of
+  baseline p50) and now persists to `listings.sanity_flagged` (migration 4)
+  as a flag, never a suppression. `scripts/score_active.py` scores every
+  active `spec_status='ok'` listing and prints the best N by `ratio_to_p25`;
+  not wired into the collector or FastAPI — V0.9 decides where scoring gets
+  called from. Also: `_apply_migrations` now does a cheap plain-SELECT
+  version check before ever taking a write lock, since `DailyBudget` opens a
+  fresh connection per eBay call and was previously taking `BEGIN IMMEDIATE`
+  on every single one just to confirm nothing needed applying; `_MIGRATIONS`
+  is now a list of discrete statements per version instead of one blob
+  string split on `;` at runtime (`_split_statements` deleted) — a future
+  migration with a semicolon inside a comment or string literal would have
+  silently mis-split against a populated production database.
 
 ## Open items before V0.8
 
@@ -295,21 +319,20 @@ when credentials are absent.
 - **Two disagreement listings produce impossible buckets** (`1|intel-11th`,
   `1|intel-12th`). V0.8 wants a sanity check on generation/CPU pairs that
   cannot exist.
-- **Resurrections.** Three cohorts observed pre-V0.7c (lifespan_mins 1082;
-  2836 ×7; 5670 ×3). Identical lifespans within a cohort are expected, not
-  suspicious — last_seen is sweep-only and first_seen is usually a sweep, so
-  hourly quantization makes matching values common. The 5670 cohort spanned
-  two different sellers, ruling out batch-relisting. V0.7c found and fixed
-  the actual cause these were most consistent with: the old sweep ceiling
-  (1,000) was below the measured active set (~1,013+), so listings past the
-  pagination horizon were never seen by a sweep and got marked gone on the
-  miss_count timer. A resurrection is the *visible* case of that (the item
-  happens to come back within index range later); the invisible case — one
-  that never returns — is indistinguishable from a real fast sale and was
-  the actual risk to the baseline. Do not draw conclusions about whether
-  N=3 (the miss-count threshold) is right from this pre-fix data — re-count
-  resurrections after the fix has been running a while; a nonzero count
-  post-fix would be the real signal about N.
+- **Resurrections — reopened, unresolved.** Three cohorts observed pre-V0.7c
+  (lifespan_mins 1082; 2836 ×7; 5670 ×3). Identical lifespans within a
+  cohort are expected, not suspicious — last_seen is sweep-only and
+  first_seen is usually a sweep, so hourly quantization makes matching
+  values common. The 5670 cohort spanned two different sellers, ruling out
+  batch-relisting. V0.7c's pagination-ceiling theory was plausible but is
+  now contradicted by data: the never-swept rate is flat at ~8% of daily
+  deaths both before and after raising the sweep ceiling, so pagination
+  gaps do not explain these rows after all. Back to genuinely unresolved —
+  possible causes not yet ruled out include eBay search-index reordering
+  independent of page count, and something bucket/profile-specific. Do not
+  draw conclusions about whether N=3 (the miss-count threshold) is right
+  until the actual cause is identified; a fix aimed at the wrong cause
+  won't move this number.
 - Delete `reserve(n)`'s unused `n` parameter.
 - **WAL high-water was ~4 MB** after the initial full sweeps. Re-check now that
   the backfill has written every row; if it has grown an order of magnitude,

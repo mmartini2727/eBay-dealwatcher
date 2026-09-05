@@ -60,6 +60,10 @@ def run_report(profile, conn) -> str:
 
     lines.append("=== (a) candidate pool ===")
     lines.append(f"  {pool_stats.total_dead_ok} dead listings with spec_status='ok'")
+    lines.append(
+        f"  {pool_stats.sweep_confirmed} were confirmed present by at least "
+        "one sweep (first_seen != last_seen)"
+    )
     lines.append(f"  {pool_stats.has_bucket_key} have a bucket_key at all")
     lines.append(f"  {pool_stats.bucket_key_has_no_question_mark} of those have no '?' component")
     lines.append(f"  {pool_stats.has_usable_price} of those have a usable price")

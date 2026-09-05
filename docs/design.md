@@ -54,6 +54,22 @@ Three layers, in order of when they become available:
 
   - Consequence: the survival-derived baseline is in practice a Gen 1–3 Intel feature. Gen 5/6 will run on seed baselines indefinitely. That is what layer 1 is for, but V0.8 must not be designed as if layer 3 eventually replaces it — the fallback is the steady state for the target generations, and the seed chart's accuracy matters more than this document originally assumed.
 
+  - **Storage tier drop from bucket_key: pending, its own milestone.** The
+    fragmentation measured above is null-driven, but `bucket_key`'s own width
+    (`[generation, cpu_family, ram_tier, storage_tier]`, §5.2/§5's bucket
+    section) is a second, independent source: two listings identical in every
+    way except 256GB vs. 512GB storage currently land in different buckets
+    even when both fields are non-null. Removing `storage_tier` from the key
+    roughly quadruples sample density per bucket — cheap to say, not free to
+    do: every stored `bucket_key` in the database was computed under the
+    four-field key, so this invalidates all of them and requires a full
+    `--all` backfill re-run (`scripts/backfill_normalize.py`) before any
+    baseline recompute means anything. It needs its own milestone rather than
+    riding along with an unrelated normalization change specifically because
+    of that backfill dependency — a partial rollout (new listings keyed on
+    three fields, old rows still keyed on four) would silently corrupt every
+    affected bucket's percentiles rather than failing loudly.
+
 **Known weakness of (3):** disappearance conflates *sold* with *ended early* or
 *pulled by seller*. `getItem` on a dead listing errors and does not disclose
 which.
@@ -271,6 +287,40 @@ These are load-bearing. Getting them wrong produces a database that looks correc
   relist normally gets a new `item_id`; the same one returning is index
   inconsistency that outlasted the threshold. Count these — they are the only
   evidence you get about whether N=3 is right.
+- **Known gap: fast-poll observations understate lifespan by up to one sweep
+  interval.** Only a sweep advances `last_seen` (above), but a fast poll can
+  still write a new `observations` row when a watched field changes — most
+  importantly a price cut — without touching `last_seen`. If that poll-caught
+  cut turns out to be a listing's last price before it disappears, the
+  survival baseline (§2.1) derives its lifespan as `gone_at` (`= last_seen`
+  from the sweep that last confirmed the listing) minus that observation's
+  `observed_at` (the poll's timestamp, up to ~one sweep interval earlier) —
+  understating true lifespan by up to ~60 minutes. Noise against
+  `fast_lifespan_hours: 24`; not noise against a 2-hour threshold, where an
+  hour is half the window. No fix designed yet. Two candidates, both of which
+  change what `observations.observed_at` means and neither of which is free:
+  (a) let a confirming sweep bump the existing last observation's timestamp
+  forward instead of leaving it at the poll's time, or (b) derive lifespan
+  from the earlier of (last observation's `observed_at`, the following
+  sweep's `last_seen`) rather than the observation alone.
+- **Honest limitation: `first_seen = last_seen` conflates two different
+  things (V0.8b).** The survival baseline (§2.1) excludes any dead listing
+  where `first_seen` equals `last_seen`, on the theory that it was never
+  confirmed present by a sweep. That's the common case, but it isn't the
+  only thing that produces the same equality: a listing that was, by pure
+  bad luck, first sighted BY a sweep and then genuinely sold or vanished
+  before the next sweep ran would show the identical `first_seen ==
+  last_seen` shape, despite having been confirmed present exactly once.
+  The exclusion can't tell "zero sweeps ever confirmed this" from "exactly
+  one sweep confirmed this, coincidentally the same one that first saw
+  it" - both collapse to the same two equal timestamps. The real fix is a
+  `sweep_count` column that counts confirmations directly instead of
+  inferring them from two timestamps colliding; deferred, because the
+  false-exclusion case above is rare (it requires dying inside one sweep
+  interval of being newly listed) and getting a real column into
+  production correctly is a bigger change than this milestone's actual
+  goal (excluding the common, high-volume case) needed to justify doing
+  first.
 
 ### 4.3 The listing history is the irreplaceable asset
 
@@ -310,16 +360,44 @@ Listings that fail to parse get `spec = unknown`: **excluded from baseline
 computation**, but still eligible to be alerted on if the price is low enough to
 be interesting regardless.
 
+**Display is an extract field only — never in `bucket_key`.** Resolution,
+panel type, and touch capability (`touchscreen` already extracts this way)
+change what a listing is worth, but sellers report them inconsistently and
+the values vary more continuously than RAM/storage tiers do. Adding display
+to the bucket key would fragment buckets worse than `storage_tier` already
+does (above), for a signal that's better handled as buyer judgment anyway.
+Extract it, show it in the alert text, never score or bucket on it.
+
 ### 5.3 Sanity floor
 
-Anything below ~25% of its bucket median is presumed junk that slipped the
-reject filters. Flag for manual review; do not alert. Every one of these is a
-missing reject rule — treat the queue as a to-do list.
+**V0.8b: the threshold is 35% of the resolved baseline's p50, not 25%.**
+Units are a percentage of p50 - 35 means "flagged when priced below 35% of
+p50," i.e. a 65%+ discount. The original 25% figure meant a 75%+ discount
+and effectively never fired in practice. "The resolved baseline's p50" is
+whichever layer actually answered the ladder in §5.6 - computed or seed -
+not always the survival-derived one.
+
+This is a flag, never a suppression: the scorer sets `sanity_flagged` and
+stops there. It does not block an alert, weight a score, or otherwise
+decide anything - V0.9 reads the flag and decides. The flag is persisted
+on `listings.sanity_flagged` (migration 4), not just logged, because
+CLAUDE.md calls the sanity-floor queue a to-do list of missing reject
+rules - a to-do list has to be queryable (`WHERE sanity_flagged = 1`)
+later, not scrolled past in a log.
 
 ### 5.4 Best Offer
 
 `buyingOptions` including BEST_OFFER means the listed price is an anchor, not a
 transaction price. Weight accordingly; do not let it pollute baselines.
+
+**V0.8b: `scoring.best_offer_weight` was dead config and has been deleted,
+not implemented.** The search filter is FIXED_PRICE-only (§5.5/§7) and most
+surviving listings carry BEST_OFFER anyway, so a weight applied to nearly
+every row is a near-constant multiplier dressed up as a per-listing signal
+- it would not have discriminated between listings, only rescaled all of
+them together. `buying_options` is still recorded on every observation;
+nothing currently reads it for scoring. "Weight accordingly" above remains
+an open problem, not a solved one.
 
 ### 5.5 Auctions
 
@@ -345,6 +423,78 @@ Open question for V0.8, narrower than it used to be: what to do with
 `price` alone, which is already valid on its own) or use it as a secondary
 signal (a live bid already above the BIN suggests real demand). Not a
 blocking question the way "is this bid data safe to treat as a price" was.
+
+### 5.6 The scoring ladder (V0.8b)
+
+Given one listing, resolve a baseline in this order, and stop at the first
+hit:
+
+1. **The survival-derived baselines table row for this exact `bucket_key`**
+   (§2.1, V0.8a), if one exists.
+2. **The best-matching `seed_baselines` entry** - most matched `match` keys
+   wins; ties break by file order (first wins). An empty `match: {}` block
+   is the universal fallback and every profile needs one, or a listing that
+   matches nothing more specific has no baseline to score against at all.
+
+**There is deliberately no bucket-coarsening step between the two.** The
+tempting middle layer - "if the exact bucket has no data, widen to just
+`generation`+`cpu_family` and pool everything with any RAM/storage" - is
+not built, on purpose: partial seed matching already plays that role, and
+does it with hand-authored numbers a human chose for that specific narrower
+match, not a wider, noisier pool assembled by relaxing the key.
+Coarsening would also quietly reintroduce the exact fragmentation problem
+§2.1 already measured (Gen 5/6 buckets are ones and twos) without the
+human judgment seed_baselines was built to supply in that gap.
+
+A `bucket_key` containing `?` can never hit layer 1 - V0.8a excludes those
+from baseline computation entirely, by construction - and always falls
+through to layer 2. That's intended, not a workaround.
+
+**`seed_baselines` numbers are FAST-SALE prices, not market value - the
+same quantity layer 1 computes.** They were authored as "at this price, it
+gets sniped," deliberately matching what the survival baseline measures,
+so the ladder can fall from one layer to the other without a conversion
+factor anywhere. Applying one (e.g., treating seed p25 as a market-average
+estimate needing a discount to become a "sniped" price) would make the two
+layers answer different questions depending on which one happened to have
+data for a given bucket - exactly the kind of layer-dependent inconsistency
+a human reading an alert has no way to detect.
+
+`baseline_layer` and `baseline_n` are carried on every score result and are
+not decoration: without them there is no way to tell "real deal against 12
+real observed sales" from "the seed chart's estimate for this bucket was
+wrong." Collapsing the two into a single score number would discard exactly
+the information a human needs to decide how much to trust it.
+
+### 5.7 Buyability suppression (V0.9, pending)
+
+A listing can match every spec requirement and still be a bad buy — soldered
+RAM is the first known case: a machine whose RAM can't be upgraded is worth
+less than an identical-spec machine with socketed RAM at the same price,
+because the buyer is stuck with whatever shipped. V0.9 needs a way to
+suppress or down-rank that class of listing.
+
+**Decision: this must be a declarative rule, the same shape as reject/
+require/extract (§5, `profiles/*.yaml`) — not Python that knows what a
+laptop is.** A second profile (a different machine family, a different
+manufacturer) has to be able to define its own buyability rules with a YAML
+change, the same guarantee normalization already gives every other rule
+class. Hardcoding "T14 Gen N solders RAM" into `dealwatch/` code would be
+exactly the kind of target-specific Python module the profile system exists
+to avoid.
+
+**Decision: unknown RAM configuration still alerts.** A listing whose
+`ram_tier` is `?` (extraction failed) must not be suppressed on the theory
+that it might be soldered — that throws away a real deal to avoid a false
+positive that was never confirmed. Flag it unverified in the alert text
+instead, and let the buyer decide with the caveat visible.
+
+**Open, blocking data question: which generations actually solder RAM is
+not yet confirmed.** Gen 4 Intel and Gen 1/2 (both vendors) are the current
+working guesses, not verified findings, and must not be encoded as a rule
+until checked against Lenovo's own PSREF/spec sheets or a teardown source.
+A wrong guess here is worse than the unknown-RAM case above: it suppresses
+a real deal with false confidence rather than flagging honest uncertainty.
 
 ---
 

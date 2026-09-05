@@ -1,10 +1,11 @@
 """Profile config schema - the shape of `profiles/*.yaml`.
 
-Models identity fields, `search`, and the normalization pipeline
+Models identity fields, `search`, the normalization pipeline
 (reject/require/extract/derive/tiers/bucket_key/bucket_require - design.md
-§5). `extra="ignore"` stays on Profile because scoring/seed_baselines/
-alerts are still unmodeled (later milestones); rejecting them now would
-mean today's client can't load a real profile at all.
+§5), and `seed_baselines` (V0.8b, §5.6). `extra="ignore"` stays on Profile
+because `scoring` is still only a loose dict and `alerts` is entirely
+unmodeled (V0.9); rejecting them now would mean today's client can't load
+a real profile at all.
 
 This module only models *shape* - what keys/types are allowed. Semantic
 validation (does a regex compile, does an `apply:` name a real function,
@@ -103,6 +104,28 @@ class TierField(BaseModel):
     breaks: list[TierBreak]
 
 
+class SeedBaselineEntry(BaseModel):
+    """One seed_baselines entry (design.md §5.6, V0.8b) - a hand-authored
+    fallback for a bucket the survival baseline hasn't reached min_samples
+    for yet. `match` is spec-field-name -> value; an empty dict is the
+    universal fallback and matches everything. p25/p50 are DOLLARS here,
+    matching how the profile is authored and read by a human - conversion
+    to integer cents happens once, in engine/scoring.py's compile step, not
+    here: this module only models shape (see the file docstring), and cents
+    is a scoring-domain decision, not a shape one.
+
+    These were authored as FAST-SALE prices ("at this price it gets
+    sniped") - deliberately the same quantity layer 3 (baselines.py)
+    computes, not "market value." Nothing in the ladder applies a
+    conversion factor between the two; they're the same thing by
+    construction.
+    """
+
+    match: dict[str, Any] = {}
+    p25: float
+    p50: float
+
+
 class Profile(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -124,3 +147,7 @@ class Profile(BaseModel):
     # min_samples), not interpreted here - actually scoring against it is
     # V0.8's job and explicitly out of scope for this module.
     scoring: dict[str, Any] = {}
+    # V0.8b - see SeedBaselineEntry. Semantic validation (duplicate match
+    # blocks) is engine/scoring.py's compile step, same division of labor
+    # as reject/require/extract above.
+    seed_baselines: list[SeedBaselineEntry] = []

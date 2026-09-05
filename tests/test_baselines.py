@@ -49,7 +49,18 @@ def sight(conn, item_id, seen_at, *, price_cents=None, shipping_cents=None):
 
 
 def mark_gone(conn, item_id, gone_at):
-    conn.execute("UPDATE listings SET gone_at = ? WHERE item_id = ?", (gone_at, item_id))
+    """gone_at = last_seen is an invariant in production (record_sweep sets
+    both from the same event, storage/sqlite.py) - this fixture enforces
+    it too, rather than leaving last_seen wherever sight() put it (which
+    would make every fixture here look "never confirmed by a sweep" to
+    V0.8b's new exclusion, whether the test intends that or not). Pass the
+    SAME timestamp sight() used to simulate a listing that was never
+    confirmed by any sweep; pass a later one (the normal case in this
+    file) to simulate at least one sweep confirmation before it vanished."""
+    conn.execute(
+        "UPDATE listings SET gone_at = ?, last_seen = ? WHERE item_id = ?",
+        (gone_at, gone_at, item_id),
+    )
 
 
 def set_spec(conn, item_id, bucket_key, spec_status="ok"):
@@ -95,6 +106,39 @@ def test_single_observation_lifespan_is_gone_at_minus_that_observation(tmp_path)
     assert len(candidates) == 1
     assert candidates[0].price_cents == 50000
     assert candidates[0].lifespan_seconds == 5 * 3600
+
+
+def test_never_swept_listing_is_excluded(tmp_path):
+    # V0.8b: first_seen == last_seen means no sweep ever confirmed this
+    # listing present - gone_at was set straight from the insert
+    # timestamp, so the derived lifespan would be 0.0, the fastest
+    # possible value, in exactly the band the baseline weighs most
+    # heavily. Passing the SAME t0 to mark_gone as sight() used is what
+    # produces that never-confirmed shape (see mark_gone's docstring).
+    conn = make_conn(tmp_path)
+    t0 = 1_000_000
+    sight(conn, "item-1", t0, price_cents=50000)
+    set_spec(conn, "item-1", BUCKET)
+    mark_gone(conn, "item-1", t0)
+
+    assert derive_candidates(conn) == []
+
+
+def test_swept_listing_with_otherwise_identical_shape_is_included(tmp_path):
+    # The direct contrast to the test above: identical in every way except
+    # last_seen actually advanced past first_seen (at least one sweep
+    # confirmed it present before it vanished) - this one must NOT be
+    # excluded by the new gate.
+    conn = make_conn(tmp_path)
+    t0 = 1_000_000
+    sight(conn, "item-1", t0, price_cents=50000)
+    set_spec(conn, "item-1", BUCKET)
+    mark_gone(conn, "item-1", t0 + 3600)
+
+    candidates = derive_candidates(conn)
+
+    assert len(candidates) == 1
+    assert candidates[0].price_cents == 50000
 
 
 def test_live_listing_is_excluded(tmp_path):
@@ -195,6 +239,10 @@ def test_candidate_pool_stats_breakdown_matches_final_candidate_count(tmp_path):
     conn = make_conn(tmp_path)
     t0 = 1_000_000
 
+    sight(conn, "neverswept", t0, price_cents=50000)
+    set_spec(conn, "neverswept", BUCKET)
+    mark_gone(conn, "neverswept", t0)  # same t0 - never confirmed by a sweep
+
     sight(conn, "ok1", t0, price_cents=50000)
     set_spec(conn, "ok1", BUCKET)
     mark_gone(conn, "ok1", t0 + 3600)
@@ -214,7 +262,8 @@ def test_candidate_pool_stats_breakdown_matches_final_candidate_count(tmp_path):
     stats = derive_candidate_pool_stats(conn)
     candidates = derive_candidates(conn)
 
-    assert stats.total_dead_ok == 4
+    assert stats.total_dead_ok == 5
+    assert stats.sweep_confirmed == 4  # excludes neverswept
     assert stats.has_bucket_key == 3  # excludes nobucket
     assert stats.bucket_key_has_no_question_mark == 2  # excludes questionmark too
     assert stats.has_usable_price == 1  # excludes noprice too

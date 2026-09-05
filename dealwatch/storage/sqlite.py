@@ -34,97 +34,118 @@ logger = logging.getLogger(__name__)
 # the survival baseline weighs most heavily.
 MISS_THRESHOLD = 3
 
-# Each entry is (version, script). Scripts must be idempotent (CREATE TABLE
-# IF NOT EXISTS) so re-running migrations against an already-migrated file
-# is harmless - that's what makes "forward-only, no rollback" safe.
-_MIGRATIONS: list[tuple[int, str]] = [
+# Each entry is (version, [statements]). The real once-only guarantee is
+# the schema_version gate inside _apply_migrations's transaction, not
+# idempotent SQL - migration 3's ALTER TABLE ADD COLUMN is a real
+# counterexample (SQLite has no ADD COLUMN IF NOT EXISTS) and was never
+# meant to be safely re-runnable on its own. The gate is what makes
+# "forward-only, no rollback" safe on every migration, including the older
+# ones that happen to use CREATE TABLE IF NOT EXISTS.
+#
+# Split into individual statements per version, rather than one script
+# blob split on `;` at runtime (_split_statements, removed at V0.8b): a
+# future migration with a semicolon inside a string literal or comment
+# would have silently mis-split and failed at container start against a
+# populated production database. Three migrations was the cheapest this
+# was ever going to be to fix.
+_MIGRATIONS: list[tuple[int, list[str]]] = [
     (
         1,
-        """
-        CREATE TABLE IF NOT EXISTS budget (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            period TEXT NOT NULL,
-            used INTEGER NOT NULL
-        );
-        """,
+        [
+            """
+            CREATE TABLE IF NOT EXISTS budget (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                period TEXT NOT NULL,
+                used INTEGER NOT NULL
+            )
+            """,
+        ],
     ),
     (
         2,
-        """
-        -- Identity + current state. One row per item_id, updated in place.
-        CREATE TABLE IF NOT EXISTS listings (
-            item_id             TEXT PRIMARY KEY,
-            profile_id          TEXT NOT NULL,
-            title               TEXT NOT NULL,
-            seller              TEXT,
-            seller_feedback_pct REAL,
-            seller_feedback_score INTEGER,
-            condition_id        INTEGER,
-            spec_json           TEXT,
-            spec_status         TEXT NOT NULL,
-            reject_rule_id      TEXT,
-            bucket_key          TEXT,
-            first_seen          INTEGER NOT NULL,
-            last_seen           INTEGER NOT NULL,
-            miss_count          INTEGER NOT NULL DEFAULT 0,
-            gone_at             INTEGER,
-            lifespan_mins       INTEGER
-        );
-
-        -- Append-only. One row on first sight, one per watched-field change.
-        CREATE TABLE IF NOT EXISTS observations (
-            id                INTEGER PRIMARY KEY,
-            item_id           TEXT NOT NULL REFERENCES listings(item_id),
-            observed_at       INTEGER NOT NULL,
-            price_cents       INTEGER,
-            shipping_cents    INTEGER,
-            total_cents       INTEGER,
-            buying_options    TEXT,
-            current_bid_cents INTEGER,
-            bid_count         INTEGER,
-            raw_json          TEXT NOT NULL
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_observations_item_observed_at
-            ON observations(item_id, observed_at);
-
-        CREATE INDEX IF NOT EXISTS idx_listings_bucket_key_gone_at
-            ON listings(bucket_key, gone_at);
-        """,
+        [
+            # Identity + current state. One row per item_id, updated in place.
+            """
+            CREATE TABLE IF NOT EXISTS listings (
+                item_id             TEXT PRIMARY KEY,
+                profile_id          TEXT NOT NULL,
+                title               TEXT NOT NULL,
+                seller              TEXT,
+                seller_feedback_pct REAL,
+                seller_feedback_score INTEGER,
+                condition_id        INTEGER,
+                spec_json           TEXT,
+                spec_status         TEXT NOT NULL,
+                reject_rule_id      TEXT,
+                bucket_key          TEXT,
+                first_seen          INTEGER NOT NULL,
+                last_seen           INTEGER NOT NULL,
+                miss_count          INTEGER NOT NULL DEFAULT 0,
+                gone_at             INTEGER,
+                lifespan_mins       INTEGER
+            )
+            """,
+            # Append-only. One row on first sight, one per watched-field change.
+            """
+            CREATE TABLE IF NOT EXISTS observations (
+                id                INTEGER PRIMARY KEY,
+                item_id           TEXT NOT NULL REFERENCES listings(item_id),
+                observed_at       INTEGER NOT NULL,
+                price_cents       INTEGER,
+                shipping_cents    INTEGER,
+                total_cents       INTEGER,
+                buying_options    TEXT,
+                current_bid_cents INTEGER,
+                bid_count         INTEGER,
+                raw_json          TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_observations_item_observed_at
+                ON observations(item_id, observed_at)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_listings_bucket_key_gone_at
+                ON listings(bucket_key, gone_at)
+            """,
+        ],
     ),
     (
         3,
-        """
-        -- item_web_url exists today only inside raw_json - V0.9's alerts
-        -- need it as a real column. SQLite has no ADD COLUMN IF NOT EXISTS,
-        -- so this ALTER is only "idempotent" in the same sense migrations 1
-        -- and 2 are: the schema_version gate above means this whole script
-        -- runs exactly once per database file, ever, in normal operation.
-        -- Re-running it against an already-migrated file (the scenario the
-        -- CREATE TABLE IF NOT EXISTS statements below guard against) would
-        -- fail on this one line - that's a real, deliberate gap, not an
-        -- oversight, because guarding it would mean teaching the migration
-        -- runner to check column existence in Python for one column that
-        -- will only ever be added once.
-        ALTER TABLE listings ADD COLUMN item_web_url TEXT;
-
-        -- Survival-derived baselines (design.md §2.1, V0.8a). Fully
-        -- recomputable from listings/observations - see
-        -- scripts/recompute_baselines.py, which DELETEs and re-INSERTs
-        -- every row for a profile rather than updating in place.
-        CREATE TABLE IF NOT EXISTS baselines (
-            profile_id        TEXT NOT NULL,
-            bucket_key        TEXT NOT NULL,
-            n                 INTEGER NOT NULL,
-            n_price_only      INTEGER NOT NULL,
-            p10_cents         INTEGER NOT NULL,
-            p25_cents         INTEGER NOT NULL,
-            p50_cents         INTEGER NOT NULL,
-            fast_hours        INTEGER NOT NULL,
-            computed_at       INTEGER NOT NULL,
-            PRIMARY KEY (profile_id, bucket_key)
-        );
-        """,
+        [
+            # item_web_url exists today only inside raw_json - V0.9's alerts
+            # need it as a real column. Not re-runnable on its own (SQLite
+            # has no ADD COLUMN IF NOT EXISTS) - see the header comment
+            # above on why that's fine.
+            "ALTER TABLE listings ADD COLUMN item_web_url TEXT",
+            # Survival-derived baselines (design.md §2.1, V0.8a). Fully
+            # recomputable from listings/observations - see
+            # scripts/recompute_baselines.py, which DELETEs and re-INSERTs
+            # every row for a profile rather than updating in place.
+            """
+            CREATE TABLE IF NOT EXISTS baselines (
+                profile_id        TEXT NOT NULL,
+                bucket_key        TEXT NOT NULL,
+                n                 INTEGER NOT NULL,
+                n_price_only      INTEGER NOT NULL,
+                p10_cents         INTEGER NOT NULL,
+                p25_cents         INTEGER NOT NULL,
+                p50_cents         INTEGER NOT NULL,
+                fast_hours        INTEGER NOT NULL,
+                computed_at       INTEGER NOT NULL,
+                PRIMARY KEY (profile_id, bucket_key)
+            )
+            """,
+        ],
+    ),
+    (
+        4,
+        [
+            # V0.8b sanity floor (design.md §5.3): NULL = never scored,
+            # not "scored and passed" - a scorer that hasn't run yet must
+            # not read as a clean bill of health.
+            "ALTER TABLE listings ADD COLUMN sanity_flagged INTEGER",
+        ],
     ),
 ]
 
@@ -154,27 +175,29 @@ def connect(db_path: Path | str) -> sqlite3.Connection:
     return conn
 
 
-def _split_statements(script: str) -> list[str]:
-    # Every migration script is semicolon-terminated CREATE/ALTER statements
-    # with only `--` line comments (no semicolons inside a comment or string
-    # literal anywhere in _MIGRATIONS) - safe to split on literal `;`. A
-    # comment line ends up prepended to the following fragment rather than
-    # its own; that's fine, SQLite's parser skips comments in an execute()
-    # string the same as inside a script.
-    return [s.strip() for s in script.split(";") if s.strip()]
-
-
 def _apply_migrations(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)"
     )
 
+    latest = _MIGRATIONS[-1][0]
+
+    # Cheap read-only check before ever taking a write lock. DailyBudget
+    # (providers/ratelimit.py) opens a fresh connection per call by design,
+    # so without this, every single eBay call would take a BEGIN IMMEDIATE
+    # write lock just to confirm there's nothing to apply - on an
+    # already-migrated database, which is the overwhelming majority of
+    # calls in normal operation. Only fall through to the transaction when
+    # this plain SELECT says there's real work.
+    row = conn.execute("SELECT version FROM schema_version").fetchone()
+    if row is not None and row[0] >= latest:
+        return
+
     # BEGIN IMMEDIATE around the whole read-current-version -> apply ->
     # write-new-version sequence, executing each migration statement with
     # plain execute() rather than executescript(), is load-bearing, not
-    # decoration. DailyBudget (providers/ratelimit.py) opens a fresh
-    # connection per call by design and is exercised from many threads at
-    # once (tests/test_ratelimit.py's concurrent-reservation tests) - a
+    # decoration. DailyBudget is exercised from many threads at once
+    # (tests/test_ratelimit.py's concurrent-reservation tests) - a
     # brand-new database file can genuinely get several concurrent
     # first-time connect() calls. executescript() unconditionally commits
     # any open transaction before it runs and then autocommits its own
@@ -183,20 +206,25 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     # before the script's DDL even starts, and two connections can both
     # read current=N and both attempt the same migration. CREATE TABLE IF
     # NOT EXISTS tolerated that (migrations 1 and 2, unchanged); ALTER
-    # TABLE ADD COLUMN (migration 3) does not - SQLite has no ADD COLUMN
-    # IF NOT EXISTS, so the loser got a real "duplicate column" error,
-    # discovered via this exact concurrency test hanging (a thread dying
-    # before it reaches the test's Barrier leaves the other 49 waiting
-    # forever - not a timeout, an actual deadlock).
+    # TABLE ADD COLUMN (migrations 3 and 4) does not - SQLite has no ADD
+    # COLUMN IF NOT EXISTS, so the loser got a real "duplicate column"
+    # error, discovered via this exact concurrency test hanging (a thread
+    # dying before it reaches the test's Barrier leaves the other 49
+    # waiting forever - not a timeout, an actual deadlock).
     conn.execute("BEGIN IMMEDIATE")
     try:
+        # Re-read inside the transaction, not reused from the plain SELECT
+        # above: another connection may have applied every pending
+        # migration while this one was waiting on BEGIN IMMEDIATE's lock,
+        # and that earlier read is stale by the time the lock is actually
+        # granted.
         row = conn.execute("SELECT version FROM schema_version").fetchone()
         current = row[0] if row else 0
 
-        for version, script in _MIGRATIONS:
+        for version, statements in _MIGRATIONS:
             if version <= current:
                 continue
-            for statement in _split_statements(script):
+            for statement in statements:
                 conn.execute(statement)
             if row is None:
                 conn.execute(
@@ -532,6 +560,18 @@ def get_observations(conn: sqlite3.Connection, item_id: str) -> list[dict]:
         (item_id,),
     ).fetchall()
     return [_observation_row_to_dict(row) for row in rows]
+
+
+def store_sanity_flag(conn: sqlite3.Connection, item_id: str, sanity_flagged: bool) -> None:
+    """Persist V0.8b's sanity-floor flag (design.md §5.3). CLAUDE.md calls
+    the sanity-floor queue a to-do list of missing reject rules - a to-do
+    list that isn't queryable (`WHERE sanity_flagged = 1`) doesn't get
+    worked, so this is a real column, not a log line. One UPDATE, no
+    explicit BEGIN/COMMIT - same reasoning as store_spec()."""
+    conn.execute(
+        "UPDATE listings SET sanity_flagged = ? WHERE item_id = ?",
+        (1 if sanity_flagged else 0, item_id),
+    )
 
 
 def count_active_listings(conn: sqlite3.Connection, profile_id: str) -> int:

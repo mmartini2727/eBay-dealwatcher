@@ -380,6 +380,48 @@ def test_migration_runs_twice_cleanly_and_leaves_budget_intact(tmp_path):
     assert get_latest_observation(conn2, "item-1") is not None
 
 
+def test_migration_4_applies_to_a_database_already_at_version_3(tmp_path, monkeypatch):
+    # The production path is the upgrade path, not a fresh file: every real
+    # database this runs against already has months of history at whatever
+    # version it was last opened with. Builds a genuine v3 database using
+    # the REAL migrations 1-3 (sliced from the actual _MIGRATIONS, not a
+    # hand-copied duplicate that could silently drift from it), then
+    # reconnects with the full, current _MIGRATIONS and confirms migration
+    # 4 actually applies - and that existing data survives the upgrade.
+    import dealwatch.storage.sqlite as storage_module
+
+    db_path = tmp_path / "dealwatch.db"
+    v3_only = [m for m in storage_module._MIGRATIONS if m[0] <= 3]
+    monkeypatch.setattr(storage_module, "_MIGRATIONS", v3_only)
+
+    conn = storage_module.connect(db_path)
+    version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+    assert version == 3
+    sight(conn, "item-1", 1000)
+    conn.close()
+
+    monkeypatch.undo()  # restore the real _MIGRATIONS, including migration 4
+
+    upgraded = storage_module.connect(db_path)  # the actual upgrade path
+    version = upgraded.execute("SELECT version FROM schema_version").fetchone()[0]
+    assert version == 4
+
+    # Pre-existing data survived the upgrade...
+    row = upgraded.execute(
+        "SELECT title FROM listings WHERE item_id = 'item-1'"
+    ).fetchone()
+    assert row["title"] == "Lenovo ThinkPad T14 Gen 1 16GB 256GB"
+
+    # ...and the new column is real and usable, not just present.
+    upgraded.execute(
+        "UPDATE listings SET sanity_flagged = 1 WHERE item_id = 'item-1'"
+    )
+    flagged = upgraded.execute(
+        "SELECT sanity_flagged FROM listings WHERE item_id = 'item-1'"
+    ).fetchone()
+    assert flagged["sanity_flagged"] == 1
+
+
 def test_concurrent_first_connect_against_a_fresh_file_does_not_crash_or_hang(tmp_path):
     # V0.8a regression: migration 3 (ALTER TABLE ADD COLUMN, no IF NOT
     # EXISTS equivalent in SQLite) exposed a latent race in

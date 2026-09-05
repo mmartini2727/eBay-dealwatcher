@@ -30,7 +30,8 @@ search:
     # currentBidPrice, and failed to map (4/sweep). BIN-with-Best-Offer
     # still matches on FIXED_PRICE; auction+BIN still comes through, and
     # its `price` is a real BIN. buying_options is still recorded per
-    # observation, so scoring.best_offer_weight is unaffected.
+    # observation even though nothing scores against it yet (V0.8b deleted
+    # scoring.best_offer_weight as dead config - see CLAUDE.md).
     buyingOptions: [FIXED_PRICE]
     # Raised from 1200: the search filter is the only lossy stage — a
     # listing never fetched cannot be backfilled from raw_json later.
@@ -378,8 +379,12 @@ bucket_require: [generation, cpu_family]
 scoring:
   min_samples: 12              # below this, fall back to seed_baselines
   target_percentile: 25
-  sanity_floor_pct: 25         # under this % of median => flag, do not alert
-  best_offer_weight: 0.85      # BIN with Best Offer is an anchor, not a price
+  # V0.8b: raised from 25. Units are % OF THE BASELINE'S p50 - 35 means
+  # "flagged when priced below 35% of p50", i.e. a 65%+ discount. The old
+  # value of 25 meant a 75%+ discount and effectively never fired; this is
+  # a flag, not a suppression (design.md §5.3) - it never blocks an alert,
+  # it only marks a listing for the sanity-floor queue.
+  sanity_floor_pct: 35
   include_shipping: true
   fast_lifespan_hours: 24    # V0.8a: threshold is provisional. The
                              # measured lifespan distribution is flat

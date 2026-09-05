@@ -35,9 +35,14 @@ def seed_fast_bucket(conn, count, *, gone_offset_hours=1, start_price=10000):
         item_id = f"item-{i}"
         sight(conn, item_id, t0, start_price + i * 100)
         store_spec(conn, item_id, SpecResult(spec={}, spec_status="ok", reject_rule_id=None, bucket_key=BUCKET))
+        # gone_at = last_seen is a production invariant (record_sweep sets
+        # both together) - V0.8b's never-swept exclusion in
+        # engine/baselines.py depends on last_seen actually differing from
+        # first_seen, so this fixture has to move both together too.
+        gone_at = t0 + gone_offset_hours * 3600
         conn.execute(
-            "UPDATE listings SET gone_at = ? WHERE item_id = ?",
-            (t0 + gone_offset_hours * 3600, item_id),
+            "UPDATE listings SET gone_at = ?, last_seen = ? WHERE item_id = ?",
+            (gone_at, gone_at, item_id),
         )
 
 

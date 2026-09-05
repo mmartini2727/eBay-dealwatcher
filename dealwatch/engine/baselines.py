@@ -1,4 +1,5 @@
-"""Survival-derived baseline computation (design.md §2.1, V0.8a).
+"""Survival-derived baseline computation (design.md §2.1, V0.8a; the
+never-swept exclusion below is V0.8b).
 
 No scoring, no alerting, no seed_baselines, no sanity floor - this module
 only turns dead listings into price/lifespan candidates and turns those
@@ -31,7 +32,7 @@ from dataclasses import dataclass
 logger = logging.getLogger(__name__)
 
 _DEAD_OK_LISTINGS = """
-    SELECT item_id, bucket_key, gone_at
+    SELECT item_id, bucket_key, gone_at, first_seen, last_seen
     FROM listings
     WHERE gone_at IS NOT NULL AND spec_status = 'ok'
 """
@@ -62,9 +63,25 @@ class CandidatePoolStats:
     equals len(derive_candidates(conn))."""
 
     total_dead_ok: int
+    sweep_confirmed: int
     has_bucket_key: int
     bucket_key_has_no_question_mark: int
     has_usable_price: int
+
+
+def select_price(total_cents: int | None, price_cents: int | None) -> tuple[int, bool] | None:
+    """total_cents when known, else price_cents, else None when neither is
+    usable (an auction row with no BIN at all). The bool is True exactly
+    when price_cents was the fallback (total_cents was unknown) -
+    V0.8a's n_price_only convention. Shared with engine/scoring.py (V0.8b),
+    which needs the identical rule for an active listing's latest
+    observation - one implementation so the two can't drift apart, the
+    same reasoning as normalize_input_fields() (CLAUDE.md)."""
+    if total_cents is not None:
+        return total_cents, False
+    if price_cents is not None:
+        return price_cents, True
+    return None
 
 
 def _derive(conn) -> tuple[list[LifespanCandidate], CandidatePoolStats]:
@@ -76,12 +93,25 @@ def _derive(conn) -> tuple[list[LifespanCandidate], CandidatePoolStats]:
     """
     rows = conn.execute(_DEAD_OK_LISTINGS).fetchall()
     total_dead_ok = len(rows)
+    sweep_confirmed = 0
     has_bucket_key = 0
     no_question_mark = 0
     has_usable_price = 0
     candidates: list[LifespanCandidate] = []
 
     for row in rows:
+        # V0.8b: a listing whose last_seen never advanced past first_seen
+        # was never confirmed present by a single sweep - gone_at equals
+        # the insert timestamp and the derived lifespan is 0.0, the
+        # fastest possible value, in exactly the band the baseline weighs
+        # most heavily. Measured at a steady ~8% of daily deaths, average
+        # final price $378.95 vs. $362 for swept listings - not cheap
+        # fast-sellers, just unmeasured ones. A lifespan that cannot be
+        # measured must not count as the fastest measurable one.
+        if row["first_seen"] == row["last_seen"]:
+            continue
+        sweep_confirmed += 1
+
         bucket_key = row["bucket_key"]
         if bucket_key is None:
             continue
@@ -98,14 +128,10 @@ def _derive(conn) -> tuple[list[LifespanCandidate], CandidatePoolStats]:
             # doesn't own that guarantee, so it's checked, not assumed.
             continue
 
-        if last_obs["total_cents"] is not None:
-            price_cents = last_obs["total_cents"]
-            price_is_price_only = False
-        elif last_obs["price_cents"] is not None:
-            price_cents = last_obs["price_cents"]
-            price_is_price_only = True
-        else:
+        selected = select_price(last_obs["total_cents"], last_obs["price_cents"])
+        if selected is None:
             continue  # auction row with no usable price at all
+        price_cents, price_is_price_only = selected
         has_usable_price += 1
 
         lifespan_seconds = row["gone_at"] - last_obs["observed_at"]
@@ -128,6 +154,7 @@ def _derive(conn) -> tuple[list[LifespanCandidate], CandidatePoolStats]:
 
     stats = CandidatePoolStats(
         total_dead_ok=total_dead_ok,
+        sweep_confirmed=sweep_confirmed,
         has_bucket_key=has_bucket_key,
         bucket_key_has_no_question_mark=no_question_mark,
         has_usable_price=has_usable_price,
