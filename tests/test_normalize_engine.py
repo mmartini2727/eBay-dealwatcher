@@ -494,6 +494,68 @@ def test_bare_model_number_pattern_does_not_match_storage_or_clock_speed(fragmen
 
 
 # ---------------------------------------------------------------------------
+# RAM extraction - bare-GB titles, no ddr/ram/memory keyword.
+#
+# Measured on the LXC: 38% of baseline candidates had ram_gb NULL, and a
+# sample of 40 of those titles all stated RAM with no keyword at all -
+# always bare forms like "16GB 256GB". The discriminator added is
+# MAGNITUDE (a closed set: 8/12/16/24/32/40/48/64), not position - storage
+# can legitimately come first in a title, so a RAM-then-storage assumption
+# would misread it.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "title,expected_ram_gb",
+    [
+        ("Lenovo ThinkPad T14 Gen 2 i5-1135G7 16GB 256GB Win11 Home", 16),
+        # Storage-first: position independence is the whole point of the
+        # magnitude-based discriminator, not an incidental side effect.
+        ("Lenovo ThinkPad T14 (512GB,16GB i5-10310U 10th.Gen,Bluetooth,Wi-Fi)", 16),
+        ("ThinkPad T14 Gen 2i i7-1185G7 16/512GB Win11P Touch", 16),
+        # "2.40Ghz" sits right before the real RAM figure - must not be misread.
+        ("Lenovo Thinkpad T14 Gen2 i5-1135G7 2.40Ghz 24GB M2-512SSD", 24),
+        ("Lenovo ThinkPad T14 Gen 3 FHD+ i7-1270P 40GB 512GB SSD", 40),
+    ],
+)
+def test_bare_gb_ram_extraction_matches_real_titles(title, expected_ram_gb):
+    result = normalize(PROFILE, fields(title))
+    assert result.spec["ram_gb"] == expected_ram_gb
+
+
+def test_ddr4_keyword_rule_still_wins_over_the_bare_gb_fallback():
+    # The two existing keyword rules are more specific and must keep
+    # winning - the new rules were appended after them, not inserted
+    # before or reordered in.
+    title = "Lenovo ThinkPad T14 Gen 1 i5-1135G7 16GB DDR4 512GB SSD"
+    result = normalize(PROFILE, fields(title))
+    assert result.spec["ram_gb"] == 16
+
+
+def test_title_that_genuinely_states_no_ram_stays_null():
+    title = "Lenovo ThinkPad T14 Gen 5 Ryzen 5 Pro 8540U 512GB- Black"
+    result = normalize(PROFILE, fields(title))
+    assert result.spec["ram_gb"] is None
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "Lenovo ThinkPad T14 Gen 1 i5-10310U 512GB SSD Win11 Pro",
+        "Lenovo ThinkPad T14 Gen 1 i5-10310U 1024GB SSD Win11 Pro",
+    ],
+)
+def test_bare_storage_figures_never_get_misread_as_ram(title):
+    # 512 and 1024 are both outside the closed RAM set, and neither has an
+    # internal word boundary a shorter alternative (12, 24) could latch
+    # onto - see the profile comment on \b. Covers both "MUST NOT be 512"
+    # and "MUST NOT be 24"/"MUST NOT be 12" from the task in one
+    # parametrization, since all three are the same failure mode.
+    result = normalize(PROFILE, fields(title))
+    assert result.spec["ram_gb"] is None
+
+
+# ---------------------------------------------------------------------------
 # spec_status assignment and bucket_key rendering, using small synthetic
 # profiles - these are mechanical/boundary checks, not rule-motivation
 # tests, so real fixture titles aren't required for them.

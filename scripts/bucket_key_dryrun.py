@@ -28,7 +28,10 @@ after filtering out '?' keys. This is what proves the numbers below
 describe the real pipeline rather than a parallel reimplementation that
 has quietly drifted from it. It runs every time this script runs, not as
 a separate test - a dry run whose own self-check didn't pass would be
-worse than no dry run at all.
+worse than no dry run at all. Prints a result line on BOTH outcomes - a
+line that only ever appeared on failure would give a passing run no
+positive evidence it was ever checked at all, indistinguishable from the
+check having been skipped entirely.
 """
 
 import argparse
@@ -186,6 +189,8 @@ def verify_against_derive_candidates(conn, pre_bucket: list[PreBucketCandidate],
         for c in sorted(only_in_real)[:20]:
             print(f"    {c}")
         raise SystemExit(1)
+
+    print(f"SELF-CHECK OK: {len(real_set)} candidate(s) match baselines.derive_candidates() exactly")
 
 
 def _fast_counts_by_bucket(

@@ -265,6 +265,34 @@ extract:
       - pattern: '\b(?:ram|memory)\s*[:.]?\s*(\d{1,3})\s*gb\b'
         value: '{1}'
         apply: to_int
+      # Bare-GB fallback (measured on the LXC: 38% of baseline candidates
+      # had ram_gb NULL, and a sample of 40 of those titles all state RAM
+      # with no ddr/ram/memory keyword at all - a pattern gap, not missing
+      # data). Position is NOT the discriminator - storage can legitimately
+      # come before RAM in a title ("512GB,16GB i5-10310U") - MAGNITUDE is:
+      # RAM comes from a small closed set (8/12/16/24/32/40/48/64) that
+      # never overlaps observed storage values (128/250/256/500/512/
+      # 1000/1024). The alternation is deliberately this closed set, not
+      # \d{1,3}, specifically so it can never match a bare storage figure
+      # regardless of where it sits in the title. \b on both sides is load-
+      # bearing, not decoration: with digits as adjacent word characters,
+      # \b only lands at an actual token boundary, so "12" cannot match
+      # inside "512", "24" cannot match inside "1024", and "8" cannot match
+      # inside "48" - there is no internal boundary within a contiguous
+      # digit run for a shorter alternative to latch onto.
+      #
+      # Slash form ("16/512GB", only the storage number carries the `GB`
+      # suffix) must come BEFORE the enumerated rule below: it is the more
+      # specific case and should win on principle even though, today, the
+      # enumerated rule alone does not match "16/512GB" at all (no `gb`
+      # immediately follows "16") - a future looser rule must not get the
+      # chance to be the one relied on for this shape.
+      - pattern: '\b(8|12|16|24|32|40|48|64)\s*/\s*\d{3,4}\s*gb\b'
+        value: '{1}'
+        apply: to_int
+      - pattern: '\b(8|12|16|24|32|40|48|64)\s*gb\b'
+        value: '{1}'
+        apply: to_int
     default: null
 
   storage_gb:
