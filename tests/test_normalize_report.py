@@ -62,13 +62,15 @@ def test_bucket_histogram_counts_ok_and_partial_separately(tmp_path):
     seed(conn, "v1|ok|1", "Lenovo ThinkPad T14 Gen 1 i5-10310U 16GB RAM 256GB SSD v2", 1001)
     for i in range(12):
         # No generation marker, no CPU model - generation and cpu_family
-        # both stay null, so this is partial with bucket_key "?|?|16|256".
+        # both stay null, so this is partial with bucket_key "?|?|16"
+        # (V0.8c: storage_tier dropped from bucket_key, so the key is now
+        # three segments, not four).
         seed(conn, f"v1|partial|{i}", "Lenovo ThinkPad T14 16GB RAM 256GB SSD", 1002 + i)
 
     output = run_report(PROFILE, conn, seed=1)
 
-    assert "1|intel-10th|16|256: 2 ok, 0 partial" in output
-    assert "?|?|16|256: 0 ok, 12 partial" in output
+    assert "1|intel-10th|16: 2 ok, 0 partial" in output
+    assert "?|?|16: 0 ok, 12 partial" in output
     # 12 partial hits alone must not look like reached coverage.
     assert "0 OK-only buckets reach scoring.min_samples=12" in output
 

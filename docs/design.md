@@ -54,21 +54,61 @@ Three layers, in order of when they become available:
 
   - Consequence: the survival-derived baseline is in practice a Gen 1–3 Intel feature. Gen 5/6 will run on seed baselines indefinitely. That is what layer 1 is for, but V0.8 must not be designed as if layer 3 eventually replaces it — the fallback is the steady state for the target generations, and the seed chart's accuracy matters more than this document originally assumed.
 
-  - **Storage tier drop from bucket_key: pending, its own milestone.** The
-    fragmentation measured above is null-driven, but `bucket_key`'s own width
-    (`[generation, cpu_family, ram_tier, storage_tier]`, §5.2/§5's bucket
-    section) is a second, independent source: two listings identical in every
-    way except 256GB vs. 512GB storage currently land in different buckets
-    even when both fields are non-null. Removing `storage_tier` from the key
-    roughly quadruples sample density per bucket — cheap to say, not free to
-    do: every stored `bucket_key` in the database was computed under the
-    four-field key, so this invalidates all of them and requires a full
-    `--all` backfill re-run (`scripts/backfill_normalize.py`) before any
-    baseline recompute means anything. It needs its own milestone rather than
-    riding along with an unrelated normalization change specifically because
-    of that backfill dependency — a partial rollout (new listings keyed on
-    three fields, old rows still keyed on four) would silently corrupt every
-    affected bucket's percentiles rather than failing loudly.
+  - **Storage tier dropped from bucket_key (V0.8c).** `bucket_key` is now
+    `[generation, cpu_family, ram_tier]` — no longer four fields. Measured
+    on the LXC, after the V0.8c bare-GB RAM extraction fix, against 190
+    baseline candidates:
+
+    | | 4-field key (old) | 3-field key (new) |
+    | --- | --- | --- |
+    | clean candidates | 140 | 188 |
+    | candidates with `?` | 50 | 2 |
+    | distinct buckets | 40 | 30 |
+    | buckets reaching `min_samples` | 1 | 2 |
+
+    The original hypothesis for this drop was that `bucket_key`'s own
+    width was a second, independent fragmentation source alongside null
+    extraction (§2.1's earlier measurement). That turned out to be a minor
+    effect in practice: 48 of the 50 remaining `?` candidates were
+    storage-only, but the dominant cause of the *null* extraction problem
+    was the RAM regex gap (bare "16GB 256GB" titles with no `ddr4`/`ram`/
+    `memory` keyword), fixed the same milestone — not `bucket_key`'s width.
+    Storage is also not a purchase discriminator for this target: two
+    otherwise-identical machines differing only in storage size are not
+    different deals, so there was no decision-quality cost to dropping it,
+    only a fragmentation cost to keeping it. `storage_tier` stays defined
+    in `tiers` and still lands in `spec_json` — only its `bucket_key`
+    membership was removed, so it remains queryable and could be
+    re-added later.
+
+    This invalidated every stored `bucket_key` and required a full `--all`
+    backfill re-run (`scripts/backfill_normalize.py`) before the recompute
+    meant anything — a partial rollout (new listings keyed on three
+    fields, old rows still keyed on four) would have silently corrupted
+    every affected bucket's percentiles rather than failing loudly.
+    Reversing this decision (re-adding `storage_tier`) is possible but
+    costs another full backfill; it is not a config flag to flip back.
+
+  - **Seed chart validated against computed data at two independent
+    points (V0.8c).** The survival-derived baseline (layer 3) reaching
+    `min_samples` for the first time gave the first opportunity to check
+    the hand-authored seed chart (layer 1) against reality, not just
+    against itself:
+
+    | bucket | seed p25/p50 | computed p25/p50 (n) |
+    | --- | --- | --- |
+    | `1|intel-10th|16` | $160 / $200 | $164.99 / $195.50 (n=14) |
+    | `2|intel-11th|16` | $230 / $250 | $215.00 / $244.90 (n=24) |
+
+    Both are close — single-digit-percent p50 differences — which is
+    reassuring given that Gen 5/6 AMD, the actual buying target, will run
+    on seed baselines indefinitely (per the Consequence bullet above) and
+    has no computed data to check itself against. `2|intel-11th|16`'s seed
+    was anchored on a stale computed p50 of $249 from before this
+    recompute; re-anchoring it to the new $244.90 is a deliberate
+    follow-up, not done here, since the *post-backfill* recompute is what
+    the anchor should be pinned to and that hadn't run yet when the seed
+    file was last edited.
 
 **Known weakness of (3):** disappearance conflates *sold* with *ended early* or
 *pulled by seller*. `getItem` on a dead listing errors and does not disclose

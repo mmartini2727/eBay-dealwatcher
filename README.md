@@ -152,3 +152,28 @@ everything already collected once it exists.
   file.
 - Container runs as a non-root user; `data/` is chowned to it.
 - `profiles/` mounts read-only, `data/` read-write.
+- **Updating `scripts/*.py` on the LXC: use the trailing-`/.`/trailing-`/`
+  form, not the bare one.** `scripts/` (the maintenance/report scripts —
+  `baseline_report.py`, `recompute_baselines.py`, `score_active.py`, etc.)
+  isn't baked into the image or mounted by `compose.yaml`; it has to be
+  copied into the running container by hand before any of them can be run
+  there. `docker cp scripts dealwatch:/app/scripts` only overwrites cleanly
+  the *first* time. Once `/app/scripts/` already exists inside the
+  container, Docker's `cp` copies the *directory* `scripts` into it rather
+  than merging its contents — a second invocation silently nests it as
+  `/app/scripts/scripts/*.py`, and the container keeps running whatever was
+  already at `/app/scripts/*.py`. This is the same class of failure as the
+  profile-restart bug above: the copy command reports success either way.
+
+  ```bash
+  docker cp scripts/. dealwatch:/app/scripts/
+  ```
+
+  Verify the copy actually landed before trusting a script's output —
+  don't rely on the exit code:
+
+  ```bash
+  md5sum scripts/*.py | awk '{print $1}' | sort > /tmp/local.md5
+  docker exec dealwatch sh -c 'md5sum /app/scripts/*.py' | awk '{print $1}' | sort > /tmp/remote.md5
+  diff /tmp/local.md5 /tmp/remote.md5 && echo "scripts match"
+  ```

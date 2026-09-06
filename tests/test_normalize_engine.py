@@ -20,6 +20,7 @@ from dealwatch.normalize.engine import (
     PARTIAL,
     REJECTED,
     ProfileCompileError,
+    _build_bucket_key,
     compile_profile,
     normalize,
 )
@@ -553,6 +554,63 @@ def test_bare_storage_figures_never_get_misread_as_ram(title):
     # parametrization, since all three are the same failure mode.
     result = normalize(PROFILE, fields(title))
     assert result.spec["ram_gb"] is None
+
+
+# ---------------------------------------------------------------------------
+# V0.8c: storage_tier dropped from bucket_key (design.md §2.1). Measured on
+# the LXC: 48 of 50 remaining '?' candidates were storage-only, spread
+# across 40 buckets with 1 qualifying under the 4-field key; dropping
+# storage_tier took the usable pool from 140 to 188 candidates across 30
+# buckets with 2 qualifying. storage_tier stays defined in tiers and still
+# lands in spec_json - only bucket_key membership changed.
+# ---------------------------------------------------------------------------
+
+
+def test_real_profile_bucket_key_is_three_fields():
+    assert PROFILE.bucket_key == ["generation", "cpu_family", "ram_tier"]
+
+
+def test_build_bucket_key_produces_three_segments_for_the_real_profile():
+    spec = {"generation": "1", "cpu_family": "intel-10th", "ram_tier": "16", "storage_tier": "256"}
+    bucket_key = _build_bucket_key(PROFILE.bucket_key, spec)
+    assert bucket_key.count("|") == 2  # three segments, two separators
+    assert bucket_key == "1|intel-10th|16"
+
+
+def test_ram_gb_40_lands_in_tier_32_not_64_plus():
+    # 40GB is 8 soldered + a 32GB SODIMM - it behaves like a 32GB machine.
+    title = "Lenovo ThinkPad T14 Gen 3 FHD+ i7-1270P 40GB 512GB SSD"
+    result = normalize(PROFILE, fields(title))
+    assert result.spec["ram_gb"] == 40
+    assert result.spec["ram_tier"] == "32"
+
+
+def test_ram_gb_24_still_lands_in_tier_32():
+    # 24GB (8 soldered + 16 SODIMM) was already correct before V0.8c and
+    # must stay that way - this is a regression check, not a new behavior.
+    title = "Lenovo Thinkpad T14 Gen2 i5-1135G7 2.40Ghz 24GB M2-512SSD"
+    result = normalize(PROFILE, fields(title))
+    assert result.spec["ram_gb"] == 24
+    assert result.spec["ram_tier"] == "32"
+
+
+def test_bucket_key_identical_across_different_storage_tiers():
+    # The actual point of dropping storage_tier from bucket_key: two
+    # listings that differ ONLY in storage must now bucket together.
+    base = {"generation": "2", "cpu_family": "intel-11th", "ram_tier": "16"}
+    key_256 = _build_bucket_key(PROFILE.bucket_key, {**base, "storage_tier": "256"})
+    key_512 = _build_bucket_key(PROFILE.bucket_key, {**base, "storage_tier": "512"})
+    key_none = _build_bucket_key(PROFILE.bucket_key, {**base, "storage_tier": None})
+    assert key_256 == key_512 == key_none == "2|intel-11th|16"
+
+
+def test_storage_tier_none_no_longer_produces_a_question_mark():
+    # The 48-candidate rescue this milestone exists for: a listing with
+    # every OTHER field populated but unparsed storage must no longer be
+    # excluded from baseline computation via a '?' in its bucket_key.
+    spec = {"generation": "1", "cpu_family": "intel-10th", "ram_tier": "16", "storage_tier": None}
+    bucket_key = _build_bucket_key(PROFILE.bucket_key, spec)
+    assert "?" not in bucket_key
 
 
 # ---------------------------------------------------------------------------

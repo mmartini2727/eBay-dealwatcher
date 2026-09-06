@@ -384,8 +384,11 @@ tiers:
     breaks:
       - {max: 8,   label: "8"}
       - {max: 16,  label: "16"}
-      - {max: 32,  label: "32"}
-      - {min: 33,  label: "64+"}
+      # V0.8c: 40GB (8 soldered + 32 SODIMM) behaves like a 32GB machine.
+      - {max: 40,  label: "32"}
+      - {min: 41,  label: "64+"}
+  # storage_tier stays defined and still lands in spec_json - only its
+  # membership in bucket_key is removed below. Untouched by V0.8c.
   storage_tier:
     from: storage_gb
     breaks:
@@ -394,7 +397,19 @@ tiers:
       - {max: 1024, label: "1TB"}
       - {min: 1025, label: "2TB+"}
 
-bucket_key: [generation, cpu_family, ram_tier, storage_tier]
+# V0.8c: storage_tier dropped. Measured on the LXC (190 baseline
+# candidates, post RAM-extraction fix): the 4-field key left 50 candidates
+# with a '?' bucket_key, 48 of them storage-only, spread across 40 buckets
+# with exactly 1 qualifying (n>=min_samples). Storage was never a purchase
+# discriminator for this target - two otherwise-identical machines differing
+# only in storage size are not different deals - so it was pure
+# fragmentation cost for zero decision value. The 3-field key: 188 clean
+# candidates, 30 buckets, 2 qualify. Reversing this (adding storage_tier
+# back) is possible but re-invalidates every stored bucket_key and costs
+# another full backfill - see CLAUDE.md's Conventions on "two triggers, one
+# path" for why that backfill has to complete before either trigger's
+# output means anything.
+bucket_key: [generation, cpu_family, ram_tier]
 
 # Fields that MUST be non-null for a listing to contribute to a baseline.
 # Listings failing this are still alertable on price alone — they just
