@@ -18,6 +18,7 @@ from dealwatch.storage.sqlite import (
     get_observations,
     record_sighting,
     record_sweep,
+    store_sanity_flags,
     store_spec,
 )
 
@@ -362,6 +363,61 @@ def test_store_spec_is_idempotent(tmp_path):
     second = dict(conn.execute("SELECT * FROM listings WHERE item_id = 'item-1'").fetchone())
 
     assert first == second
+
+
+def test_store_sanity_flags_sets_exactly_the_given_flags_and_leaves_others_untouched(tmp_path):
+    conn = make_conn(tmp_path)
+    sight(conn, "item-1", 1000)
+    sight(conn, "item-2", 1000)
+    sight(conn, "item-3", 1000)
+    # A pre-existing flag on a row NOT included in this batch must survive -
+    # store_sanity_flags only touches the rows it's handed, not every row.
+    conn.execute("UPDATE listings SET sanity_flagged = 1 WHERE item_id = 'item-3'")
+
+    store_sanity_flags(conn, [("item-1", True), ("item-2", False)])
+
+    flags = {
+        row["item_id"]: row["sanity_flagged"]
+        for row in conn.execute("SELECT item_id, sanity_flagged FROM listings").fetchall()
+    }
+    assert flags["item-1"] == 1
+    assert flags["item-2"] == 0
+    assert flags["item-3"] == 1  # untouched, not reset to NULL/0
+
+
+def test_store_sanity_flags_empty_list_is_a_noop_not_an_error(tmp_path):
+    conn = make_conn(tmp_path)
+    sight(conn, "item-1", 1000)
+
+    store_sanity_flags(conn, [])  # must not raise
+
+    row = conn.execute(
+        "SELECT sanity_flagged FROM listings WHERE item_id = 'item-1'"
+    ).fetchone()
+    assert row["sanity_flagged"] is None  # never touched, still the column default
+
+
+def test_store_sanity_flags_empty_list_does_not_take_a_write_lock(tmp_path):
+    # The test above (data untouched, no exception) also passes if an
+    # empty batch opens a transaction and runs an empty executemany inside
+    # it - that's harmless too, so it doesn't actually prove no lock was
+    # taken. This test does: it holds the write lock on a second
+    # connection first, the way the live collector's poll/sweep would, and
+    # asserts an empty call returns immediately rather than blocking on
+    # busy_timeout for a lock it never needed - the exact "database is
+    # locked" failure mode this milestone exists to prevent.
+    db_path = tmp_path / "dealwatch.db"
+    conn = connect(db_path)
+    sight(conn, "item-1", 1000)
+    conn.execute("PRAGMA busy_timeout=200")  # fail fast if this regresses
+
+    blocker = connect(db_path)
+    blocker.execute("BEGIN IMMEDIATE")
+    try:
+        store_sanity_flags(conn, [])  # must not attempt to acquire the lock
+    finally:
+        blocker.execute("ROLLBACK")
+        blocker.close()
 
 
 def test_migration_runs_twice_cleanly_and_leaves_budget_intact(tmp_path):

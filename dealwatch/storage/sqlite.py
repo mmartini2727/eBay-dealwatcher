@@ -562,16 +562,40 @@ def get_observations(conn: sqlite3.Connection, item_id: str) -> list[dict]:
     return [_observation_row_to_dict(row) for row in rows]
 
 
-def store_sanity_flag(conn: sqlite3.Connection, item_id: str, sanity_flagged: bool) -> None:
-    """Persist V0.8b's sanity-floor flag (design.md §5.3). CLAUDE.md calls
-    the sanity-floor queue a to-do list of missing reject rules - a to-do
-    list that isn't queryable (`WHERE sanity_flagged = 1`) doesn't get
-    worked, so this is a real column, not a log line. One UPDATE, no
-    explicit BEGIN/COMMIT - same reasoning as store_spec()."""
-    conn.execute(
-        "UPDATE listings SET sanity_flagged = ? WHERE item_id = ?",
-        (1 if sanity_flagged else 0, item_id),
-    )
+def store_sanity_flags(conn: sqlite3.Connection, flags: list[tuple[str, bool]]) -> None:
+    """Persist V0.8b's sanity-floor flag (design.md §5.3) for a batch of
+    listings in one transaction - one BEGIN IMMEDIATE, one executemany, one
+    COMMIT, same pattern as record_sweep()/store_baselines(). CLAUDE.md
+    calls the sanity-floor queue a to-do list of missing reject rules - a
+    to-do list that isn't queryable (`WHERE sanity_flagged = 1`) doesn't
+    get worked, so this is a real column, not a log line.
+
+    flags is a list of (item_id, sanity_flagged) pairs. This used to be a
+    per-item store_sanity_flag(conn, item_id, sanity_flagged) called once
+    per scored listing - scripts/score_active.py scores hundreds of active
+    listings per run, so that was hundreds of separate write transactions
+    racing the live collector's poll/sweep writes on the same database
+    file, which is exactly what produced "database is locked" on the LXC.
+    Batching into one transaction is the fix; there is no longer a
+    single-row version to call instead.
+
+    An empty list is a no-op and does not open a transaction - there is
+    nothing to protect atomically, and no write lock is worth taking for
+    zero rows.
+    """
+    if not flags:
+        return
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.executemany(
+            "UPDATE listings SET sanity_flagged = ? WHERE item_id = ?",
+            [(1 if flagged else 0, item_id) for item_id, flagged in flags],
+        )
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
 
 
 def count_active_listings(conn: sqlite3.Connection, profile_id: str) -> int:

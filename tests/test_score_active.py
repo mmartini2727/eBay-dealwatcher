@@ -1,11 +1,15 @@
 """Tests for scripts/score_active.py's run_score_active().
 
 Uses the real profiles/thinkpad-t14.yaml for its seed_baselines fallback
-(match: {} -> p25=250, p50=350) and scoring.sanity_floor_pct, the same
-approach test_recompute_baselines.py and test_baseline_report.py already
-take - store_spec() writes bucket_key/spec_json directly rather than
-running the real regex pipeline, since normalize() itself isn't what this
-script is testing. Real SQLite under tmp_path. No network.
+(match: {}) and scoring.sanity_floor_pct, the same approach
+test_recompute_baselines.py and test_baseline_report.py already take -
+store_spec() writes bucket_key/spec_json directly rather than running the
+real regex pipeline, since normalize() itself isn't what this script is
+testing. The fallback's exact p25/p50 are real business data the
+maintainer retunes independently of this test file, so assertions here
+check relative behavior (ordering, well-below-any-reasonable-floor) rather
+than hardcoding dollar amounts that would drift out of sync with the
+profile. Real SQLite under tmp_path. No network.
 """
 
 import json
@@ -58,10 +62,12 @@ def make_dead(conn, item_id, price_cents, *, bucket_key=None):
 
 def test_scores_active_listings_sorted_by_ratio_to_p25_ascending(tmp_path):
     conn = connect(tmp_path / "dealwatch.db")
-    # Fallback seed is p25=250/p50=350 (profiles/thinkpad-t14.yaml). Neither
-    # listing has a bucket_key, so both fall straight to that seed.
-    make_active(conn, "expensive", 30000)  # ratio_to_p25 = 300/250 = 1.2
-    make_active(conn, "cheap", 20000)      # ratio_to_p25 = 200/250 = 0.8
+    # Neither listing has a bucket_key, so both fall straight to the
+    # profile's match: {} seed - same baseline for both, so whichever price
+    # is lower has the lower ratio_to_p25 regardless of the baseline's
+    # actual p25 value.
+    make_active(conn, "expensive", 900000)
+    make_active(conn, "cheap", 100)
 
     output = run_score_active(PROFILE, conn, limit=10)
 
@@ -73,8 +79,10 @@ def test_scores_active_listings_sorted_by_ratio_to_p25_ascending(tmp_path):
 
 def test_persists_sanity_flagged_on_the_listings_row(tmp_path):
     conn = connect(tmp_path / "dealwatch.db")
-    # Fallback p50=350 (=$350.00); sanity_floor_pct=35 -> flagged under $122.50.
-    make_active(conn, "junk", 5000)  # $50, well under the floor
+    # 1 cent is under any plausible sanity floor regardless of what the
+    # profile's fallback p50 currently is - keeps this test independent of
+    # the seed chart's real, independently-retuned dollar values.
+    make_active(conn, "junk", 1)
 
     run_score_active(PROFILE, conn, limit=10)
 

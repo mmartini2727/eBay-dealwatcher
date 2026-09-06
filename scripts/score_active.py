@@ -6,10 +6,14 @@
         [--db data/dealwatch.db] [--limit 20]
 
 Writes: persists sanity_flagged on every listing scored (design.md §5.3 -
-the sanity-floor queue has to be queryable later, not a log line). Does
-NOT send alerts, decide buyability, or touch the alerts table - that's
-V0.9. Not wired into the collector loop or FastAPI this milestone; V0.9
-decides where scoring gets called from.
+the sanity-floor queue has to be queryable later, not a log line), in one
+batched transaction at the end of the run (store_sanity_flags) rather than
+one write per listing - scoring hundreds of active listings used to mean
+hundreds of separate BEGIN IMMEDIATEs racing the live collector's poll/sweep
+writes on the same database file, which hit "database is locked" on the
+LXC. Does NOT send alerts, decide buyability, or touch the alerts table -
+that's V0.9. Not wired into the collector loop or FastAPI this milestone;
+V0.9 decides where scoring gets called from.
 
 "Active" means gone_at IS NULL; only spec_status='ok' listings are scored
 - 'partial' listings have a bucket_key containing '?' and would only ever
@@ -29,7 +33,7 @@ from dealwatch.engine.baselines import select_price
 from dealwatch.engine.collector import load_profile
 from dealwatch.engine.scoring import compile_seed_baselines, score_listing
 from dealwatch.normalize.engine import compile_profile
-from dealwatch.storage.sqlite import connect, get_latest_observation, store_sanity_flag
+from dealwatch.storage.sqlite import connect, get_latest_observation, store_sanity_flags
 
 _ACTIVE_OK_LISTINGS = """
     SELECT item_id, bucket_key, spec_json, item_web_url
@@ -45,6 +49,7 @@ def run_score_active(profile, conn, *, limit: int) -> str:
     rows = conn.execute(_ACTIVE_OK_LISTINGS, (profile.id,)).fetchall()
 
     results = []
+    sanity_flags: list[tuple[str, bool]] = []
     skipped_no_price = 0
     for row in rows:
         observation = get_latest_observation(conn, row["item_id"])
@@ -69,8 +74,14 @@ def run_score_active(profile, conn, *, limit: int) -> str:
             price_is_price_only=price_is_price_only,
             item_web_url=row["item_web_url"],
         )
-        store_sanity_flag(conn, row["item_id"], result.sanity_flagged)
+        sanity_flags.append((row["item_id"], result.sanity_flagged))
         results.append(result)
+
+    # One write transaction for the whole run, not one per listing - see
+    # store_sanity_flags' docstring for why that distinction is load-bearing
+    # here (hundreds of separate BEGIN IMMEDIATEs raced the live collector's
+    # writes on the LXC and hit "database is locked").
+    store_sanity_flags(conn, sanity_flags)
 
     results.sort(key=lambda r: r.ratio_to_p25)
 
