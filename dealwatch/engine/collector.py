@@ -33,6 +33,7 @@ from dealwatch.normalize.listing import (
     _to_int,
     map_item_summary,
     normalize_input_fields,
+    parse_variation_id,
 )
 from dealwatch.normalize.schema import Profile
 from dealwatch.providers.ebay import EbayBrowseProvider
@@ -45,15 +46,20 @@ from dealwatch.storage.sqlite import (
     record_sighting,
     record_sweep,
     store_spec,
+    store_sweep_stats,
 )
 
 logger = logging.getLogger(__name__)
 
-# The fast poll is itemStartDate-filtered (design.md §4.2) - one page is
-# correct for it regardless of active-set size, so unlike the sweep's page
-# size/depth (V0.7c: now profile.search.poll.sweep_page_limit/
-# sweep_max_pages, since those must track the active set), this one stays a
-# plain constant.
+# The fast poll is NOT itemStartDate-filtered - the profile sets no such
+# filter and search() has no code path that would add one (V0.8d - this
+# comment previously claimed otherwise). It re-fetches page one of the same
+# query every interval_minutes and relies on record_sighting's own dedup
+# (unchanged fields -> no new observation) to stay cheap. One page is a
+# fixed cost choice, not a guarantee that only new listings come back -
+# unlike the sweep's page size/depth (V0.7c: profile.search.poll.
+# sweep_page_limit/sweep_max_pages, since those must track the active set),
+# this stays a plain constant regardless of active-set size.
 FAST_POLL_PAGE_LIMIT = 50
 
 # V0.7c: a sweep that returns fewer distinct items than the DB's current
@@ -101,6 +107,7 @@ def _listing_fields(listing: Listing, profile_id: str) -> dict:
         "seller_feedback_pct": listing.seller_feedback_pct,
         "seller_feedback_score": listing.seller_feedback_score,
         "condition_id": listing.condition_id,
+        "variation_id": listing.variation_id,
     }
 
 
@@ -120,14 +127,20 @@ def _observation_fields(listing: Listing, raw: dict) -> dict:
     }
 
 
-def _raw_only_listing_fields(raw: dict, title: str, profile_id: str) -> dict:
+def _raw_only_listing_fields(raw: dict, title: str, item_id: str, profile_id: str) -> dict:
     """Best-effort listings row from a raw dict that failed to map. Reuses
     map_item_summary's own field-by-field extraction (_get/_to_int/_to_float
     are "private" but this is an import, not a fork - duplicating that
     parsing here would be a second copy to keep in sync by hand) for every
     field that ISN'T one of the three map_item_summary requires
     (item_id/title/price), since a missing price says nothing about
-    whether seller/condition_id/etc. are present."""
+    whether seller/condition_id/etc. are present.
+
+    variation_id is parsed here too (V0.8d), from item_id rather than raw -
+    missing this path would leave mapping-failure rows with a NULL
+    variation_id, silently readmitting exactly the multi-variation listings
+    this change excludes from the baseline.
+    """
     return {
         "profile_id": profile_id,
         "title": title,
@@ -135,6 +148,7 @@ def _raw_only_listing_fields(raw: dict, title: str, profile_id: str) -> dict:
         "seller_feedback_pct": _to_float(_get(raw, "seller", "feedbackPercentage")),
         "seller_feedback_score": _to_int(_get(raw, "seller", "feedbackScore")),
         "condition_id": _to_int(raw.get("conditionId")),
+        "variation_id": parse_variation_id(item_id),
     }
 
 
@@ -225,7 +239,7 @@ def _process_raw_item(
         record_sighting(
             conn,
             item_id,
-            _raw_only_listing_fields(raw, title, profile.id),
+            _raw_only_listing_fields(raw, title, item_id, profile.id),
             # Money stays integer cents; null means unknown, never zero.
             # Deliberately not attempting buying_options/current_bid_cents/
             # bid_count here too - those parse cleanly regardless of the
@@ -318,12 +332,26 @@ async def run_sweep_cycle(
     stats.last_sweep_at = swept_at
     stats.sweep_count += 1
 
+    # Read before ANY of this cycle's writes, including record_sighting
+    # calls in the loop below - V0.8d needs this on every exit path
+    # (design.md's dated entry), including the early-budget-exhausted
+    # return where no query has even run yet, so it's read once here
+    # rather than at the point record_sweep used to be the only consumer.
+    active_count_before = count_active_listings(conn, profile.id)
+
     status = await asyncio.to_thread(budget.status)
     if status["remaining"] <= 0:
         logger.info("sweep for profile=%s skipped: no budget remaining", profile.id)
+        store_sweep_stats(
+            conn, profile.id, swept_at,
+            fetched_count=0, distinct_count=0,
+            active_count_before=active_count_before,
+            truncated=True, sweep_recorded=False,
+        )
         return
 
     seen_item_ids: set[str] = set()
+    fetched_count = 0
     exhausted = False
 
     for query in profile.search.queries:
@@ -343,6 +371,7 @@ async def run_sweep_cycle(
             exhausted = True
             break
 
+        fetched_count += len(raw_items)
         for raw in raw_items:
             item_id = _process_raw_item(conn, profile, raw, seen_at_dt, swept_at, stats)
             if item_id is not None:
@@ -364,29 +393,42 @@ async def run_sweep_cycle(
         # manufacturing false misses. The items already seen above via
         # record_sighting still land; only the absence-bookkeeping is
         # skipped.
+        store_sweep_stats(
+            conn, profile.id, swept_at,
+            fetched_count=fetched_count, distinct_count=len(seen_item_ids),
+            active_count_before=active_count_before,
+            truncated=True, sweep_recorded=False,
+        )
         return
 
     # Coverage check (V0.7c) - this is the durable protection, not the page
     # limit above: an active set that outgrows sweep_page_limit *
     # sweep_max_pages again in the future will silently reproduce the exact
-    # bug this milestone fixes unless something notices. Compared against
-    # count_active_listings() as it stands BEFORE record_sweep()'s
-    # miss_count/gone_at bookkeeping runs below - that count is exactly
-    # "how many listings the DB currently expects to still be out there."
-    # Purely observational: never skips or otherwise changes record_sweep's
+    # bug this milestone fixes unless something notices. active_count_before
+    # is exactly "how many listings the DB currently expects to still be out
+    # there," read above before this cycle's own writes. Purely
+    # observational: never skips or otherwise changes record_sweep's
     # behavior, per this milestone's own instruction - deciding what to do
     # about a coverage gap needs data first.
-    active_count = count_active_listings(conn, profile.id)
-    if active_count > 0 and len(seen_item_ids) < active_count * _COVERAGE_WARNING_RATIO:
+    if (
+        active_count_before > 0
+        and len(seen_item_ids) < active_count_before * _COVERAGE_WARNING_RATIO
+    ):
         logger.warning(
             "sweep coverage gap for profile=%s: returned %d distinct items, "
             "%d active listings expected",
             profile.id,
             len(seen_item_ids),
-            active_count,
+            active_count_before,
         )
 
     record_sweep(conn, seen_item_ids, profile.id, swept_at)
+    store_sweep_stats(
+        conn, profile.id, swept_at,
+        fetched_count=fetched_count, distinct_count=len(seen_item_ids),
+        active_count_before=active_count_before,
+        truncated=False, sweep_recorded=True,
+    )
 
 
 async def _fast_poll_loop(
