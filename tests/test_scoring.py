@@ -5,9 +5,12 @@ is the real write path); seed-baseline tests need no DB writes at all. No
 network.
 """
 
+from pathlib import Path
+
 import pytest
 
 from dealwatch.engine.baselines import Baseline
+from dealwatch.engine.collector import load_profile
 from dealwatch.engine.scoring import (
     CompiledSeedBaseline,
     compile_seed_baselines,
@@ -20,6 +23,7 @@ from dealwatch.storage.sqlite import connect, store_baselines
 
 PROFILE_ID = "thinkpad-t14"
 BUCKET = "1|intel-10th|16|256"
+REAL_PROFILE_PATH = Path(__file__).parent.parent / "profiles" / "thinkpad-t14.yaml"
 
 
 def make_profile(*, seed_baselines=None, sanity_floor_pct=35):
@@ -119,6 +123,50 @@ def test_no_match_returns_none():
         make_profile(seed_baselines=[{"match": {"a": 1}, "p25": 10, "p50": 20}])
     )
     assert resolve_seed_baseline(seeds, {"a": 2}) is None
+
+
+# ---------------------------------------------------------------------------
+# Real profile: storage_tier dropped from the "Specific overrides" match
+# blocks (bucket_key drop prep). resolve_seed_baseline() matches against
+# spec, not bucket_key, so a storage_tier key in `match` only fired when
+# the storage regex actually matched - listings with unparsed storage fell
+# through to the coarse generation+cpu_family entry instead. Dropping it
+# from the override match blocks is what fixes that.
+# ---------------------------------------------------------------------------
+
+
+def test_real_profile_seed_baselines_compile_without_duplicate_match_error():
+    # The old {generation: "6", cpu_family: intel-ultra-2, ram_tier: "32",
+    # storage_tier: "1TB"} override becomes a duplicate match block against
+    # the "512" override once storage_tier is dropped from both - this is
+    # exactly what compile_seed_baselines()'s duplicate-match guard exists
+    # to catch. Must NOT raise, or the profile is broken at startup.
+    profile = load_profile(REAL_PROFILE_PATH)
+    compile_seed_baselines(profile)  # must not raise
+
+
+def test_gen5_ultra1_32gb_override_matches_regardless_of_storage_tier():
+    # The behavior change this task exists for: a Gen 5 Intel Ultra 1,
+    # 32GB listing whose storage never parsed (storage_tier: None) must
+    # still hit the specific override, not fall through to the coarse
+    # generation+cpu_family fallback.
+    profile = load_profile(REAL_PROFILE_PATH)
+    seeds = compile_seed_baselines(profile)
+
+    winner = resolve_seed_baseline(
+        seeds,
+        {
+            "generation": "5",
+            "cpu_family": "intel-ultra-1",
+            "ram_tier": "32",
+            "storage_tier": None,
+        },
+    )
+
+    assert winner is not None
+    assert winner.match == {"generation": "5", "cpu_family": "intel-ultra-1", "ram_tier": "32"}
+    assert winner.p25_cents == 52500  # $525
+    assert winner.p50_cents == 62500  # $625
 
 
 # ---------------------------------------------------------------------------
