@@ -1,10 +1,12 @@
 """eBay Browse API client - item_summary/search only.
 
-Deliberately thin. Normalization, the collector loop, and polling strategy
-(sort=newlyListed, sweep intervals, etc. from design.md §7) are later
-milestones - this exists to prove the OAuth (V0.2) and budget (this
-milestone) plumbing works end-to-end, and to hand back raw eBay dicts for
-V0.4+ to normalize. No Listing model here on purpose.
+Deliberately thin: no Listing model here, no sort/date-filter logic - just
+params in, raw itemSummaries out; normalization and the collector loop live
+elsewhere. search() never sends a `sort` parameter, despite
+`search.poll.sort: newlyListed` existing in profiles/*.yaml (schema.py) -
+that field is currently unused. Wiring it (and reasoning through what it
+would change for a sweep vs. a fast poll) is V0.8e's job, with its own
+before/after measurement, not something to add here quietly.
 """
 
 import asyncio

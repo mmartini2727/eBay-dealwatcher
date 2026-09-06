@@ -17,6 +17,7 @@ from dealwatch.engine.baselines import (
     nearest_rank_percentile,
 )
 from dealwatch.normalize.engine import SpecResult
+from dealwatch.normalize.listing import parse_variation_id
 from dealwatch.storage.sqlite import connect, record_sighting, store_baselines, store_spec
 
 PROFILE_ID = "thinkpad-t14"
@@ -37,7 +38,12 @@ def sight(conn, item_id, seen_at, *, price_cents=None, shipping_cents=None):
     record_sighting(
         conn,
         item_id,
-        dict(profile_id=PROFILE_ID, title="t"),
+        # variation_id derived from item_id via the real parse_variation_id()
+        # (V0.8d), not injected as a separate fixture parameter - production
+        # never gets to choose it independently of item_id, and a test that
+        # could would no longer catch parse_variation_id() regressing to
+        # "always None" (see the exclusion test below).
+        dict(profile_id=PROFILE_ID, title="t", variation_id=parse_variation_id(item_id)),
         dict(
             price_cents=price_cents,
             shipping_cents=shipping_cents,
@@ -178,6 +184,32 @@ def test_null_bucket_key_is_excluded(tmp_path):
     mark_gone(conn, "item-1", 1_000_000 + 3600)
 
     assert derive_candidates(conn) == []
+
+
+def test_variation_listing_is_excluded(tmp_path):
+    # V0.8d: a row for one variation of a multi-variation listing
+    # (item_id shaped v1|<listing>|<non-zero variation>) flaps in and out
+    # of search results based on which variation eBay happens to surface,
+    # independent of the listing actually dying - not survival-signal
+    # material. Uses a real eBay-shaped item_id (not an injected flag) so
+    # this test exercises parse_variation_id() itself via sight() - a
+    # regression there (e.g. parse_variation_id always returning None)
+    # would make this test go red too, not just the dedicated parse tests
+    # in test_listing.py.
+    conn = make_conn(tmp_path)
+    t0 = 1_000_000
+
+    sight(conn, "v1|999|456", t0, price_cents=50000)  # a real variation
+    set_spec(conn, "v1|999|456", BUCKET)
+    mark_gone(conn, "v1|999|456", t0 + 3600)
+
+    sight(conn, "plain-1", t0, price_cents=50000)  # not eBay-variation-shaped -> None
+    set_spec(conn, "plain-1", BUCKET)
+    mark_gone(conn, "plain-1", t0 + 3600)
+
+    candidates = derive_candidates(conn)
+
+    assert [c.item_id for c in candidates] == ["plain-1"]
 
 
 def test_null_shipping_uses_price_cents_and_counts_as_price_only(tmp_path):

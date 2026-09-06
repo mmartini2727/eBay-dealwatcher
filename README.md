@@ -141,15 +141,82 @@ everything already collected once it exists.
 ## Flow Chart 
 ![dealwatch_pipeline_overview.svg](docs/dealwatch_pipeline_overview.svg)
 
+## Database snapshots
+
+`data/dealwatch.db` is the irreplaceable asset. Code is rewritable; months of
+comps are not. A live LXC/Proxmox backup does **not** guarantee a consistent
+SQLite file — WAL mode means the `.db`, `-wal`, and `-shm` files are only
+coherent together, and a filesystem-level copy can catch them mid-write.
+
+Snapshots are taken with `VACUUM INTO`, which produces a single fully
+checkpointed file with no sidecars, from a read transaction — the collector
+keeps running throughout. **Do not stop the container to take a snapshot.**
+
+Offsite retention is the PBS prune policy for this LXC: last 3, 7 daily,
+4 weekly, 12 monthly. That is the real answer to "how far back can I
+recover comps" — roughly a year.
+
+### Taking one
+
+On the **LXC host** (the container image has no `sqlite3` CLI):
+
+```bash
+cd /path/to/dealwatch
+./scripts/snapshot.sh              # routine
+./scripts/snapshot.sh pre-v0.9     # labelled, before a deploy or migration
+```
+
+Output goes to `/root/dealwatch-data/dealwatch-<UTC timestamp>[-tag].db`,
+deliberately **outside the repo and outside the `data/` bind mount**.
+Snapshots are carried offsite by this LXC's PBS backup; there is no
+separate copy step. `DEALWATCH_SNAPSHOT_KEEP` controls local retention
+(default 7); `DEALWATCH_SNAPSHOT_DIR` overrides the destination.
+
+The script fails loudly on a failed `PRAGMA integrity_check` or a zero-row
+snapshot, leaving a `.partial` file for inspection. A snapshot's observation
+count being slightly *below* the live database is expected — the collector
+wrote during the vacuum.
+
+### When
+
+- **Daily at 01:30 local**, via cron on the LXC host (not in the container):
+  `30 1 * * * cd /path/to/dealwatch && ./scripts/snapshot.sh >> /var/log/dealwatch-snapshot.log 2>&1`
+- **Before every deploy**, tagged with the milestone.
+- **Before any migration or backfill** that rewrites existing rows.
+
+01:30 is chosen to complete ahead of this LXC's 02:00 PBS backup. **If the
+PBS schedule changes, change this too** — a snapshot taken after the backup
+window is offsite a full day late, and the staleness is invisible until you
+need it. The vacuum writes to a `.partial` name and renames atomically, so
+an overlap cannot produce a corrupt snapshot — but it can produce a PBS
+backup containing no snapshot at all for that night.
+
+### Restoring
+
+A PBS restore of this LXC contains both the live `data/dealwatch.db`
+(captured mid-write at 02:00) and the vacuum snapshots in
+`/root/dealwatch-data/`. **Use a snapshot.** The live copy is likely
+recoverable via WAL replay, but that depends on the backup mode being atomic
+across `.db`/`-wal`/`-shm`; the snapshot depends on nothing. Do not simply
+start the container on a restored LXC and assume the database is sound.
+
+```bash
+docker compose down
+cp /root/dealwatch-data/dealwatch-<stamp>.db data/dealwatch.db
+rm -f data/dealwatch.db-wal data/dealwatch.db-shm
+chown 10001:10001 data/dealwatch.db
+docker compose up -d
+```
+
+The `chown` is not optional — the container runs as uid 10001 and a
+root-owned database file fails to open on write. Delete the stale `-wal`
+and `-shm`: they belong to the database you just replaced.
+
 ## Operational notes
 
 - Add `/health` to Uptime Kuma. Separately add an **external** monitor against
   the Worker's challenge endpoint — its silent death has consequences that
   otherwise go unnoticed for days.
-- The SQLite listing history is the irreplaceable asset. Code is rewritable;
-  three months of comps are not. Take a periodic `VACUUM INTO` dump to the NAS
-  as a second copy — a live LXC backup does not guarantee a consistent SQLite
-  file.
 - Container runs as a non-root user; `data/` is chowned to it.
 - `profiles/` mounts read-only, `data/` read-write.
 - **Updating `scripts/*.py` on the LXC: use the trailing-`/.`/trailing-`/`

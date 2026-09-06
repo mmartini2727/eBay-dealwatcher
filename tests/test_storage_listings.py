@@ -194,26 +194,41 @@ def test_fast_poll_sighting_does_not_advance_last_seen(tmp_path):
     assert after == before == 1000
 
 
-def test_sweep_marks_a_missing_item_gone_at_threshold(tmp_path):
+def test_miss_threshold_is_pinned_to_5():
+    # The guard: 5 is an empirical derivation (see storage/sqlite.py's
+    # comment on MISS_THRESHOLD), not an arbitrary number, and every other
+    # test in this file is written against the constant so it keeps
+    # testing real behavior if this ever changes again - which means
+    # nothing else here would notice a silent drift to, say, 3. This is
+    # the one place that hardcodes the literal.
+    assert MISS_THRESHOLD == 5
+
+
+def test_n_minus_one_misses_leaves_gone_at_null_nth_miss_sets_it(tmp_path):
+    # Written against MISS_THRESHOLD so it keeps testing the real boundary
+    # if the constant changes again - but this is NOT "loop MISS_THRESHOLD
+    # times and check the end state," which would pass for any threshold
+    # including 1 without ever proving the off-by-one boundary is right.
+    # Checking N-1 (still NULL) immediately before N (now set) is what
+    # actually exercises that boundary.
     conn = make_conn(tmp_path)
     sight(conn, "item-1", 1000)
     record_sweep(conn, ["item-1"], PROFILE_ID, swept_at=1000)  # establishes last_seen
 
-    record_sweep(conn, [], PROFILE_ID, swept_at=2000)  # miss 1
+    swept_at = 1000
+    for _ in range(MISS_THRESHOLD - 1):
+        swept_at += 1000
+        record_sweep(conn, [], PROFILE_ID, swept_at=swept_at)
+
     row = conn.execute(
         "SELECT miss_count, gone_at FROM listings WHERE item_id = 'item-1'"
     ).fetchone()
-    assert row["miss_count"] == 1
+    assert row["miss_count"] == MISS_THRESHOLD - 1
     assert row["gone_at"] is None
 
-    record_sweep(conn, [], PROFILE_ID, swept_at=3000)  # miss 2
-    row = conn.execute(
-        "SELECT miss_count, gone_at FROM listings WHERE item_id = 'item-1'"
-    ).fetchone()
-    assert row["miss_count"] == 2
-    assert row["gone_at"] is None
+    swept_at += 1000
+    record_sweep(conn, [], PROFILE_ID, swept_at=swept_at)  # the Nth miss
 
-    record_sweep(conn, [], PROFILE_ID, swept_at=4000)  # miss 3 -> gone
     row = conn.execute(
         "SELECT miss_count, gone_at FROM listings WHERE item_id = 'item-1'"
     ).fetchone()
@@ -226,15 +241,19 @@ def test_gone_at_equals_last_seen_not_swept_at(tmp_path):
     sight(conn, "item-1", 1000)
     record_sweep(conn, ["item-1"], PROFILE_ID, swept_at=5000)  # last_seen = 5000
 
-    record_sweep(conn, [], PROFILE_ID, swept_at=6000)
-    record_sweep(conn, [], PROFILE_ID, swept_at=7000)
-    record_sweep(conn, [], PROFILE_ID, swept_at=8000)  # 3rd miss, swept_at=8000
+    # MISS_THRESHOLD-many misses to reach "gone" - this test isn't about the
+    # threshold value itself (see test_n_minus_one_misses_... for that), just
+    # about gone_at being last_seen rather than whichever swept_at got there.
+    swept_at = 5000
+    for _ in range(MISS_THRESHOLD):
+        swept_at += 1000
+        record_sweep(conn, [], PROFILE_ID, swept_at=swept_at)
 
     row = conn.execute(
         "SELECT last_seen, gone_at FROM listings WHERE item_id = 'item-1'"
     ).fetchone()
     assert row["gone_at"] == row["last_seen"] == 5000
-    assert row["gone_at"] != 8000
+    assert row["gone_at"] != swept_at
 
 
 def test_miss_then_sighting_resets_miss_count_and_never_sets_gone_at(tmp_path):
@@ -266,9 +285,10 @@ def test_resurrection_clears_gone_at_and_lifespan(tmp_path, caplog):
     conn = make_conn(tmp_path)
     sight(conn, "item-1", 1000)
     record_sweep(conn, ["item-1"], PROFILE_ID, swept_at=1000)
-    record_sweep(conn, [], PROFILE_ID, swept_at=2000)
-    record_sweep(conn, [], PROFILE_ID, swept_at=3000)
-    record_sweep(conn, [], PROFILE_ID, swept_at=4000)  # gone
+    swept_at = 1000
+    for _ in range(MISS_THRESHOLD):  # MISS_THRESHOLD-many misses -> gone
+        swept_at += 1000
+        record_sweep(conn, [], PROFILE_ID, swept_at=swept_at)
 
     row = conn.execute(
         "SELECT gone_at, lifespan_mins FROM listings WHERE item_id = 'item-1'"
@@ -300,9 +320,13 @@ def test_count_active_listings_excludes_gone_items(tmp_path):
 
     assert count_active_listings(conn, PROFILE_ID) == 2
 
-    record_sweep(conn, ["item-2"], PROFILE_ID, swept_at=2000)  # item-1 missed
-    record_sweep(conn, ["item-2"], PROFILE_ID, swept_at=3000)
-    record_sweep(conn, ["item-2"], PROFILE_ID, swept_at=4000)  # item-1 gone
+    # MISS_THRESHOLD-many misses for item-1 (item-2 keeps being seen so it
+    # stays active) - this test is about the active-count filter, not the
+    # threshold value itself.
+    swept_at = 1000
+    for _ in range(MISS_THRESHOLD):
+        swept_at += 1000
+        record_sweep(conn, ["item-2"], PROFILE_ID, swept_at=swept_at)  # item-1 missed
 
     assert count_active_listings(conn, PROFILE_ID) == 1
 
@@ -447,16 +471,31 @@ def test_migration_4_applies_to_a_database_already_at_version_3(tmp_path, monkey
     import dealwatch.storage.sqlite as storage_module
 
     db_path = tmp_path / "dealwatch.db"
-    v3_only = [m for m in storage_module._MIGRATIONS if m[0] <= 3]
+    real_migrations = storage_module._MIGRATIONS
+    v3_only = [m for m in real_migrations if m[0] <= 3]
     monkeypatch.setattr(storage_module, "_MIGRATIONS", v3_only)
 
     conn = storage_module.connect(db_path)
     version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
     assert version == 3
-    sight(conn, "item-1", 1000)
+    # Raw SQL matching v3's actual shape, not sight()/record_sighting():
+    # that helper is written for the CURRENT schema (it references
+    # variation_id, added at v5) and would fail against a database that is
+    # deliberately older than that - the same reason this test exists.
+    conn.execute(
+        "INSERT INTO listings (item_id, profile_id, title, spec_status, "
+        "first_seen, last_seen, miss_count) VALUES "
+        "('item-1', ?, 'Lenovo ThinkPad T14 Gen 1 16GB 256GB', 'pending', 1000, 1000, 0)",
+        (PROFILE_ID,),
+    )
     conn.close()
 
-    monkeypatch.undo()  # restore the real _MIGRATIONS, including migration 4
+    # Scoped to v4, not the real (now v5) _MIGRATIONS - keeps this test's
+    # assertions about "migration 4 applied" true regardless of what later
+    # migrations exist. See test_migration_5_applies_to_a_database_already_
+    # at_version_4 for the v4->v5 step.
+    v4_only = [m for m in real_migrations if m[0] <= 4]
+    monkeypatch.setattr(storage_module, "_MIGRATIONS", v4_only)
 
     upgraded = storage_module.connect(db_path)  # the actual upgrade path
     version = upgraded.execute("SELECT version FROM schema_version").fetchone()[0]
@@ -476,6 +515,68 @@ def test_migration_4_applies_to_a_database_already_at_version_3(tmp_path, monkey
         "SELECT sanity_flagged FROM listings WHERE item_id = 'item-1'"
     ).fetchone()
     assert flagged["sanity_flagged"] == 1
+
+
+def test_migration_5_applies_to_a_database_already_at_version_4(tmp_path, monkeypatch):
+    # Same production-is-the-upgrade-path reasoning as the v3->v4 test
+    # above. Confirms migration 5's variation_id backfill matches
+    # parse_variation_id()'s Python rule, the sweeps table is real and
+    # usable, and re-running migrations against an already-v5 file is a
+    # true no-op - not just "doesn't error," but leaves the backfilled
+    # value and the sweeps row byte-identical.
+    import dealwatch.storage.sqlite as storage_module
+
+    db_path = tmp_path / "dealwatch.db"
+    real_migrations = storage_module._MIGRATIONS
+    v4_only = [m for m in real_migrations if m[0] <= 4]
+    monkeypatch.setattr(storage_module, "_MIGRATIONS", v4_only)
+
+    conn = storage_module.connect(db_path)
+    version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+    assert version == 4
+    # v4 has no variation_id column yet - raw SQL, not record_sighting().
+    conn.execute(
+        "INSERT INTO listings (item_id, profile_id, title, spec_status, "
+        "first_seen, last_seen, miss_count) VALUES "
+        "('v1|123|456', ?, 't', 'ok', 1000, 1000, 0)",
+        (PROFILE_ID,),
+    )
+    conn.close()
+
+    monkeypatch.setattr(storage_module, "_MIGRATIONS", real_migrations)
+
+    upgraded = storage_module.connect(db_path)
+    version = upgraded.execute("SELECT version FROM schema_version").fetchone()[0]
+    assert version == 5
+
+    # The backfill computed variation_id from item_id, matching
+    # parse_variation_id("v1|123|456") == "456" exactly.
+    row = upgraded.execute(
+        "SELECT variation_id FROM listings WHERE item_id = 'v1|123|456'"
+    ).fetchone()
+    assert row["variation_id"] == "456"
+
+    # sweeps is a real, usable table, not just present.
+    upgraded.execute(
+        "INSERT INTO sweeps (profile_id, swept_at, fetched_count, "
+        "distinct_count, active_count_before, truncated, sweep_recorded) "
+        "VALUES (?, 1000, 10, 9, 8, 0, 1)",
+        (PROFILE_ID,),
+    )
+    assert upgraded.execute("SELECT COUNT(*) FROM sweeps").fetchone()[0] == 1
+    upgraded.close()
+
+    # Re-running migrations against an already-v5 file is a no-op: the
+    # backfilled value and the sweeps row are untouched, not recomputed or
+    # duplicated.
+    reconnected = storage_module.connect(db_path)
+    version = reconnected.execute("SELECT version FROM schema_version").fetchone()[0]
+    assert version == 5
+    row = reconnected.execute(
+        "SELECT variation_id FROM listings WHERE item_id = 'v1|123|456'"
+    ).fetchone()
+    assert row["variation_id"] == "456"
+    assert reconnected.execute("SELECT COUNT(*) FROM sweeps").fetchone()[0] == 1
 
 
 def test_concurrent_first_connect_against_a_fresh_file_does_not_crash_or_hang(tmp_path):

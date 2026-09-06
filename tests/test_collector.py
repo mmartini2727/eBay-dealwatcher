@@ -337,6 +337,95 @@ async def _sweep_with_partial_page_set_does_not_call_record_sweep(tmp_path):
     assert row["last_seen"] == old_seen_at
 
 
+def _latest_sweep_row(conn) -> dict:
+    row = conn.execute("SELECT * FROM sweeps ORDER BY id DESC LIMIT 1").fetchone()
+    assert row is not None, "no row written to sweeps at all"
+    return dict(row)
+
+
+def test_sweep_writes_a_sweeps_row_on_normal_completion(tmp_path):
+    run(_sweep_writes_a_sweeps_row_on_normal_completion(tmp_path))
+
+
+async def _sweep_writes_a_sweeps_row_on_normal_completion(tmp_path):
+    conn = connect(tmp_path / "dealwatch.db")
+    # One pre-existing active listing, so active_count_before is
+    # verifiably non-zero rather than indistinguishable from a hardcoded 0.
+    record_sighting(
+        conn, "v1|pre|0",
+        dict(profile_id=PROFILE_ID, title="pre-existing"),
+        dict(price_cents=10000, raw_json="{}"),
+        1_000_000,
+    )
+
+    budget = DailyBudget(make_settings(tmp_path))
+    provider = FakeProvider(budget)
+    provider.queue_items(
+        [raw_item(item_id="v1|1|0"), raw_item(item_id="v1|2|0")], reserve=1
+    )
+    profile = make_profile()
+    stats = CollectorStats()
+
+    await run_sweep_cycle(provider, profile, budget, conn, stats)
+
+    row = _latest_sweep_row(conn)
+    assert row["fetched_count"] == 2
+    assert row["distinct_count"] == 2
+    assert row["active_count_before"] == 1  # only v1|pre|0 was active before this sweep
+    assert row["truncated"] == 0
+    assert row["sweep_recorded"] == 1
+
+
+def test_sweep_writes_a_sweeps_row_on_early_budget_exhaustion(tmp_path):
+    run(_sweep_writes_a_sweeps_row_on_early_budget_exhaustion(tmp_path))
+
+
+async def _sweep_writes_a_sweeps_row_on_early_budget_exhaustion(tmp_path):
+    conn = connect(tmp_path / "dealwatch.db")
+    # ceiling = 0: status["remaining"] is 0 before run_sweep_cycle ever
+    # calls search() - the early-return exit path, distinct from the
+    # mid-sweep truncation path below.
+    budget = DailyBudget(make_settings(tmp_path, daily_call_limit=0, daily_reserve_calls=0))
+    provider = FakeProvider(budget)  # empty queue - a search() call here would KeyError
+    profile = make_profile()
+    stats = CollectorStats()
+
+    await run_sweep_cycle(provider, profile, budget, conn, stats)
+
+    row = _latest_sweep_row(conn)
+    assert row["fetched_count"] == 0
+    assert row["distinct_count"] == 0
+    assert row["active_count_before"] == 0
+    assert row["truncated"] == 1
+    assert row["sweep_recorded"] == 0
+    assert provider.calls == []  # confirms this is genuinely the early path, not a fluke
+
+
+def test_sweep_writes_a_sweeps_row_on_truncated_mid_sweep(tmp_path):
+    run(_sweep_writes_a_sweeps_row_on_truncated_mid_sweep(tmp_path))
+
+
+async def _sweep_writes_a_sweeps_row_on_truncated_mid_sweep(tmp_path):
+    conn = connect(tmp_path / "dealwatch.db")
+    # ceiling = 1: the one query call reserves the entire day's budget,
+    # simulating "ran out of room mid-pagination" - same setup as
+    # test_sweep_with_partial_page_set_does_not_call_record_sweep above.
+    budget = DailyBudget(make_settings(tmp_path, daily_call_limit=1, daily_reserve_calls=0))
+    provider = FakeProvider(budget)
+    provider.queue_items([raw_item(item_id="v1|1|0")], reserve=1)
+    profile = make_profile()
+    stats = CollectorStats()
+
+    await run_sweep_cycle(provider, profile, budget, conn, stats)
+
+    row = _latest_sweep_row(conn)
+    assert row["fetched_count"] == 1  # the one page that DID come back before truncation
+    assert row["distinct_count"] == 1
+    assert row["active_count_before"] == 0
+    assert row["truncated"] == 1
+    assert row["sweep_recorded"] == 0
+
+
 def test_mapping_failure_is_isolated_surrounding_items_still_land(tmp_path):
     run(_mapping_failure_is_isolated_surrounding_items_still_land(tmp_path))
 

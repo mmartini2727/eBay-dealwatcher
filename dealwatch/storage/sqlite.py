@@ -32,7 +32,23 @@ logger = logging.getLogger(__name__)
 # gone_at on the first miss would manufacture short lifespans out of eBay's
 # ordinary search-index inconsistency, and short lifespans are exactly what
 # the survival baseline weighs most heavily.
-MISS_THRESHOLD = 3
+#
+# Raised 3 -> 5 (V0.8d), from an empirical derivation, not a round-number
+# guess - the next person to see "5" should not assume it was arbitrary.
+# Measured on the LXC: each sweep fetches ~1,200+ rows across 7 pages of
+# 200 but yields only ~987 distinct items, because eBay's relevance
+# ordering re-ranks between page requests - about a 6% per-sweep miss rate
+# for a listing that is actually still active. Modeling misses as
+# independent per sweep, the false-death rate at threshold N is
+# 0.06^N x active_listings x sweeps/day. At N=3: 0.06^3 x 1000 x 22 =~
+# 4.7/day - and the observed resurrection-log rate over 21.8 hours was 4,
+# matching the independent-miss model. At N=5: 0.06^5 x 1000 x 22 =~
+# 0.0002/day, a ~250x reduction. The cost of raising it is close to free:
+# record_sweep sets gone_at = last_seen, not detection time, so a TRUE
+# death's recorded lifespan is byte-identical whether confirmed after 3
+# sweeps or 5 - the only cost is a longer delay (two more sweep intervals)
+# before the row finalizes.
+MISS_THRESHOLD = 5
 
 # Each entry is (version, [statements]). The real once-only guarantee is
 # the schema_version gate inside _apply_migrations's transaction, not
@@ -145,6 +161,78 @@ _MIGRATIONS: list[tuple[int, list[str]]] = [
             # not "scored and passed" - a scorer that hasn't run yet must
             # not read as a clean bill of health.
             "ALTER TABLE listings ADD COLUMN sanity_flagged INTEGER",
+        ],
+    ),
+    (
+        5,
+        [
+            # V0.8d finding 2 (design.md's dated entry): a row for one
+            # variation of a multi-variation listing (item_id shaped
+            # v1|<listing>|<non-zero variation>) flaps in and out of search
+            # results independent of the listing actually dying, and
+            # fabricates a lifespan when it does. Excluded from the
+            # survival baseline (engine/baselines.py) via this column, not
+            # by re-parsing item_id at query time.
+            "ALTER TABLE listings ADD COLUMN variation_id TEXT",
+            # Backfill existing rows from item_id, in SQL, to the EXACT
+            # same rule dealwatch.normalize.listing.parse_variation_id()
+            # implements in Python (new rows get it from there at insert
+            # time - see record_sighting): split on '|'; a variation_id
+            # exists only when there are exactly 3 parts and the 3rd is
+            # neither empty nor "0". SQLite has no split() function, so
+            # this is written as nested instr()/substr() rather than
+            # ported line-for-line - p1/p2 are the first and second pipe
+            # positions (both 0 if absent, and p2 comes out 0 automatically
+            # when there's no second pipe, no special case needed for "no
+            # pipe at all"), part3 is everything after the second pipe, and
+            # p3 is used only to detect a FOURTH-plus part (a third pipe
+            # inside part3, meaning more than 3 parts total, not a
+            # variation). Hand-verified against parse_variation_id() for
+            # v1|123|0, v1|123|456, v1|123, v1|123|, v1|123|456|789,
+            # v1||456, "", and "garbage" - all agree.
+            """
+            UPDATE listings
+            SET variation_id = computed.variation_id
+            FROM (
+                SELECT
+                    item_id,
+                    CASE
+                        WHEN p2 = 0 OR p3 > 0 OR part3 IN ('', '0') THEN NULL
+                        ELSE part3
+                    END AS variation_id
+                FROM (
+                    SELECT
+                        item_id,
+                        p1,
+                        p2,
+                        substr(item_id, p1 + p2 + 1) AS part3,
+                        instr(substr(item_id, p1 + p2 + 1), '|') AS p3
+                    FROM (
+                        SELECT
+                            item_id,
+                            instr(item_id, '|') AS p1,
+                            instr(substr(item_id, instr(item_id, '|') + 1), '|') AS p2
+                        FROM listings
+                    )
+                )
+            ) AS computed
+            WHERE listings.item_id = computed.item_id
+            """,
+            # V0.8d finding 1: today the ~6% per-sweep miss rate had to be
+            # reverse-engineered from log line counts. This makes it a
+            # time series instead of a one-off measurement.
+            """
+            CREATE TABLE IF NOT EXISTS sweeps (
+                id                  INTEGER PRIMARY KEY,
+                profile_id          TEXT NOT NULL,
+                swept_at            INTEGER NOT NULL,
+                fetched_count       INTEGER NOT NULL,
+                distinct_count      INTEGER NOT NULL,
+                active_count_before INTEGER NOT NULL,
+                truncated           INTEGER NOT NULL,
+                sweep_recorded      INTEGER NOT NULL
+            )
+            """,
         ],
     ),
 ]
@@ -261,7 +349,8 @@ def record_sighting(
     listing_fields keys: profile_id (str), title (str), seller (str|None),
     seller_feedback_pct (float|None), seller_feedback_score (int|None),
     condition_id (int|None), spec_status (str, optional - only consulted on
-    insert; defaults to 'pending' if omitted, meaning "never normalized").
+    insert; defaults to 'pending' if omitted, meaning "never normalized"),
+    variation_id (str|None, optional - only consulted on insert; see below).
 
     observation_fields keys: price_cents, shipping_cents, total_cents,
     current_bid_cents, bid_count (all int|None), buying_options (list[str]),
@@ -295,9 +384,10 @@ def record_sighting(
                     item_id, profile_id, title, seller, seller_feedback_pct,
                     seller_feedback_score, condition_id, spec_json,
                     spec_status, reject_rule_id, bucket_key,
-                    first_seen, last_seen, miss_count, gone_at, lifespan_mins
+                    first_seen, last_seen, miss_count, gone_at, lifespan_mins,
+                    variation_id
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, NULL,
-                          ?, ?, 0, NULL, NULL)
+                          ?, ?, 0, NULL, NULL, ?)
                 """,
                 (
                     item_id,
@@ -310,6 +400,7 @@ def record_sighting(
                     spec_status,
                     seen_at,
                     seen_at,
+                    listing_fields.get("variation_id"),
                 ),
             )
             _insert_observation(conn, item_id, observation_fields, seen_at)
@@ -511,6 +602,49 @@ def record_sweep(
     except BaseException:
         conn.execute("ROLLBACK")
         raise
+
+
+def store_sweep_stats(
+    conn: sqlite3.Connection,
+    profile_id: str,
+    swept_at: int,
+    *,
+    fetched_count: int,
+    distinct_count: int,
+    active_count_before: int,
+    truncated: bool,
+    sweep_recorded: bool,
+) -> None:
+    """One row per sweep cycle, on every exit path (design.md's V0.8d dated
+    entry) - including the early-budget-exhausted return and the truncated
+    return, not just a completed sweep. `fetched_count - distinct_count` is
+    the pagination-drift metric this table exists to expose: eBay's
+    relevance ordering re-ranks between page requests, so the same item can
+    come back on two different pages of the same sweep, or a page boundary
+    can skip an item entirely.
+
+    One INSERT, no explicit BEGIN/COMMIT - same reasoning as store_spec():
+    a single statement is already atomic, and this is called from
+    run_sweep_cycle on the same connection as other calls that DO manage
+    their own transaction, so this must not open a nested one.
+    """
+    conn.execute(
+        """
+        INSERT INTO sweeps (
+            profile_id, swept_at, fetched_count, distinct_count,
+            active_count_before, truncated, sweep_recorded
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            profile_id,
+            swept_at,
+            fetched_count,
+            distinct_count,
+            active_count_before,
+            1 if truncated else 0,
+            1 if sweep_recorded else 0,
+        ),
+    )
 
 
 def _insert_observation(

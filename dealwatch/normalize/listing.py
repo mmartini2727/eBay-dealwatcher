@@ -21,6 +21,13 @@ class Listing(BaseModel):
     price_cents: int
     seen_at: datetime
 
+    # eBay Browse item_ids for one variation of a multi-variation listing
+    # have the form v1|<listing>|<variation> (V0.8d) - which variation
+    # appears in a given search result set is unstable, so these are
+    # excluded from the survival baseline entirely (engine/baselines.py).
+    # See parse_variation_id() below.
+    variation_id: str | None = None
+
     subtitle: str | None = None
     condition_id: int | None = None
     seller: str | None = None
@@ -113,6 +120,31 @@ def _shipping_cents(raw: dict) -> int | None:
     return _optional_cents(_get(options[0], "shippingCost", "value"))
 
 
+def parse_variation_id(item_id: str) -> str | None:
+    """eBay-specific item_id parsing (V0.8d, design.md's dated entry): a
+    row that is one variation of a multi-variation listing has an item_id
+    of the form v1|<listing>|<variation>. Any other shape - a plain
+    v1|<listing>, a malformed string, empty - returns None. Never raises:
+    a malformed item_id must not abort a sweep.
+
+    Kept here rather than in engine/baselines.py, which excludes these
+    from the survival baseline: this module is already eBay-specific
+    (map_item_summary), and provider ID-format knowledge belongs with the
+    provider, not with the generic baseline-derivation layer.
+
+    The exact same rule is re-implemented in SQL in storage/sqlite.py's
+    migration 5 backfill - see that migration's comment for why it can't
+    just call this function, and the two must be kept in lockstep by hand.
+    """
+    parts = item_id.split("|")
+    if len(parts) != 3:
+        return None
+    variation = parts[2]
+    if variation in ("", "0"):
+        return None
+    return variation
+
+
 def map_item_summary(raw: dict, seen_at: datetime) -> Listing:
     """Map one raw itemSummary dict to a Listing.
 
@@ -135,6 +167,7 @@ def map_item_summary(raw: dict, seen_at: datetime) -> Listing:
         title=title,
         price_cents=price_cents,
         seen_at=seen_at,
+        variation_id=parse_variation_id(item_id),
         subtitle=raw.get("subtitle"),
         condition_id=_to_int(raw.get("conditionId")),
         seller=_get(raw, "seller", "username"),

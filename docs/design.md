@@ -366,6 +366,69 @@ These are load-bearing. Getting them wrong produces a database that looks correc
 
 - Code can be rewritten. Three months of accumulated comps cannot. The SQLite file lives in the Docker LXC and is therefore in PBS, but SQLite inside a live LXC backup is not guaranteed consistent — take a periodic `VACUUM INTO` dump to the NAS as a second copy.
 
+### 4.4 V0.8d — data integrity in the survival signal (2026-09-06)
+
+Diagnostic work on the LXC found two independent sources of fabricated
+lifespans in the survival baseline. Both are confirmed from production data,
+neither is speculative.
+
+**Finding 1 — pagination drift causes false deaths.** Each sweep fetches
+~1,200+ rows across 7 pages of 200 but yields only ~987 distinct items,
+because eBay's relevance ordering re-ranks *between page requests* — the
+same item can land on two different pages of the same sweep (double-counted
+in `fetched_count`, harmless) or fall through a page boundary entirely
+(missed, not harmless). That's about a 6% per-sweep miss rate for a listing
+that is actually still active. Modeling misses as independent per sweep, the
+false-death rate at miss-threshold N is `0.06^N × active_listings ×
+sweeps/day`. At the old N=3: `0.06³ × 1000 × 22 ≈ 4.7/day` — and the
+resurrection-log warning rate measured over 21.8 hours was 4, matching the
+independent-miss model closely enough to trust it. **Decision: raise
+`MISS_THRESHOLD` 3 → 5** (`storage/sqlite.py`). At N=5 the model predicts
+`0.06⁵ × 1000 × 22 ≈ 0.0002/day`, a ~250× reduction, at close to zero cost:
+`record_sweep` sets `gone_at = last_seen`, not detection time (§4.2), so a
+*true* death's recorded lifespan is byte-identical whether confirmed after 3
+sweeps or 5 — the only cost is a longer delay (two more sweep intervals)
+before the row finalizes.
+
+**Finding 2 — multi-variation listings are not survival-signal material.**
+Of 14 resurrection-log warnings, 10 came from just three parent listings.
+eBay Browse item_ids have the form `v1|<listing>|<variation>`, where a
+non-zero third component means the row is one variation of a
+multi-variation listing (color, size, etc., sold as one eBay listing with
+several buyable options). Which variation eBay happens to surface in a
+given search result set is unstable — the row flaps in and out of results
+independent of whether the underlying listing is actually still for sale —
+and produces exactly the fabricated-lifespan pattern the survival baseline
+is most sensitive to (observed: 962, 1854, 5607, 6378 minutes, none of them
+real). **Decision: exclude any listing with a non-null `variation_id` from
+baseline candidacy** (`engine/baselines.py`'s dead-listings query), via a
+new `listings.variation_id` column populated at map/sighting time
+(`normalize/listing.py`'s `parse_variation_id`), not by re-parsing item_id
+at query time. Whether a variation listing should be *alertable* is a
+separate, real question, deliberately left to V0.9's scoring — this
+milestone only removes it from the baseline's input, `score_active.py` is
+untouched.
+
+**Also added: a `sweeps` table** (`storage/sqlite.py` migration 5), one row
+per sweep cycle on every exit path (a completed sweep, a truncated one, and
+the early-budget-exhausted return). Before this, the ~6% per-sweep miss rate
+above had to be reverse-engineered from log line counts; `fetched_count -
+distinct_count` now makes pagination drift a queryable time series instead
+of a one-off measurement.
+
+**Honest limitation, stated explicitly because it's easy to miss: pre-V0.8d
+dead rows are contaminated by an unmeasurable number of undetected false
+deaths.** The resurrection-warning count (14, above) is a *lower bound*
+only — it counts listings that happened to re-enter the relevance window
+before their `variation_id` (or, pre-fix, their pagination-drift miss
+streak) crossed `MISS_THRESHOLD` a second time and got logged again. A
+listing that never re-enters the window leaves no trace at all: its
+fabricated lifespan sits in the baseline, indistinguishable from a real
+fast sale, forever. Neither finding retroactively cleans existing
+`baselines` rows — this milestone does not recompute or delete them (that's
+a backfill + recompute decision for whoever runs it, informed by these two
+fixes, not something to do quietly alongside the code change).
+
 ---
 
 ## 5. Normalization — the actual hard part

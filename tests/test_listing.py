@@ -14,6 +14,7 @@ from dealwatch.normalize.listing import (
     ListingMappingError,
     map_item_summary,
     normalize_input_fields,
+    parse_variation_id,
 )
 
 def _load_titles() -> list[str]:
@@ -219,6 +220,33 @@ def test_missing_buying_options_is_empty_list_not_none():
     listing = map_item_summary(raw, seen_at=SEEN_AT)
 
     assert listing.buying_options == []
+
+
+@pytest.mark.parametrize(
+    "item_id,expected",
+    [
+        ("v1|123|0", None),  # explicit "not a variation" sentinel
+        ("v1|123|456", "456"),
+        ("v1|123", None),  # only 2 parts - no variation slot at all
+        ("garbage", None),  # no pipes at all
+        ("", None),  # empty string
+    ],
+)
+def test_parse_variation_id_coverage(item_id, expected):
+    assert parse_variation_id(item_id) == expected
+
+
+def test_map_item_summary_populates_variation_id_for_a_variation_row():
+    raw = full_item_summary(itemId="v1|110599695364|789")
+    listing = map_item_summary(raw, seen_at=SEEN_AT)
+    assert listing.variation_id == "789"
+
+
+def test_map_item_summary_variation_id_is_none_for_a_plain_listing():
+    # full_item_summary()'s default itemId is "v1|110599695364|0" - the
+    # explicit not-a-variation sentinel, not a real variation.
+    listing = map_item_summary(full_item_summary(), seen_at=SEEN_AT)
+    assert listing.variation_id is None
 
 
 def test_normalize_input_fields_extracts_subtitle_and_condition_id():

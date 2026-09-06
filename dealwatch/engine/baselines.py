@@ -35,7 +35,17 @@ _DEAD_OK_LISTINGS = """
     SELECT item_id, bucket_key, gone_at, first_seen, last_seen
     FROM listings
     WHERE gone_at IS NOT NULL AND spec_status = 'ok'
+      AND variation_id IS NULL
 """
+# variation_id IS NULL (V0.8d, design.md's dated entry): a row for one
+# variation of a multi-variation listing (item_id shaped
+# v1|<listing>|<non-zero variation>) flaps in and out of search results
+# based on which variation eBay happens to surface, independent of the
+# listing actually dying - 10 of 14 resurrection-log warnings traced back
+# to just three parent listings. These are not survival-signal material
+# and must never vote on a baseline; whether they should be alertable at
+# all is a separate, real question left to scoring (score_active.py is
+# untouched here on purpose).
 
 _LAST_OBSERVATION = """
     SELECT total_cents, price_cents, observed_at
