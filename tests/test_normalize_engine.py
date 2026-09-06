@@ -533,6 +533,33 @@ def test_ddr4_keyword_rule_still_wins_over_the_bare_gb_fallback():
     assert result.spec["ram_gb"] == 16
 
 
+def test_ram_keyword_before_number_still_works():
+    # The "ram/memory precedes the number" keyword rule, not the "number
+    # precedes ddr/ram/memory" one above - both must survive magnitude
+    # constraint, not just one of them.
+    title = "Lenovo ThinkPad T14 Gen 4 i7-1270P RAM 32GB 512GB SSD"
+    result = normalize(PROFILE, fields(title))
+    assert result.spec["ram_gb"] == 32
+
+
+def test_keyword_rule_does_not_misread_a_mashed_storage_figure_as_ram():
+    # Real title: a formatting glitch mashes "RAM" onto the storage figure
+    # with no boundary between them ("RAM256Gb"), so the actual RAM figure
+    # is the earlier bare "16Gb". An unconstrained `(\d{1,3})` on the
+    # ram/memory-prefixed keyword rule would read 256 as RAM - magnitude
+    # constraining that rule to the closed set is what prevents it.
+    title = "Lenovo ThinkPad T14 Gen 1 i5-10310U 16Gb RAM256Gb NVME"
+    result = normalize(PROFILE, fields(title))
+    assert result.spec["ram_gb"] == 16
+
+
+def test_ram_gb_48_lands_in_tier_48():
+    title = "Lenovo ThinkPad T14 Gen 4 i7-1270P 48GB RAM 512GB SSD"
+    result = normalize(PROFILE, fields(title))
+    assert result.spec["ram_gb"] == 48
+    assert result.spec["ram_tier"] == "48"
+
+
 def test_title_that_genuinely_states_no_ram_stays_null():
     title = "Lenovo ThinkPad T14 Gen 5 Ryzen 5 Pro 8540U 512GB- Black"
     result = normalize(PROFILE, fields(title))

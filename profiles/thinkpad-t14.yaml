@@ -259,10 +259,18 @@ extract:
     rules:
       # The unit suffix is MANDATORY. A bare `(\d+)\s*gb` will happily
       # capture "512GB SSD" as 512GB of RAM and poison the bucket.
-      - pattern: '(\d{1,3})\s*gb\s*(?:ddr[45]|ram|memory)\b'
+      #
+      # The captured number is also magnitude-constrained to the same
+      # closed RAM set the bare-GB fallback below uses (8/12/16/24/32/40/
+      # 48/64), not `(\d{1,3})`: a keyword nearby doesn't guarantee the
+      # NUMBER next to it is the one the keyword refers to. Real title:
+      # "16Gb RAM256Gb NVME" - a formatting glitch mashes "RAM" onto the
+      # storage figure with no boundary, and an unconstrained `(\d{1,3})`
+      # after "ram" happily read 256 as RAM.
+      - pattern: '(8|12|16|24|32|40|48|64)\s*gb\s*(?:ddr[45]|ram|memory)\b'
         value: '{1}'
         apply: to_int
-      - pattern: '\b(?:ram|memory)\s*[:.]?\s*(\d{1,3})\s*gb\b'
+      - pattern: '\b(?:ram|memory)\s*[:.]?\s*(8|12|16|24|32|40|48|64)\s*gb\b'
         value: '{1}'
         apply: to_int
       # Bare-GB fallback (measured on the LXC: 38% of baseline candidates
@@ -385,8 +393,11 @@ tiers:
       - {max: 8,   label: "8"}
       - {max: 16,  label: "16"}
       # V0.8c: 40GB (8 soldered + 32 SODIMM) behaves like a 32GB machine.
+      # Label relabeled from "64+" to "48": no true 64GB T14 SKU exists -
+      # every listing landing here was actually 48GB (real spec ceiling),
+      # and "64+" overstated what the hardware can be.
       - {max: 40,  label: "32"}
-      - {min: 41,  label: "64+"}
+      - {min: 41,  label: "48"}
   # storage_tier stays defined and still lands in spec_json - only its
   # membership in bucket_key is removed below. Untouched by V0.8c.
   storage_tier:
