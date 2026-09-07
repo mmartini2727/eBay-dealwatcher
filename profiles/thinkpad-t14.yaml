@@ -596,13 +596,35 @@ seed_baselines:
     p50: 250
 
 # ---------------------------------------------------------------------------
-# 8. ALERTS
+# 8. ALERTS (V0.9)
 # ---------------------------------------------------------------------------
 alerts:
   webhook_env: DISCORD_WEBHOOK_DEALS
+  # true until explicitly flipped: writes alerts rows, posts nothing. The
+  # dry-run day IS the first-run guard (engine/alerting.py) - flipping this
+  # to false does not fire on the ~1,000 already-active listings, only on
+  # new listings and genuine price drops from that point on.
+  dry_run: true
+  trigger:
+    max_ratio_to_p25: 1.00      # alert at or below the fast-sale quartile
+  # The buying ceiling, distinct from search.filters.price above (a fetch
+  # threshold - never truncate what gets collected). Read to decide whether
+  # to alert at all, regardless of how good the deal score is. Kept at 1200
+  # rather than lowered to match the milestone doc's 900 placeholder - it
+  # already sits below search.filters.price's 2000 fetch ceiling (raised
+  # from 1200 at V0.8c, after this was set), so it's real headroom above
+  # every seed_baselines p50 (highest: $825), not a no-op.
+  max_price_usd: 1200
   realert_drop_pct: 8          # re-alert if BIN drops this much below last alert
   cooldown_minutes: 60
-  # The buying ceiling, distinct from search.filters.price above (a fetch
-  # threshold - never truncate what gets collected). V0.9 reads this to
-  # decide whether to alert at all, regardless of how good the deal score is.
-  max_price_usd: 1200
+  max_per_cycle: 10
+  # Default false: a multi-variation listing's price is typically the
+  # LOWEST variation, so these systematically look like better deals than
+  # they are.
+  include_variations: false
+  title_template: "Gen {generation} {cpu_family} {ram_tier}GB"
+  # Real spec keys this profile's extract/derive/tiers actually produce -
+  # touchscreen and no_os are worth a glance on a used ThinkPad; "condition"
+  # is not a spec field here (that's condition_id, a raw listing field, not
+  # part of the normalized spec), so it's deliberately not listed.
+  fields: [generation, cpu_family, ram_tier, storage_tier, touchscreen, no_os]

@@ -9,15 +9,22 @@ Real SQLite under tmp_path, no network.
 import asyncio
 from pathlib import Path
 
+import pytest
+
+import dealwatch.engine.alerting as alerting_module
+import dealwatch.engine.collector as collector_module
 from dealwatch.config import Settings
 from dealwatch.engine.collector import (
     FAST_POLL_PAGE_LIMIT,
+    Collector,
     CollectorStats,
     load_profile,
     run_fast_poll_cycle,
     run_sweep_cycle,
 )
-from dealwatch.normalize.schema import PollConfig, Profile, SearchConfig
+from dealwatch.engine.scoring import compile_seed_baselines
+from dealwatch.normalize.engine import ProfileCompileError
+from dealwatch.normalize.schema import AlertsConfig, AlertTrigger, PollConfig, Profile, SearchConfig
 from dealwatch.providers.ratelimit import BudgetExhausted, DailyBudget
 from dealwatch.storage.sqlite import (
     connect,
@@ -864,3 +871,256 @@ async def _normalize_error_on_one_item_does_not_abort_the_sweep(tmp_path, monkey
     assert poisoned["spec_status"] == "pending"  # left untouched, recoverable by backfill
 
     assert stats.normalize_error_count == 1
+
+
+# ---------------------------------------------------------------------------
+# V0.9: alert-cycle wiring (design.md's dated entry). run_alert_cycle
+# itself is fully covered by test_alerting.py - these tests only prove
+# the collector calls it with the right arguments, at the right point in
+# the cycle, and can't be taken down by it.
+# ---------------------------------------------------------------------------
+
+
+def test_fast_poll_calls_run_alert_cycle_with_the_collected_item_ids(tmp_path, monkeypatch):
+    run(_fast_poll_calls_run_alert_cycle_with_the_collected_item_ids(tmp_path, monkeypatch))
+
+
+async def _fast_poll_calls_run_alert_cycle_with_the_collected_item_ids(tmp_path, monkeypatch):
+    calls = []
+
+    async def fake_run_alert_cycle(conn, profile, compiled_seeds, item_ids, now_ts):
+        calls.append(list(item_ids))
+
+    monkeypatch.setattr(collector_module, "run_alert_cycle", fake_run_alert_cycle)
+
+    conn = connect(tmp_path / "dealwatch.db")
+    provider = FakeProvider()
+    provider.queue_items([raw_item(item_id="v1|1|0"), raw_item(item_id="v1|2|0")])
+    profile = make_profile()
+    stats = CollectorStats()
+
+    await run_fast_poll_cycle(provider, profile, conn, stats)
+
+    assert calls == [["v1|1|0", "v1|2|0"]]
+
+
+def test_fast_poll_alert_cycle_failure_does_not_propagate(tmp_path, monkeypatch):
+    # Shallow variant: run_alert_cycle itself replaced wholesale. Proves the
+    # collector's try/except around the CALL SITE works. It does NOT prove
+    # anything about the real evaluate()/send_alert() call chain, which is
+    # exactly where a real bug (a template KeyError, a bad embed field)
+    # would actually originate - see the deep variant below for that.
+    run(_fast_poll_alert_cycle_failure_does_not_propagate(tmp_path, monkeypatch))
+
+
+async def _fast_poll_alert_cycle_failure_does_not_propagate(tmp_path, monkeypatch):
+    async def broken_run_alert_cycle(*args, **kwargs):
+        raise RuntimeError("Discord is down")
+
+    monkeypatch.setattr(collector_module, "run_alert_cycle", broken_run_alert_cycle)
+
+    conn = connect(tmp_path / "dealwatch.db")
+    provider = FakeProvider()
+    provider.queue_items([raw_item(item_id="v1|1|0")])
+    profile = make_profile()
+    stats = CollectorStats()
+
+    # Must not raise - a bug in the alert cycle must never stall a poll
+    # cycle or prevent a sighting write.
+    await run_fast_poll_cycle(provider, profile, conn, stats)
+
+    assert get_latest_observation(conn, "v1|1|0") is not None
+
+
+def _alerting_enabled_profile(**alert_overrides) -> Profile:
+    # A survivor of every evaluate() gate: generous trigger/ceiling, a
+    # `{}` seed fallback priced so raw_item()'s default $349.99 scores as a
+    # real deal (ratio_to_p25 < 1.0) - the point is to reach
+    # discord.send_alert for real, not to stop earlier at some other gate.
+    alerts_kwargs = dict(
+        webhook_env="DISCORD_WEBHOOK_COLLECTOR_TEST",
+        dry_run=False,
+        trigger=AlertTrigger(max_ratio_to_p25=1.0),
+        max_price_usd=1000.0,
+        title_template="{generation}",
+        fields=[],
+    )
+    alerts_kwargs.update(alert_overrides)
+    return Profile(
+        id=PROFILE_ID,
+        name="Test Profile",
+        search=SearchConfig(queries=["Lenovo ThinkPad T14"], filters={}, poll=PollConfig()),
+        seed_baselines=[{"match": {}, "p25": 400, "p50": 500}],
+        alerts=AlertsConfig(**alerts_kwargs),
+    )
+
+
+def test_fast_poll_survives_a_notifier_that_raises_deep_variant(tmp_path, monkeypatch):
+    # The deep variant the shallow test above can't cover: run_alert_cycle
+    # itself is real. Only discord.send_alert - the notifier - is broken,
+    # simulating exactly the failure design.md calls out as the worst
+    # available outcome in this milestone: a bug in the embed builder
+    # (build_embed() runs OUTSIDE send_alert's own try/except, so a bad
+    # template or a bad field really does propagate like this) taking down
+    # the collector. This exercises the real evaluate() -> score_listing()
+    # -> send_alert() chain end to end.
+    run(_fast_poll_survives_a_notifier_that_raises_deep_variant(tmp_path, monkeypatch))
+
+
+async def _fast_poll_survives_a_notifier_that_raises_deep_variant(tmp_path, monkeypatch):
+    monkeypatch.setenv("DISCORD_WEBHOOK_COLLECTOR_TEST", "https://discord.example/webhook")
+
+    async def broken_send_alert(*args, **kwargs):
+        raise RuntimeError("embed builder bug")
+
+    monkeypatch.setattr(alerting_module.discord, "send_alert", broken_send_alert)
+
+    conn = connect(tmp_path / "dealwatch.db")
+    provider = FakeProvider()
+    provider.queue_items([raw_item(item_id="v1|1|0")])  # $349.99, ratio 349.99/400 < 1.0
+    profile = _alerting_enabled_profile()
+    compiled_seeds = compile_seed_baselines(profile)
+    stats = CollectorStats()
+
+    # Must not raise, and the sighting must still have landed - a bug deep
+    # inside the notifier must never take the collector down with it.
+    await run_fast_poll_cycle(provider, profile, conn, stats, compiled_seeds)
+
+    assert get_latest_observation(conn, "v1|1|0") is not None
+
+
+def test_sweep_calls_run_alert_cycle_after_record_sweep_with_seen_item_ids(tmp_path, monkeypatch):
+    run(_sweep_calls_run_alert_cycle_after_record_sweep_with_seen_item_ids(tmp_path, monkeypatch))
+
+
+async def _sweep_calls_run_alert_cycle_after_record_sweep_with_seen_item_ids(tmp_path, monkeypatch):
+    order = []
+
+    real_record_sweep = collector_module.record_sweep
+
+    def spying_record_sweep(*args, **kwargs):
+        order.append("record_sweep")
+        return real_record_sweep(*args, **kwargs)
+
+    async def spying_run_alert_cycle(conn, profile, compiled_seeds, item_ids, now_ts):
+        order.append("run_alert_cycle")
+        order.append(sorted(item_ids))
+
+    monkeypatch.setattr(collector_module, "record_sweep", spying_record_sweep)
+    monkeypatch.setattr(collector_module, "run_alert_cycle", spying_run_alert_cycle)
+
+    conn = connect(tmp_path / "dealwatch.db")
+    budget = DailyBudget(make_settings(tmp_path))
+    provider = FakeProvider(budget)
+    provider.queue_items(
+        [raw_item(item_id="v1|1|0"), raw_item(item_id="v1|2|0")], reserve=1
+    )
+    profile = make_profile()
+    stats = CollectorStats()
+
+    await run_sweep_cycle(provider, profile, budget, conn, stats)
+
+    assert order == ["record_sweep", "run_alert_cycle", ["v1|1|0", "v1|2|0"]]
+
+
+def test_sweep_alert_cycle_failure_does_not_propagate(tmp_path, monkeypatch):
+    run(_sweep_alert_cycle_failure_does_not_propagate(tmp_path, monkeypatch))
+
+
+async def _sweep_alert_cycle_failure_does_not_propagate(tmp_path, monkeypatch):
+    async def broken_run_alert_cycle(*args, **kwargs):
+        raise RuntimeError("Discord is down")
+
+    monkeypatch.setattr(collector_module, "run_alert_cycle", broken_run_alert_cycle)
+
+    conn = connect(tmp_path / "dealwatch.db")
+    budget = DailyBudget(make_settings(tmp_path))
+    provider = FakeProvider(budget)
+    provider.queue_items([raw_item(item_id="v1|1|0")], reserve=1)
+    profile = make_profile()
+    stats = CollectorStats()
+
+    await run_sweep_cycle(provider, profile, budget, conn, stats)  # must not raise
+
+    # record_sweep's own bookkeeping still landed.
+    row = conn.execute("SELECT last_seen FROM listings WHERE item_id = 'v1|1|0'").fetchone()
+    assert row["last_seen"] is not None
+
+
+def test_sweep_skips_the_alert_cycle_when_budget_is_exhausted_before_any_query(
+    tmp_path, monkeypatch
+):
+    run(_sweep_skips_the_alert_cycle_when_budget_is_exhausted_before_any_query(tmp_path, monkeypatch))
+
+
+async def _sweep_skips_the_alert_cycle_when_budget_is_exhausted_before_any_query(
+    tmp_path, monkeypatch
+):
+    calls = []
+
+    async def spying_run_alert_cycle(*args, **kwargs):
+        calls.append(args)
+
+    monkeypatch.setattr(collector_module, "run_alert_cycle", spying_run_alert_cycle)
+
+    conn = connect(tmp_path / "dealwatch.db")
+    budget = DailyBudget(make_settings(tmp_path, daily_call_limit=0, daily_reserve_calls=0))
+    provider = FakeProvider(budget)
+    profile = make_profile()
+    stats = CollectorStats()
+
+    await run_sweep_cycle(provider, profile, budget, conn, stats)
+
+    # The early-budget-exhausted return happens before record_sweep, and
+    # the alert cycle goes with it (design.md's dated entry) - alerting off
+    # a sweep that never actually ran would be baseless.
+    assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# V0.9: Collector startup validation (design.md's dated entry) - fail fast
+# on a bad profile OR a missing webhook env var, before either background
+# loop ever runs.
+# ---------------------------------------------------------------------------
+
+
+def _alerts_profile(**overrides) -> Profile:
+    alerts_kwargs = dict(
+        webhook_env="DISCORD_WEBHOOK_COLLECTOR_TEST",
+        dry_run=True,
+        trigger=AlertTrigger(),
+        max_price_usd=1000.0,
+        title_template="{generation}",
+        fields=["generation"],
+    )
+    alerts_kwargs.update(overrides)
+    return Profile(
+        id=PROFILE_ID,
+        name="Test Profile",
+        search=SearchConfig(queries=["q"], filters={}, poll=PollConfig()),
+        alerts=AlertsConfig(**alerts_kwargs),
+    )
+
+
+def test_collector_init_raises_when_webhook_env_is_unset(tmp_path, monkeypatch):
+    monkeypatch.delenv("DISCORD_WEBHOOK_COLLECTOR_TEST", raising=False)
+    settings = make_settings(tmp_path)
+    profile = _alerts_profile()
+
+    with pytest.raises(ProfileCompileError):
+        Collector(settings, profile)
+
+
+def test_collector_init_succeeds_when_webhook_env_is_set(tmp_path, monkeypatch):
+    monkeypatch.setenv("DISCORD_WEBHOOK_COLLECTOR_TEST", "https://discord.example/webhook")
+    settings = make_settings(tmp_path)
+    profile = _alerts_profile()
+
+    Collector(settings, profile)  # must not raise
+
+
+def test_collector_init_does_not_require_a_webhook_env_without_an_alerts_block(tmp_path):
+    settings = make_settings(tmp_path)
+    profile = make_profile()  # no alerts block at all
+
+    Collector(settings, profile)  # must not raise

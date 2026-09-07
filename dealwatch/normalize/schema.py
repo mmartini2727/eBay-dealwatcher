@@ -2,15 +2,20 @@
 
 Models identity fields, `search`, the normalization pipeline
 (reject/require/extract/derive/tiers/bucket_key/bucket_require - design.md
-§5), and `seed_baselines` (V0.8b, §5.6). `extra="ignore"` stays on Profile
-because `scoring` is still only a loose dict and `alerts` is entirely
-unmodeled (V0.9); rejecting them now would mean today's client can't load
-a real profile at all.
+§5), `seed_baselines` (V0.8b, §5.6), and `alerts` (V0.9). `extra="ignore"`
+stays on Profile itself because `scoring` is still only a loose dict;
+rejecting unknown top-level keys now would mean today's client can't load a
+real profile at all. `alerts` and its `trigger` sub-model use
+`extra="forbid"`, deliberately different from Profile - a typo'd key under
+`alerts:` should be a startup error the same way a bad regex already is,
+not a silently-ignored no-op.
 
 This module only models *shape* - what keys/types are allowed. Semantic
 validation (does a regex compile, does an `apply:` name a real function,
-does a bucket_key field actually get produced by something) is
-dealwatch.normalize.engine.compile_profile's job, not this one's.
+does a bucket_key field actually get produced by something, does
+`alerts.webhook_env` name a real environment variable) is
+dealwatch.normalize.engine.compile_profile's job or dealwatch.engine.
+alerting.resolve_webhook_url's, not this module's.
 """
 
 from typing import Any
@@ -126,6 +131,54 @@ class SeedBaselineEntry(BaseModel):
     p50: float
 
 
+class AlertTrigger(BaseModel):
+    """`extra="forbid"`: this is a small, closed set of knobs - a typo'd
+    key here should fail loudly at load, not be silently dropped."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_ratio_to_p25: float = 1.00
+
+
+class AlertsConfig(BaseModel):
+    """V0.9 - `alerts:` block shape (design.md's dated entry). `extra=
+    "forbid"`: unlike Profile itself, this is a small enough surface that a
+    typo'd key (`cooldown_minute` for `cooldown_minutes`) should be a
+    startup error, the same way an invalid regex already is - not a
+    silently-ignored no-op that alerts wrong for weeks.
+
+    `webhook_env` NAMES an environment variable; it is not the webhook URL
+    itself and this model does not read the environment - resolving it (and
+    raising if it's unset/empty) is dealwatch.engine.alerting.
+    resolve_webhook_url's job, called once at startup, same division of
+    labor as compile_profile validating shape vs. semantics.
+
+    `fields`/`title_template` reference spec keys by name but are NOT
+    validated against what the profile's extract/derive/tiers stages
+    actually produce - a field absent from a given listing's spec is a
+    legitimate runtime state (a `partial` listing), not a config error, and
+    renders as "unknown" (dealwatch.notify.discord), never raises.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    webhook_env: str
+    dry_run: bool = True
+    trigger: AlertTrigger = AlertTrigger()
+    # Dollars, matching how seed_baselines.p25/p50 are authored - converted
+    # to cents once, at the point of comparison, same as those.
+    max_price_usd: float
+    realert_drop_pct: int = 8
+    cooldown_minutes: int = 60
+    max_per_cycle: int = 10
+    # Default False (design.md's dated entry): a multi-variation listing's
+    # price is typically the LOWEST variation, so these systematically look
+    # like better deals than they are unless a profile opts in explicitly.
+    include_variations: bool = False
+    title_template: str
+    fields: list[str] = []
+
+
 class Profile(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -151,3 +204,7 @@ class Profile(BaseModel):
     # blocks) is engine/scoring.py's compile step, same division of labor
     # as reject/require/extract above.
     seed_baselines: list[SeedBaselineEntry] = []
+    # V0.9 - see AlertsConfig. Optional: a profile with no `alerts:` block
+    # collects and scores but never alerts, same "collector ships before
+    # scoring" staging CLAUDE.md already documents for the whole project.
+    alerts: AlertsConfig | None = None

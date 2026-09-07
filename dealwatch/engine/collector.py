@@ -24,7 +24,9 @@ from pathlib import Path
 import yaml
 
 from dealwatch.config import Settings
-from dealwatch.normalize.engine import normalize
+from dealwatch.engine.alerting import resolve_webhook_url, run_alert_cycle
+from dealwatch.engine.scoring import CompiledSeedBaseline, compile_seed_baselines
+from dealwatch.normalize.engine import compile_profile, normalize
 from dealwatch.normalize.listing import (
     Listing,
     ListingMappingError,
@@ -117,6 +119,11 @@ def _listing_fields(listing: Listing, profile_id: str) -> dict:
         "seller_feedback_score": listing.seller_feedback_score,
         "condition_id": listing.condition_id,
         "variation_id": listing.variation_id,
+        # V0.9: without this, listings.item_web_url stays NULL for every
+        # listing collected from here on (it previously only ever got set
+        # by the one-time scripts/backfill_item_url.py run) and every
+        # future alert embed would have no link to the actual listing.
+        "item_web_url": listing.item_web_url,
     }
 
 
@@ -148,7 +155,9 @@ def _raw_only_listing_fields(raw: dict, title: str, item_id: str, profile_id: st
     variation_id is parsed here too (V0.8d), from item_id rather than raw -
     missing this path would leave mapping-failure rows with a NULL
     variation_id, silently readmitting exactly the multi-variation listings
-    this change excludes from the baseline.
+    this change excludes from the baseline. item_web_url (V0.9) is read
+    straight from raw the same way map_item_summary itself does - a missing
+    price says nothing about whether itemWebUrl is present.
     """
     return {
         "profile_id": profile_id,
@@ -158,6 +167,7 @@ def _raw_only_listing_fields(raw: dict, title: str, item_id: str, profile_id: st
         "seller_feedback_score": _to_int(_get(raw, "seller", "feedbackScore")),
         "condition_id": _to_int(raw.get("conditionId")),
         "variation_id": parse_variation_id(item_id),
+        "item_web_url": raw.get("itemWebUrl"),
     }
 
 
@@ -281,15 +291,23 @@ async def run_fast_poll_cycle(
     profile: Profile,
     conn,
     stats: CollectorStats,
+    compiled_seeds: list[CompiledSeedBaseline] | None = None,
 ) -> None:
     """One fast-poll cycle: page one of each query, record_sighting only.
 
     Never calls record_sweep - a fast poll only ever sees the newest page,
     so its absence-of-an-item tells you nothing about that item.
+
+    compiled_seeds defaults to None (treated as empty) purely so every
+    pre-V0.9 test call site keeps working unchanged - a profile with no
+    `alerts:` block makes run_alert_cycle a no-op regardless of what's
+    passed here. Collector always passes its real compile_seed_baselines()
+    result, computed once at startup, never per cycle.
     """
     seen_at_dt = datetime.now(timezone.utc)
     seen_at_ts = int(seen_at_dt.timestamp())
 
+    item_ids: list[str] = []
     for query in profile.search.queries:
         try:
             raw_items = await provider.search(
@@ -311,10 +329,21 @@ async def run_fast_poll_cycle(
             break
 
         for raw in raw_items:
-            _process_raw_item(conn, profile, raw, seen_at_dt, seen_at_ts, stats)
+            item_id = _process_raw_item(conn, profile, raw, seen_at_dt, seen_at_ts, stats)
+            if item_id is not None:
+                item_ids.append(item_id)
 
     stats.last_poll_at = seen_at_ts
     stats.poll_count += 1
+
+    # After all of this cycle's persistence work, and wrapped so nothing it
+    # does can propagate into the poll loop (design.md's V0.9 dated entry):
+    # a Discord outage, a webhook 500, or a bug in the embed builder must
+    # not stall a poll cycle or prevent a sighting write.
+    try:
+        await run_alert_cycle(conn, profile, compiled_seeds or [], item_ids, seen_at_ts)
+    except Exception:
+        logger.exception("alert cycle failed for profile=%s", profile.id)
 
 
 async def run_sweep_cycle(
@@ -323,6 +352,7 @@ async def run_sweep_cycle(
     budget: DailyBudget,
     conn,
     stats: CollectorStats,
+    compiled_seeds: list[CompiledSeedBaseline] | None = None,
 ) -> None:
     """One sweep cycle: deep pagination over the full active set, then
     exactly one record_sweep - unless the result might be truncated.
@@ -452,14 +482,31 @@ async def run_sweep_cycle(
         truncated=False, sweep_recorded=True,
     )
 
+    # After record_sweep/store_sweep_stats, and wrapped so nothing it does
+    # can propagate into the sweep loop (design.md's V0.9 dated entry) - a
+    # BIN cut is only visible here, since the fast poll only ever sees page
+    # one sorted newlyListed and would not see a price drop on an older
+    # listing. Deliberately NOT hoisted above the exhausted-budget/truncated
+    # early returns above: a possibly-truncated sweep's seen_item_ids may be
+    # incomplete, and alerting off an incomplete set is no better founded
+    # than record_sweep's own absence-bookkeeping would be on it.
+    try:
+        await run_alert_cycle(conn, profile, compiled_seeds or [], list(seen_item_ids), swept_at)
+    except Exception:
+        logger.exception("alert cycle failed for profile=%s", profile.id)
+
 
 async def _fast_poll_loop(
-    provider: EbayBrowseProvider, profile: Profile, conn, stats: CollectorStats
+    provider: EbayBrowseProvider,
+    profile: Profile,
+    conn,
+    stats: CollectorStats,
+    compiled_seeds: list[CompiledSeedBaseline] | None = None,
 ) -> None:
     interval_seconds = profile.search.poll.interval_minutes * 60
     while True:
         try:
-            await run_fast_poll_cycle(provider, profile, conn, stats)
+            await run_fast_poll_cycle(provider, profile, conn, stats, compiled_seeds)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -476,11 +523,12 @@ async def _sweep_loop(
     budget: DailyBudget,
     conn,
     stats: CollectorStats,
+    compiled_seeds: list[CompiledSeedBaseline] | None = None,
 ) -> None:
     interval_seconds = profile.search.poll.sweep_interval_minutes * 60
     while True:
         try:
-            await run_sweep_cycle(provider, profile, budget, conn, stats)
+            await run_sweep_cycle(provider, profile, budget, conn, stats, compiled_seeds)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -510,12 +558,31 @@ class Collector:
         self._budget = DailyBudget(settings)
         token_manager = TokenManager(settings)
         self._provider = EbayBrowseProvider(settings, token_manager, self._budget)
+
+        # Fail fast, before either loop below ever runs (design.md's V0.9
+        # dated entry): a bad regex, an unresolvable bucket_key field, a
+        # duplicate seed_baselines match block, or an alerts.webhook_env
+        # naming an environment variable that's unset or empty are all the
+        # same class of mistake - a startup error, not a silent no-op
+        # discovered at 2am. compile_seed_baselines() runs once here, not
+        # per cycle - it's real regex-adjacent compile work
+        # (compile_seed_baselines validates every match block), unlike
+        # resolve_webhook_url's cheap os.environ lookup, which
+        # run_alert_cycle repeats per cycle for a different reason (see its
+        # own docstring).
+        compile_profile(profile)
+        self._compiled_seeds = compile_seed_baselines(profile)
+        resolve_webhook_url(profile)
+
         self._tasks: list[asyncio.Task] = []
 
     def start(self) -> None:
         self._tasks = [
             asyncio.create_task(
-                _fast_poll_loop(self._provider, self._profile, self._conn, self.stats)
+                _fast_poll_loop(
+                    self._provider, self._profile, self._conn, self.stats,
+                    self._compiled_seeds,
+                )
             ),
             asyncio.create_task(
                 _sweep_loop(
@@ -524,6 +591,7 @@ class Collector:
                     self._budget,
                     self._conn,
                     self.stats,
+                    self._compiled_seeds,
                 )
             ),
         ]

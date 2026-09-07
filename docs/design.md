@@ -862,13 +862,28 @@ real observed sales" from "the seed chart's estimate for this bucket was
 wrong." Collapsing the two into a single score number would discard exactly
 the information a human needs to decide how much to trust it.
 
-### 5.7 Buyability suppression (V0.9, pending)
+### 5.7 Buyability: label, don't suppress (V0.9a, pending) — scope change, 2026-09-07
 
 A listing can match every spec requirement and still be a bad buy — soldered
 RAM is the first known case: a machine whose RAM can't be upgraded is worth
 less than an identical-spec machine with socketed RAM at the same price,
-because the buyer is stuck with whatever shipped. V0.9 needs a way to
-suppress or down-rank that class of listing.
+because the buyer is stuck with whatever shipped.
+
+This section originally framed the fix as suppression, blocked on an
+unverified generation mapping. That framing fused two different things that
+V0.9 (Discord alerts, §11) separated:
+
+- *"Gen 4 AMD solders RAM"* is a fact about hardware. It is profile
+  knowledge and belongs in `derive:` as a `ram_upgradeable` attribute — an
+  existing generic stage (§5), no new rule language needed.
+- *"I won't buy a soldered 16GB machine"* is a preference. It is not a
+  property of the listing, and does not belong in the normalization
+  pipeline at all.
+
+**Decision: this must never become a `reject:` rule.** A soldered Gen 4 AMD
+is a valid comp for other soldered Gen 4 AMDs — rejecting the class strips
+real data out of a bucket that already has almost none (§2.1's
+fragmentation concern applies here too).
 
 **Decision: this must be a declarative rule, the same shape as reject/
 require/extract (§5, `profiles/*.yaml`) — not Python that knows what a
@@ -891,6 +906,13 @@ working guesses, not verified findings, and must not be encoded as a rule
 until checked against Lenovo's own PSREF/spec sheets or a teardown source.
 A wrong guess here is worse than the unknown-RAM case above: it suppresses
 a real deal with false confidence rather than flagging honest uncertainty.
+
+**V0.9a, after that PSREF check:** add the `derive:` rule and put the
+attribute in the alert body (`alerts.fields`, §11) — label, don't suppress.
+If the label is wrong you see it and fix it; if a suppression rule is wrong
+you never see the listing and never learn. Whether suppression is worth
+building at all gets decided from a month of real alert rows, which the
+`alerts` table (§11) now makes queryable.
 
 ---
 
@@ -1003,3 +1025,98 @@ gathered**. It does not drive collection and it is not on the alerting path.
   otherwise go unnoticed for days.
 - Container runs as a non-root user; `data/` is chowned to it.
 - `profiles/` mounts read-only, `data/` read-write.
+
+---
+
+## 11. V0.9 — Discord alerts (2026-09-07)
+
+V0.8b built the scoring ladder and explicitly left "where does scoring get
+called from" open. This milestone answers it: scoring runs inside the live
+collector, on every fast-poll and sweep cycle, and survivors get a Discord
+embed.
+
+### Where scoring is called from, and why it's failure-isolated
+
+`Collector.__init__` compiles the profile once at startup -
+`compile_profile`, `compile_seed_baselines`, and `resolve_webhook_url`
+(`engine/alerting.py`) - the same "fail fast on a bad config, not on the
+first listing that happens to reach the broken path" principle every prior
+profile-driven stage already follows. A `webhook_env` naming an unset or
+empty environment variable is a `ProfileCompileError` here, at container
+start, not a silent no-op discovered days later when nothing has ever
+posted.
+
+Per-cycle, `run_fast_poll_cycle` and `run_sweep_cycle` each call
+`engine.alerting.run_alert_cycle` once, **after** that cycle's own
+persistence work is complete - after the poll's `record_sighting` calls,
+after the sweep's `record_sweep`/`store_sweep_stats`. Both call sites wrap
+it in a bare `try/except Exception: logger.exception(...)`. This is not
+optional hardening: a bug in the embed builder, a Discord outage, or a
+webhook 5xx must never stall a poll cycle or prevent a sighting write - the
+collector's one job, since V0.6, is to not lose data, and alerting is
+downstream of that job, never allowed to endanger it.
+
+The sweep's early-exit paths (budget exhausted before any query, or
+exhausted mid-sweep) both `return` before `record_sweep` runs, same as
+V0.8d's `sweeps`-table bookkeeping - the alert cycle call sits after
+`record_sweep`, so it goes with those early returns too. Alerting off a
+possibly-truncated `seen_item_ids` would be no better founded than
+`record_sweep`'s own absence-bookkeeping would be on it.
+
+### The `alerts` table, and why it is a table, not columns
+
+`last_alerted_at`/`last_alerted_price_cents` columns on `listings` would
+answer "when did I last alert on this item" and destroy "what did this
+system actually tell me last month, and was any of it right" - the only
+way the scoring ladder (and the seed-baseline guesses in particular) ever
+gets evaluated against reality after the fact. Same reasoning as the
+`sweeps` table (V0.8d): a queryable history, not a log line nobody can
+re-run a report against. `baseline_layer`/`baseline_n` are persisted on
+every row for the same reason `ScoreResult` carries them (§5.6) - without
+them there's no way to distinguish "real deal against 24 observed sales"
+from "the seed chart's guess for this bucket was wrong," a month from now,
+from this table alone.
+
+### The dry-run-as-first-run-guard mechanism
+
+`last_alert()` (`storage/sqlite.py`) returns the most recent alert row for
+an item **regardless of `dry_run`**. This single decision does double duty.
+`alerts.dry_run: true` is the shipped default - it writes a real row per
+survivor, with `delivery_status='dry_run'`, but posts nothing. Because
+cooldown/re-alert (`engine/alerting.py`'s `evaluate()`) reads `last_alert()`
+without filtering on `dry_run`, every one of those dry-run rows immediately
+starts gating future alerts on the same item exactly as if it had actually
+posted. The practical consequence: flipping `dry_run` to `false` the next
+morning does not fire on the ~1,000 already-active listings that would
+otherwise all look brand-new to the cooldown check - only on genuinely new
+listings and genuine further price drops from that point forward. No
+separate backfill script exists for this, or is needed - a day of dry-run
+operation before flipping the flag is the backfill.
+
+### The poll-vs-sweep split, and a correction
+
+The fast poll sees new listings (page one, `sort=newlyListed`, V0.8e); the
+sweep sees price drops on everything else, because only the sweep
+enumerates the full active set. **Correction to this file's earlier
+framing**: §4.2's original text (before V0.8e) described the fast poll as
+using `sort=newlyListed` **with an `itemStartDate` filter**, "so each poll
+returns only what appeared since the last one." That filter was never
+built - see §4.2's own "designed and deliberately not built" entry for why
+(a persisted-checkpoint requirement that a stateless `sort=newlyListed`
+page avoids entirely) - and this section's original text repeated that
+stale description rather than the corrected one. The fast poll returns a
+fixed-size page of the current newest listings; `run_alert_cycle` receives
+whatever `item_ids` that cycle actually touched, new or not, and gates on
+real data (spec_status, price, ratio, cooldown) rather than on the
+fetch mechanism telling it something is new.
+
+### V0.9a scope change (§5.7)
+
+Soldered-RAM buyability suppression, originally scoped as part of this
+milestone's target list, was pulled out during this milestone - see §5.7's
+amended entry. The short version: suppression-via-`reject:` would strip
+real comps out of buckets that already have almost none, and the specific
+generation/vendor mapping needed to build it correctly has not been
+verified against Lenovo's own spec sheets. Labeling (rendering the
+attribute in the alert body once `derive:` produces it) ships in a future
+V0.9a; suppressing anything on an unverified guess does not.

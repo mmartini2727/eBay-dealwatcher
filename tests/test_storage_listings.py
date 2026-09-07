@@ -16,6 +16,8 @@ from dealwatch.storage.sqlite import (
     count_active_listings,
     get_latest_observation,
     get_observations,
+    last_alert,
+    record_alert,
     record_sighting,
     record_sweep,
     store_sanity_flags,
@@ -37,6 +39,7 @@ def listing_fields(**overrides) -> dict:
         seller_feedback_pct=99.5,
         seller_feedback_score=40213,
         condition_id=3000,
+        item_web_url=None,
     )
     base.update(overrides)
     return base
@@ -132,6 +135,55 @@ def test_title_change_writes_observation_and_marks_spec_stale(tmp_path):
     assert row["spec_status"] == "stale"
     assert row["spec_json"] is None
     assert row["bucket_key"] is None
+
+
+def test_item_web_url_is_set_on_insert(tmp_path):
+    conn = make_conn(tmp_path)
+    sight(conn, "item-1", 1000, item_web_url="https://ebay.com/itm/1")
+
+    row = conn.execute(
+        "SELECT item_web_url FROM listings WHERE item_id = 'item-1'"
+    ).fetchone()
+    assert row["item_web_url"] == "https://ebay.com/itm/1"
+
+
+def test_item_web_url_self_heals_on_a_later_sighting(tmp_path):
+    # V0.9 regression: item_web_url used to be consulted only on INSERT,
+    # so a row created before that fix (or by a caller that genuinely had
+    # no URL yet) would carry a NULL item_web_url forever - no sighting
+    # after the first one would ever touch it, and only a one-time backfill
+    # script (scripts/backfill_item_url.py) could repair it. The UPDATE
+    # branch now sets it too, so a later sighting that DOES have a URL
+    # heals the row without any backfill.
+    conn = make_conn(tmp_path)
+    sight(conn, "item-1", 1000)  # no item_web_url - simulates a pre-fix row
+    row = conn.execute(
+        "SELECT item_web_url FROM listings WHERE item_id = 'item-1'"
+    ).fetchone()
+    assert row["item_web_url"] is None
+
+    sight(conn, "item-1", 2000, item_web_url="https://ebay.com/itm/1")
+
+    row = conn.execute(
+        "SELECT item_web_url FROM listings WHERE item_id = 'item-1'"
+    ).fetchone()
+    assert row["item_web_url"] == "https://ebay.com/itm/1"
+
+
+def test_item_web_url_update_does_not_clobber_an_existing_value_with_none(tmp_path):
+    # The COALESCE on the UPDATE branch exists specifically for this case:
+    # a later sighting that doesn't have a URL to hand (e.g. the raw-only
+    # mapping-failure path, if itemWebUrl itself happened to be absent from
+    # that particular raw dict) must not overwrite an already-good value.
+    conn = make_conn(tmp_path)
+    sight(conn, "item-1", 1000, item_web_url="https://ebay.com/itm/1")
+
+    sight(conn, "item-1", 2000, item_web_url=None)  # e.g. a poll with no URL
+
+    row = conn.execute(
+        "SELECT item_web_url FROM listings WHERE item_id = 'item-1'"
+    ).fetchone()
+    assert row["item_web_url"] == "https://ebay.com/itm/1"  # untouched, not wiped
 
 
 def test_insert_with_explicit_spec_status_pending_stores_pending(tmp_path):
@@ -524,6 +576,12 @@ def test_migration_5_applies_to_a_database_already_at_version_4(tmp_path, monkey
     # usable, and re-running migrations against an already-v5 file is a
     # true no-op - not just "doesn't error," but leaves the backfilled
     # value and the sweeps row byte-identical.
+    #
+    # Scoped to <= 5, not the real (now v6) _MIGRATIONS - same reasoning as
+    # the v3->v4 test's v4_only slice: keeps this test's "migration 5
+    # applied" assertions true regardless of what later migrations exist.
+    # See test_migration_6_applies_to_a_database_already_at_version_5 for
+    # the v5->v6 step.
     import dealwatch.storage.sqlite as storage_module
 
     db_path = tmp_path / "dealwatch.db"
@@ -543,7 +601,8 @@ def test_migration_5_applies_to_a_database_already_at_version_4(tmp_path, monkey
     )
     conn.close()
 
-    monkeypatch.setattr(storage_module, "_MIGRATIONS", real_migrations)
+    v5_only = [m for m in real_migrations if m[0] <= 5]
+    monkeypatch.setattr(storage_module, "_MIGRATIONS", v5_only)
 
     upgraded = storage_module.connect(db_path)
     version = upgraded.execute("SELECT version FROM schema_version").fetchone()[0]
@@ -577,6 +636,52 @@ def test_migration_5_applies_to_a_database_already_at_version_4(tmp_path, monkey
     ).fetchone()
     assert row["variation_id"] == "456"
     assert reconnected.execute("SELECT COUNT(*) FROM sweeps").fetchone()[0] == 1
+
+
+def test_migration_6_applies_to_a_database_already_at_version_5(tmp_path, monkeypatch):
+    # Same production-is-the-upgrade-path reasoning as the migration 5 test
+    # above. Confirms the alerts table + its index are real and usable, and
+    # a second connect() against an already-v6 file is a true no-op.
+    import dealwatch.storage.sqlite as storage_module
+
+    db_path = tmp_path / "dealwatch.db"
+    real_migrations = storage_module._MIGRATIONS
+    v5_only = [m for m in real_migrations if m[0] <= 5]
+    monkeypatch.setattr(storage_module, "_MIGRATIONS", v5_only)
+
+    conn = storage_module.connect(db_path)
+    version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+    assert version == 5
+    conn.execute(
+        "INSERT INTO listings (item_id, profile_id, title, spec_status, "
+        "first_seen, last_seen, miss_count) VALUES "
+        "('item-1', ?, 't', 'ok', 1000, 1000, 0)",
+        (PROFILE_ID,),
+    )
+    conn.close()
+
+    monkeypatch.setattr(storage_module, "_MIGRATIONS", real_migrations)
+
+    upgraded = storage_module.connect(db_path)
+    version = upgraded.execute("SELECT version FROM schema_version").fetchone()[0]
+    assert version == 6
+
+    upgraded.execute(
+        "INSERT INTO alerts (item_id, profile_id, sent_at, dry_run, "
+        "price_cents, price_is_price_only, bucket_key, baseline_layer, "
+        "baseline_match, baseline_n, baseline_p25_cents, baseline_p50_cents, "
+        "ratio_to_p25, sanity_flagged, delivery_status) VALUES "
+        "('item-1', ?, 1000, 1, 20000, 0, 'bucket', 'seed', '{}', NULL, "
+        "20000, 25000, 1.0, 0, 'dry_run')",
+        (PROFILE_ID,),
+    )
+    assert upgraded.execute("SELECT COUNT(*) FROM alerts").fetchone()[0] == 1
+    upgraded.close()
+
+    reconnected = storage_module.connect(db_path)
+    version = reconnected.execute("SELECT version FROM schema_version").fetchone()[0]
+    assert version == 6
+    assert reconnected.execute("SELECT COUNT(*) FROM alerts").fetchone()[0] == 1
 
 
 # Every shape parse_variation_id() itself is required to handle correctly
@@ -635,6 +740,76 @@ def test_migration_5_backfill_matches_parse_variation_id_across_item_id_shapes(
             "SELECT variation_id FROM listings WHERE item_id = ?", (item_id,)
         ).fetchone()
         assert row["variation_id"] == parse_variation_id(item_id), repr(item_id)
+
+
+# ---------------------------------------------------------------------------
+# record_alert / last_alert (V0.9, design.md's dated entry)
+# ---------------------------------------------------------------------------
+
+
+def _alert_kwargs(**overrides):
+    defaults = dict(
+        dry_run=False,
+        price_cents=9000,
+        price_is_price_only=False,
+        bucket_key="1|intel-10th|16",
+        baseline_layer="seed",
+        baseline_match="{}",
+        baseline_n=None,
+        baseline_p25_cents=10000,
+        baseline_p50_cents=15000,
+        ratio_to_p25=0.9,
+        sanity_flagged=False,
+        delivery_status="sent",
+    )
+    defaults.update(overrides)
+    return defaults
+
+
+def test_last_alert_returns_none_when_no_alert_exists(tmp_path):
+    conn = make_conn(tmp_path)
+    sight(conn, "item-1", 1000)
+    assert last_alert(conn, "item-1") is None
+
+
+def test_record_alert_then_last_alert_round_trips(tmp_path):
+    conn = make_conn(tmp_path)
+    sight(conn, "item-1", 1000)
+
+    record_alert(conn, "item-1", PROFILE_ID, 2000, **_alert_kwargs(price_cents=9000))
+
+    row = last_alert(conn, "item-1")
+    assert row is not None
+    assert row["sent_at"] == 2000
+    assert row["price_cents"] == 9000
+    assert row["dry_run"] == 0
+    assert row["delivery_status"] == "sent"
+
+
+def test_last_alert_ignores_dry_run_returns_most_recent_regardless(tmp_path):
+    # Load-bearing (storage/sqlite.py's docstring): a dry-run row must gate
+    # cooldown/re-alert exactly like a real one - this is what lets a
+    # dry-run day double as the first-alert-ever guard.
+    conn = make_conn(tmp_path)
+    sight(conn, "item-1", 1000)
+
+    record_alert(conn, "item-1", PROFILE_ID, 2000, **_alert_kwargs(dry_run=True, delivery_status="dry_run"))
+
+    row = last_alert(conn, "item-1")
+    assert row is not None
+    assert row["dry_run"] == 1
+
+
+def test_last_alert_returns_the_most_recent_by_sent_at(tmp_path):
+    conn = make_conn(tmp_path)
+    sight(conn, "item-1", 1000)
+
+    record_alert(conn, "item-1", PROFILE_ID, 2000, **_alert_kwargs(price_cents=9000))
+    record_alert(conn, "item-1", PROFILE_ID, 3000, **_alert_kwargs(price_cents=8500))
+
+    row = last_alert(conn, "item-1")
+    assert row["sent_at"] == 3000
+    assert row["price_cents"] == 8500
 
 
 def test_concurrent_first_connect_against_a_fresh_file_does_not_crash_or_hang(tmp_path):

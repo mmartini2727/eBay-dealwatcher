@@ -130,8 +130,9 @@ be recovered.
 | V0.5 | SQLite + listing history (WAL) | done |
 | V0.6 | **Dumb collector loop — poll and persist, no scoring** | done |
 | V0.7 | ThinkPad T14 profile + normalize engine | done |
-| V0.8 | Scoring engine | next |
-| V0.9 | Discord alerts | |
+| V0.8 | Scoring engine (a-e: baselines, scoring ladder, bucket_key, sweep/pagination data integrity, `poll.sort`) | done |
+| V0.9 | Discord alerts | done |
+| V0.9a | Soldered-RAM buyability labeling (pulled out of V0.9 - design.md §5.7) | next |
 | V1.0 | MCP server (streamable HTTP, LAN only) | |
 
 Ship V0.6 even though the normalizer is a stub. Raw titles and prices are

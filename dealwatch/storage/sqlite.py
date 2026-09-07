@@ -235,6 +235,49 @@ _MIGRATIONS: list[tuple[int, list[str]]] = [
             """,
         ],
     ),
+    (
+        6,
+        [
+            # V0.9 (design.md's dated entry): one row per Discord alert
+            # actually considered for delivery - including dry-run rows,
+            # which is load-bearing (see last_alert()'s docstring: dry_run
+            # rows are what let a dry-run day double as the first-alert-ever
+            # guard). A table, not last_alerted_at columns on `listings` -
+            # an overwritten column answers "when did I last alert" and
+            # destroys "what did this system actually tell me last month,
+            # and was any of it right" - the only way scoring ever gets
+            # evaluated after the fact. Same reasoning as the `sweeps` table
+            # (V0.8d). baseline_layer/baseline_n are persisted for the same
+            # reason design.md §5.6 gives for carrying them on ScoreResult:
+            # without them there's no way to tell "real deal against 24
+            # observed sales" from "the seed chart was wrong," after the
+            # fact, from this table alone.
+            """
+            CREATE TABLE IF NOT EXISTS alerts (
+                id                  INTEGER PRIMARY KEY,
+                item_id             TEXT NOT NULL REFERENCES listings(item_id),
+                profile_id          TEXT NOT NULL,
+                sent_at             INTEGER NOT NULL,
+                dry_run             INTEGER NOT NULL DEFAULT 0,
+                price_cents         INTEGER NOT NULL,
+                price_is_price_only INTEGER NOT NULL,
+                bucket_key          TEXT,
+                baseline_layer      TEXT NOT NULL,
+                baseline_match      TEXT NOT NULL,
+                baseline_n          INTEGER,
+                baseline_p25_cents  INTEGER NOT NULL,
+                baseline_p50_cents  INTEGER NOT NULL,
+                ratio_to_p25        REAL NOT NULL,
+                sanity_flagged      INTEGER NOT NULL,
+                delivery_status     TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_alerts_item_sent_at
+                ON alerts(item_id, sent_at)
+            """,
+        ],
+    ),
 ]
 
 
@@ -350,7 +393,14 @@ def record_sighting(
     seller_feedback_pct (float|None), seller_feedback_score (int|None),
     condition_id (int|None), spec_status (str, optional - only consulted on
     insert; defaults to 'pending' if omitted, meaning "never normalized"),
-    variation_id (str|None, optional - only consulted on insert; see below).
+    variation_id (str|None, optional - only consulted on insert; see below),
+    item_web_url (str|None, optional - consulted on BOTH insert and update,
+    unlike variation_id: V0.9's alert embeds need a real link, and a row
+    inserted before this field existed must self-heal on its next sighting
+    rather than staying NULL forever. `COALESCE(?, item_web_url)` on the
+    UPDATE branch means a caller that doesn't have one to hand (a raw-only
+    mapping-failure path where itemWebUrl itself happened to be absent from
+    the raw dict) never clobbers an already-good value with NULL).
 
     observation_fields keys: price_cents, shipping_cents, total_cents,
     current_bid_cents, bid_count (all int|None), buying_options (list[str]),
@@ -385,9 +435,9 @@ def record_sighting(
                     seller_feedback_score, condition_id, spec_json,
                     spec_status, reject_rule_id, bucket_key,
                     first_seen, last_seen, miss_count, gone_at, lifespan_mins,
-                    variation_id
+                    variation_id, item_web_url
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, NULL,
-                          ?, ?, 0, NULL, NULL, ?)
+                          ?, ?, 0, NULL, NULL, ?, ?)
                 """,
                 (
                     item_id,
@@ -401,6 +451,7 @@ def record_sighting(
                     seen_at,
                     seen_at,
                     listing_fields.get("variation_id"),
+                    listing_fields.get("item_web_url"),
                 ),
             )
             _insert_observation(conn, item_id, observation_fields, seen_at)
@@ -448,10 +499,14 @@ def record_sighting(
             """
             UPDATE listings
             SET title = ?, spec_json = ?, bucket_key = ?, spec_status = ?,
-                miss_count = 0, gone_at = NULL, lifespan_mins = NULL
+                miss_count = 0, gone_at = NULL, lifespan_mins = NULL,
+                item_web_url = COALESCE(?, item_web_url)
             WHERE item_id = ?
             """,
-            (listing_fields["title"], spec_json, bucket_key, spec_status, item_id),
+            (
+                listing_fields["title"], spec_json, bucket_key, spec_status,
+                listing_fields.get("item_web_url"), item_id,
+            ),
         )
         conn.execute("COMMIT")
     except BaseException:
@@ -645,6 +700,79 @@ def store_sweep_stats(
             1 if sweep_recorded else 0,
         ),
     )
+
+
+def record_alert(
+    conn: sqlite3.Connection,
+    item_id: str,
+    profile_id: str,
+    sent_at: int,
+    *,
+    dry_run: bool,
+    price_cents: int,
+    price_is_price_only: bool,
+    bucket_key: str | None,
+    baseline_layer: str,
+    baseline_match: str,
+    baseline_n: int | None,
+    baseline_p25_cents: int,
+    baseline_p50_cents: int,
+    ratio_to_p25: float,
+    sanity_flagged: bool,
+    delivery_status: str,
+) -> None:
+    """One row per alert cycle survivor, dry-run or not (V0.9, design.md's
+    dated entry) - see last_alert()'s docstring for why dry-run rows are
+    written here at all rather than skipped.
+
+    One INSERT, no explicit BEGIN/COMMIT - same reasoning as store_spec()/
+    store_sweep_stats(): a single statement is already atomic under
+    SQLite's autocommit, and this is called from the same connection as
+    other calls that manage their own transaction, so this must not open a
+    nested one.
+    """
+    conn.execute(
+        """
+        INSERT INTO alerts (
+            item_id, profile_id, sent_at, dry_run, price_cents,
+            price_is_price_only, bucket_key, baseline_layer, baseline_match,
+            baseline_n, baseline_p25_cents, baseline_p50_cents, ratio_to_p25,
+            sanity_flagged, delivery_status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            item_id,
+            profile_id,
+            sent_at,
+            1 if dry_run else 0,
+            price_cents,
+            1 if price_is_price_only else 0,
+            bucket_key,
+            baseline_layer,
+            baseline_match,
+            baseline_n,
+            baseline_p25_cents,
+            baseline_p50_cents,
+            ratio_to_p25,
+            1 if sanity_flagged else 0,
+            delivery_status,
+        ),
+    )
+
+
+def last_alert(conn: sqlite3.Connection, item_id: str) -> sqlite3.Row | None:
+    """Most recent alert row for item_id, regardless of `dry_run`. This is
+    load-bearing (V0.9, design.md's dated entry), not an oversight: because
+    this ignores dry_run, a dry-run day's rows double as the first-alert-
+    ever guard for cooldown/re-alert purposes (engine/alerting.py's
+    evaluate()) - flipping dry_run: false the next morning does not fire on
+    every already-active listing, only on new listings and genuine price
+    drops, with no separate backfill script needed to establish that
+    baseline."""
+    return conn.execute(
+        "SELECT * FROM alerts WHERE item_id = ? ORDER BY sent_at DESC, id DESC LIMIT 1",
+        (item_id,),
+    ).fetchone()
 
 
 def _insert_observation(
