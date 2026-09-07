@@ -382,6 +382,18 @@ def test_sweep_writes_a_sweeps_row_on_early_budget_exhaustion(tmp_path):
 
 async def _sweep_writes_a_sweeps_row_on_early_budget_exhaustion(tmp_path):
     conn = connect(tmp_path / "dealwatch.db")
+    # One pre-existing active listing, same as the normal-completion test -
+    # without this, active_count_before == 0 is indistinguishable from a
+    # bug that never reads count_active_listings() on this exit path at
+    # all. active_count_before is read at the top of run_sweep_cycle,
+    # before the budget check, so it must be correct here too.
+    record_sighting(
+        conn, "v1|pre|0",
+        dict(profile_id=PROFILE_ID, title="pre-existing"),
+        dict(price_cents=10000, raw_json="{}"),
+        1_000_000,
+    )
+
     # ceiling = 0: status["remaining"] is 0 before run_sweep_cycle ever
     # calls search() - the early-return exit path, distinct from the
     # mid-sweep truncation path below.
@@ -395,7 +407,7 @@ async def _sweep_writes_a_sweeps_row_on_early_budget_exhaustion(tmp_path):
     row = _latest_sweep_row(conn)
     assert row["fetched_count"] == 0
     assert row["distinct_count"] == 0
-    assert row["active_count_before"] == 0
+    assert row["active_count_before"] == 1  # only v1|pre|0 was active before this sweep
     assert row["truncated"] == 1
     assert row["sweep_recorded"] == 0
     assert provider.calls == []  # confirms this is genuinely the early path, not a fluke

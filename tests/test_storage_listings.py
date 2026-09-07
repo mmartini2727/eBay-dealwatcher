@@ -579,6 +579,64 @@ def test_migration_5_applies_to_a_database_already_at_version_4(tmp_path, monkey
     assert reconnected.execute("SELECT COUNT(*) FROM sweeps").fetchone()[0] == 1
 
 
+# Every shape parse_variation_id() itself is required to handle correctly
+# (test_listing.py's coverage test), plus a couple more that specifically
+# stress the SQL backfill's string/position arithmetic: "" and "00" are the
+# two easiest ways for instr()/substr() off-by-ones to diverge from Python's
+# split()/comparison without either producing an obvious crash.
+_MIGRATION_5_BACKFILL_SHAPES = [
+    "v1|123|0",       # exact "0" -> not a variation -> None
+    "v1|123|456",     # ordinary variation -> "456"
+    "v1|123",         # only 2 parts -> None
+    "v1|123|",        # empty 3rd part -> None
+    "v1|123|456|789", # 4 parts -> None
+    "v1||456",        # empty 2nd part, but still exactly 3 parts -> "456"
+    "",                # empty string entirely -> None
+    "garbage",         # no pipes at all -> None
+    "a|b|c",           # doesn't start with v1 - shape only, not the prefix -> "c"
+    "v1|123|00",       # "00" != "0" as a string -> "00", not None
+]
+
+
+def test_migration_5_backfill_matches_parse_variation_id_across_item_id_shapes(
+    tmp_path, monkeypatch
+):
+    # test_migration_5_applies_to_a_database_already_at_version_4 only
+    # proves the backfill isn't completely broken on one ordinary shape.
+    # The SQL is hand-written nested instr()/substr() with no split()
+    # available in SQLite (see migration 5's comment) - the empty-segment
+    # and off-by-one cases above are exactly where that kind of SQL and
+    # Python's str.split() are most likely to quietly disagree. This seeds
+    # one row per shape and asserts the SQL backfill agrees with
+    # parse_variation_id() exactly, case by case, not just on the shape
+    # someone happened to hand-verify while writing the migration.
+    import dealwatch.storage.sqlite as storage_module
+    from dealwatch.normalize.listing import parse_variation_id
+
+    db_path = tmp_path / "dealwatch.db"
+    real_migrations = storage_module._MIGRATIONS
+    v4_only = [m for m in real_migrations if m[0] <= 4]
+    monkeypatch.setattr(storage_module, "_MIGRATIONS", v4_only)
+
+    conn = storage_module.connect(db_path)
+    for i, item_id in enumerate(_MIGRATION_5_BACKFILL_SHAPES):
+        conn.execute(
+            "INSERT INTO listings (item_id, profile_id, title, spec_status, "
+            "first_seen, last_seen, miss_count) VALUES (?, ?, 't', 'ok', 1000, 1000, 0)",
+            (item_id, f"{PROFILE_ID}-{i}"),
+        )
+    conn.close()
+
+    monkeypatch.setattr(storage_module, "_MIGRATIONS", real_migrations)
+    upgraded = storage_module.connect(db_path)
+
+    for item_id in _MIGRATION_5_BACKFILL_SHAPES:
+        row = upgraded.execute(
+            "SELECT variation_id FROM listings WHERE item_id = ?", (item_id,)
+        ).fetchone()
+        assert row["variation_id"] == parse_variation_id(item_id), repr(item_id)
+
+
 def test_concurrent_first_connect_against_a_fresh_file_does_not_crash_or_hang(tmp_path):
     # V0.8a regression: migration 3 (ALTER TABLE ADD COLUMN, no IF NOT
     # EXISTS equivalent in SQLite) exposed a latent race in
