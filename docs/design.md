@@ -509,6 +509,77 @@ implementation" and "Snapshot script for dealwatch" — both about an
 unrelated shell script that happened to land in the same commits, not V0.8d.
 Searching `git log` for "V0.8d" alone finds only `4fbdc07`.
 
+### 4.5 V0.8e — wiring `poll.sort` (discovery latency, not data integrity) (2026-09-07)
+
+`profiles/thinkpad-t14.yaml` has set `poll.sort: newlyListed` since it was
+written, `PollConfig` has carried the field since `schema.py`, and
+`EbayBrowseProvider.search()` has never sent it — confirmed from production
+request URLs. This milestone wires it, after a probe confirmed it's worth
+wiring, and is explicit about what kind of fix it is.
+
+**Justification.** Measured discovery latency from `itemCreationDate` in
+stored `raw_json`, 329 listings created during the observation window: 160
+found in under 10 minutes (avg 6), 158 within the hour (avg 34), 11 later.
+eBay's own temporary relevance boost for new listings already gets roughly
+half of them onto page one unaided; wiring `sort` should move the other half
+from ~34 minutes to ~6. **This is a discovery-latency improvement for V0.9
+alerting, not a data-integrity fix.** An earlier hypothesis — that
+relevance-ordered pagination was causing the sweep to skip listings, and
+that a stable sort key would fix it — was retired by direct measurement in
+§4.4's correction: the first `sweeps` row showed a 0.48% duplicate rate.
+Pagination is fine. That reasoning is not reintroduced here.
+
+**Step 1 — the probe, run on the LXC before any wiring:**
+
+```
+$ docker compose exec dealwatch python /app/scripts/probe_sort.py --profile /app/profiles/thinkpad-t14.yaml
+query='Lenovo ThinkPad T14' limit=50
+
+--- unsorted (today's actual behavior) ---
+count returned : 50
+total (envelope): 1033
+first 10 item_ids: ['v1|298583199831|0', 'v1|257717273129|0', 'v1|178417406357|0', 'v1|178473657428|0', 'v1|407188103083|0', 'v1|366653482085|0', 'v1|278343885763|0', 'v1|137690368844|0', 'v1|287000104684|0', 'v1|137699583104|0']
+itemCreationDate : n=50/50  min=2025-12-09T21:02:50+00:00  median=2026-09-01T22:20:37.500000+00:00  max=2026-09-07T04:51:34+00:00
+
+--- sort=newlyListed ---
+count returned : 50
+total (envelope): 1007
+first 10 item_ids: ['v1|820096971511|0', 'v1|820096917162|0', 'v1|188896714882|0', 'v1|298652066749|0', 'v1|287570145636|0', 'v1|137706685216|0', 'v1|206540356608|0', 'v1|377476959113|0', 'v1|336782104202|0', 'v1|287569679878|0']
+itemCreationDate : n=50/50  min=2026-09-04T15:34:09+00:00  median=2026-09-05T18:23:18+00:00  max=2026-09-07T04:51:34+00:00
+
+symmetric difference of item_id sets: 74
+```
+
+Outcome: eBay honors the parameter (the third of three possible outcomes —
+see `scripts/probe_sort.py`'s docstring for all three). A symmetric
+difference of 74 out of a possible 100 means only 13 of the 50 items
+overlap between the two pages, and the sorted page's `itemCreationDate`
+spread collapsed from ~9 months (2025-12-09 → 2026-09-07) to under 3 days
+(2026-09-04 → 2026-09-07), with the median moving from 2026-09-01 to
+2026-09-05. Not a no-op, not a rejection — proceed to wiring.
+
+**Step 2 — wiring.** `EbayBrowseProvider.search()` gained a keyword-only
+`sort: str | None = None`; `params["sort"]` is set only when `sort` is
+truthy, so `None` produces no key at all rather than an empty value (only
+the former was probed). `run_fast_poll_cycle` passes
+`sort=profile.search.poll.sort`. `run_sweep_cycle` passes nothing,
+deliberately — `poll.sort` is a fast-poll-only knob; if `search()` ever grew
+a fallback to read `profile.search.poll.sort` itself instead of taking an
+argument, the sweep's result ordering would silently change too, entangled
+with the `fetched_count`/`distinct_count` coverage metric §4.4 just started
+recording. `providers/ebay.py`'s module docstring — corrected in V0.8d to
+say sort is never sent — is corrected again to describe the new behavior.
+
+**Deploy timestamp — record here the moment this goes live:** `___`. This
+is a lifespan-measurement discontinuity, not a formality: catching listings
+~28 minutes earlier on average makes every post-fix lifespan that much
+longer than a pre-fix one for the same true lifespan. Against
+`fast_lifespan_hours=24` that's about a 2% shift; against a listing that
+genuinely sells in 90 minutes it's closer to 30%, and short-lived listings
+are exactly the population the survival signal weighs most heavily. Any
+future baseline recompute spanning this date is mixing two measurement
+regimes.
+
 ---
 
 ## 5. Normalization — the actual hard part

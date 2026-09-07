@@ -11,6 +11,7 @@ from pathlib import Path
 
 from dealwatch.config import Settings
 from dealwatch.engine.collector import (
+    FAST_POLL_PAGE_LIMIT,
     CollectorStats,
     load_profile,
     run_fast_poll_cycle,
@@ -39,7 +40,7 @@ class FakeProvider:
 
     def __init__(self, budget: DailyBudget | None = None):
         self.budget = budget
-        self.calls: list[tuple[str, int, int]] = []
+        self.calls: list[tuple[str, int, int, str | None]] = []
         self._queue: list[tuple[list[dict] | Exception, int]] = []
 
     def queue_items(self, items: list[dict], *, reserve: int = 0) -> None:
@@ -48,8 +49,8 @@ class FakeProvider:
     def queue_error(self, exc: Exception) -> None:
         self._queue.append((exc, 0))
 
-    async def search(self, profile, query, *, limit=50, max_pages=1):
-        self.calls.append((query, limit, max_pages))
+    async def search(self, profile, query, *, limit=50, max_pages=1, sort=None):
+        self.calls.append((query, limit, max_pages, sort))
         payload, reserve_n = self._queue.pop(0)
         for _ in range(reserve_n):
             assert self.budget is not None
@@ -133,7 +134,67 @@ async def _sweep_cycle_passes_profile_page_limit_and_max_pages_to_search(tmp_pat
 
     await run_sweep_cycle(provider, profile, budget, conn, stats)
 
-    assert provider.calls == [("Lenovo ThinkPad T14", 77, 3)]
+    assert provider.calls == [("Lenovo ThinkPad T14", 77, 3, None)]
+
+
+def test_fast_poll_passes_the_profiles_sort_value_to_search(tmp_path):
+    run(_fast_poll_passes_the_profiles_sort_value_to_search(tmp_path))
+
+
+async def _fast_poll_passes_the_profiles_sort_value_to_search(tmp_path):
+    # This proves run_fast_poll_cycle reads profile.search.poll.sort and
+    # forwards it to search() - not that eBay does anything with it
+    # (scripts/probe_sort.py already answered that). "endingSoonest" rather
+    # than "newlyListed" - the profile's real value - so this can't pass by
+    # coincidence if run_fast_poll_cycle ever hardcodes "newlyListed".
+    conn = connect(tmp_path / "dealwatch.db")
+    budget = DailyBudget(make_settings(tmp_path))
+    provider = FakeProvider(budget)
+    provider.queue_items([raw_item()], reserve=1)
+    profile = Profile(
+        id=PROFILE_ID,
+        name="Test Profile",
+        search=SearchConfig(
+            queries=["Lenovo ThinkPad T14"],
+            filters={},
+            poll=PollConfig(sort="endingSoonest"),
+        ),
+    )
+    stats = CollectorStats()
+
+    await run_fast_poll_cycle(provider, profile, conn, stats)
+
+    assert provider.calls == [("Lenovo ThinkPad T14", FAST_POLL_PAGE_LIMIT, 1, "endingSoonest")]
+
+
+def test_sweep_cycle_never_passes_sort_even_when_the_profile_sets_it(tmp_path):
+    run(_sweep_cycle_never_passes_sort_even_when_the_profile_sets_it(tmp_path))
+
+
+async def _sweep_cycle_never_passes_sort_even_when_the_profile_sets_it(tmp_path):
+    # poll.sort is a fast-poll-only knob (design.md's V0.8e dated entry) -
+    # setting it to a truthy value here and asserting the sweep's call still
+    # carries sort=None is what actually proves run_sweep_cycle never reads
+    # profile.search.poll.sort, as opposed to a profile that just happens to
+    # leave sort unset.
+    conn = connect(tmp_path / "dealwatch.db")
+    budget = DailyBudget(make_settings(tmp_path))
+    provider = FakeProvider(budget)
+    provider.queue_items([raw_item()], reserve=1)
+    profile = Profile(
+        id=PROFILE_ID,
+        name="Test Profile",
+        search=SearchConfig(
+            queries=["Lenovo ThinkPad T14"],
+            filters={},
+            poll=PollConfig(sort="newlyListed"),
+        ),
+    )
+    stats = CollectorStats()
+
+    await run_sweep_cycle(provider, profile, budget, conn, stats)
+
+    assert provider.calls[0][3] is None
 
 
 def test_sweep_coverage_gap_logs_warning(tmp_path, caplog):

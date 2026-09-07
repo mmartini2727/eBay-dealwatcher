@@ -1,12 +1,15 @@
 """eBay Browse API client - item_summary/search only.
 
-Deliberately thin: no Listing model here, no sort/date-filter logic - just
-params in, raw itemSummaries out; normalization and the collector loop live
-elsewhere. search() never sends a `sort` parameter, despite
-`search.poll.sort: newlyListed` existing in profiles/*.yaml (schema.py) -
-that field is currently unused. Wiring it (and reasoning through what it
-would change for a sweep vs. a fast poll) is V0.8e's job, with its own
-before/after measurement, not something to add here quietly.
+Deliberately thin: no Listing model here, no date-filter logic - just params
+in, raw itemSummaries out; normalization and the collector loop live
+elsewhere. search() takes an optional `sort` keyword (V0.8e, design.md's
+dated entry) and sends it verbatim as eBay's `sort` query param when given -
+it does not read `profile.search.poll.sort` itself. Confirmed live via
+scripts/probe_sort.py that eBay honors `sort=newlyListed` (a 50-item page's
+itemCreationDate spread collapsed from ~9 months to under 3 days) before
+this was wired at all. Callers decide whether to pass it: the fast poll does
+(engine/collector.py's run_fast_poll_cycle), the sweep deliberately does not
+- see that function's comment for why.
 """
 
 import asyncio
@@ -75,6 +78,7 @@ class EbayBrowseProvider(MarketplaceProvider):
         *,
         limit: int = 50,
         max_pages: int = 1,
+        sort: str | None = None,
     ) -> list[dict]:
         filter_string = build_filter_string(profile.search.filters)
         results: list[dict] = []
@@ -89,6 +93,12 @@ class EbayBrowseProvider(MarketplaceProvider):
                 params["filter"] = filter_string
             if profile.search.category_ids:
                 params["category_ids"] = ",".join(profile.search.category_ids)
+            # Absent, not empty-string, when sort is None - eBay's default
+            # relevance ordering and "sort key present but empty" are not
+            # guaranteed to behave the same, and this has only been tested
+            # against the former (scripts/probe_sort.py).
+            if sort:
+                params["sort"] = sort
 
             try:
                 payload = await self._request(params)

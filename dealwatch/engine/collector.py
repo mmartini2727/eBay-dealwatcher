@@ -284,7 +284,11 @@ async def run_fast_poll_cycle(
     for query in profile.search.queries:
         try:
             raw_items = await provider.search(
-                profile, query, limit=FAST_POLL_PAGE_LIMIT, max_pages=1
+                profile,
+                query,
+                limit=FAST_POLL_PAGE_LIMIT,
+                max_pages=1,
+                sort=profile.search.poll.sort,
             )
         except BudgetExhausted:
             # Expected, not exceptional (see module docstring / design.md
@@ -356,6 +360,15 @@ async def run_sweep_cycle(
 
     for query in profile.search.queries:
         try:
+            # No sort=... here, deliberately (V0.8e, design.md's dated
+            # entry). `poll.sort` is a fast-poll discovery-latency knob, not
+            # a sweep-ordering one - the sweep exists to enumerate the full
+            # active set, and this call must never read
+            # profile.search.poll.sort itself. If search() ever grew a
+            # fallback to profile.search.poll.sort when no sort kwarg is
+            # given, the sweep's result ordering would silently change too,
+            # entangled with the fetched/distinct coverage metric V0.8d just
+            # started recording (the `sweeps` table).
             raw_items = await provider.search(
                 profile,
                 query,

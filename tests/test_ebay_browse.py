@@ -221,6 +221,68 @@ async def _pagination_fetches_until_a_short_page(tmp_path):
     await search_client.aclose()
 
 
+def test_search_without_sort_sends_no_sort_param(tmp_path):
+    run(_search_without_sort_sends_no_sort_param(tmp_path))
+
+
+async def _search_without_sort_sends_no_sort_param(tmp_path):
+    # This proves search() constructs the request correctly when sort is
+    # None (the default, and what the sweep passes) - not that eBay treats
+    # an absent sort any particular way. Only scripts/probe_sort.py against
+    # the live API proves that.
+    token_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(counting_token_handler([]))
+    )
+    tm = TokenManager(make_settings(tmp_path), client=token_client)
+
+    captured: list[httpx.Request] = []
+
+    def search_handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, json={"itemSummaries": []})
+
+    search_client = httpx.AsyncClient(transport=httpx.MockTransport(search_handler))
+    settings = make_settings(tmp_path)
+    budget = DailyBudget(settings)
+    provider = EbayBrowseProvider(settings, tm, budget, client=search_client)
+
+    await provider.search(make_profile(), "Lenovo ThinkPad T14", sort=None)
+
+    assert "sort" not in captured[0].url.params
+
+    await token_client.aclose()
+    await search_client.aclose()
+
+
+def test_search_with_sort_sends_the_sort_param(tmp_path):
+    run(_search_with_sort_sends_the_sort_param(tmp_path))
+
+
+async def _search_with_sort_sends_the_sort_param(tmp_path):
+    token_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(counting_token_handler([]))
+    )
+    tm = TokenManager(make_settings(tmp_path), client=token_client)
+
+    captured: list[httpx.Request] = []
+
+    def search_handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, json={"itemSummaries": []})
+
+    search_client = httpx.AsyncClient(transport=httpx.MockTransport(search_handler))
+    settings = make_settings(tmp_path)
+    budget = DailyBudget(settings)
+    provider = EbayBrowseProvider(settings, tm, budget, client=search_client)
+
+    await provider.search(make_profile(), "Lenovo ThinkPad T14", sort="newlyListed")
+
+    assert captured[0].url.params["sort"] == "newlyListed"
+
+    await token_client.aclose()
+    await search_client.aclose()
+
+
 def test_budget_exhausted_mid_pagination_returns_partial_results(tmp_path):
     run(_budget_exhausted_mid_pagination_returns_partial_results(tmp_path))
 
