@@ -309,11 +309,33 @@ Indexes: `observations(item_id, observed_at)`, `listings(bucket_key, gone_at)`.
 These are load-bearing. Getting them wrong produces a database that looks correct and is not.
 
 - **Only the sweep writes `last_seen`.** The 5-minute poll uses
-  `sort=newlyListed` with an `itemStartDate` filter and returns only what is
-  new. A listing absent from that result set has told you *nothing*. If the
-  collector treats fast-poll absence as absence, it will mark every existing
-  listing gone within five minutes of starting — and the rows will still land
-  and the lifespans will still compute.
+  `sort=newlyListed` alone (V0.8e; no `itemStartDate` filter — see below) and
+  returns a fixed-size page of the current newest listings, not "only what's
+  new since the last poll." A listing absent from that page has told you
+  *nothing* — it's a small, constantly-shifting slice of the active set, not
+  the full one. If the collector treats fast-poll absence as absence, it will
+  mark every existing listing gone within five minutes of starting — and the
+  rows will still land and the lifespans will still compute.
+- **`itemStartDate` filtering was designed and deliberately not built.** The
+  original polling design here and in §7 called for `sort=newlyListed`
+  combined with an `itemStartDate:[<last poll>..now]` filter, so each poll
+  would return only listings created since the previous one. It was never
+  implemented; V0.8e's probe-then-wire process built `sort=newlyListed` alone
+  instead. Reason: a time-window filter needs a persisted checkpoint of "when
+  did the last poll actually run" to compute its lower bound, and this
+  collector deliberately keeps `CollectorStats` in-memory only (its own
+  docstring: "a restart losing them is fine"). After a restart, a crash, or
+  any other gap in the poll loop, a naive `itemStartDate` filter would either
+  need that missing checkpoint or fall back to a fixed lookback window — and
+  an outage longer than that window silently drops the listings created
+  during it, with no signal anything was missed, because the very next
+  poll's filter starts counting from *now*, not from before the gap.
+  `sort=newlyListed`'s fixed-size, checkpoint-free page has no such failure
+  mode: whatever the gap was, the next poll just sees "the current newest N,"
+  and coverage self-heals with no state to lose. Do not re-add the date
+  filter later without re-deriving this trade-off — it looks like a strict
+  improvement (narrower, more relevant pages) and is actually a regression on
+  outage recovery.
 - **N consecutive sweep misses before `gone_at`.** eBay's search index is not
   perfectly consistent; listings drop out of a sweep and return. Setting
   `gone_at` on first absence manufactures short lifespans, which land in exactly
@@ -909,8 +931,12 @@ Build the budget tracker at V0.3, not later. Requirements:
 
 Polling strategy:
 
-- `sort=newlyListed` with `filter=itemStartDate:[...]` so each poll returns only
-  what appeared since the last one. Usually one page, one call.
+- `sort=newlyListed`, no date filter (V0.8e — see §4.2's note on why an
+  `itemStartDate` filter was designed and deliberately not built). Each poll
+  fetches a fixed-size page of the current newest listings; at a measured
+  in-band arrival rate of ~9/day (§4.5), a 50-item page holds roughly five
+  days of new inventory, comfortably covering the interval between polls
+  without a time-window filter. Usually one page, one call.
 - A separate slower sweep (hourly, deeper pagination) refreshes the full active
   set so disappearance tracking stays accurate.
 - ~5 minutes is the useful polling floor — good ThinkPad deals are taken in

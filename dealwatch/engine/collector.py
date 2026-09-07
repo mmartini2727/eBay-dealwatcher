@@ -52,12 +52,21 @@ from dealwatch.storage.sqlite import (
 logger = logging.getLogger(__name__)
 
 # The fast poll is NOT itemStartDate-filtered - the profile sets no such
-# filter and search() has no code path that would add one (V0.8d - this
-# comment previously claimed otherwise). It re-fetches page one of the same
-# query every interval_minutes and relies on record_sighting's own dedup
-# (unchanged fields -> no new observation) to stay cheap. One page is a
-# fixed cost choice, not a guarantee that only new listings come back -
-# unlike the sweep's page size/depth (V0.7c: profile.search.poll.
+# filter and search() has no code path that would add one. A date filter was
+# designed (design.md §4.2/§7) and deliberately not built: it would need a
+# persisted checkpoint of "when did the last poll run," and this collector
+# deliberately keeps CollectorStats in-memory only - see design.md §4.2 for
+# why that makes a time-window filter an outage-recovery hazard. Instead
+# this re-fetches page one of sort=newlyListed (V0.8e) every
+# interval_minutes and relies on record_sighting's own dedup (unchanged
+# fields -> no new observation) to stay cheap.
+#
+# 50 is sized against measured listing creation rate, not against a filter
+# that was never built: in-band arrivals run ~9/day (design.md §4.5), so a
+# 50-item page holds roughly five days of new inventory - comfortably more
+# than one interval_minutes gap, restart or no restart. One page is a fixed
+# cost choice, not a guarantee that only new listings come back - unlike
+# the sweep's page size/depth (V0.7c: profile.search.poll.
 # sweep_page_limit/sweep_max_pages, since those must track the active set),
 # this stays a plain constant regardless of active-set size.
 FAST_POLL_PAGE_LIMIT = 50
