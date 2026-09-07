@@ -429,6 +429,86 @@ fast sale, forever. Neither finding retroactively cleans existing
 a backfill + recompute decision for whoever runs it, informed by these two
 fixes, not something to do quietly alongside the code change).
 
+**Correction (2026-09-07): the pagination-drift estimate above was wrong, by
+a lot, and for two separable reasons.** Recorded here in full, on purpose —
+the decision it fed into turned out to still be right, and the way that
+happened is the more useful thing to have on file six months from now than a
+clean derivation would be.
+
+First recorded row in the new `sweeps` table (2026-09-07 04:20:16 UTC):
+`fetched_count=1034`, `distinct_count=1029`, `active_count_before=1039`,
+`truncated=0`. That's 5 duplicate rows out of 1034 fetched (0.48%) and a
+coverage gap of 10 against 1039 expected (0.96%) — not the ~6% claimed above,
+an overstatement of roughly 6×. This is **n=1**, not a distribution: the
+earlier log-derived coverage warning showed 987 distinct against 1049
+expected (5.9%), so there is real sweep-to-sweep variance not yet
+characterized. `truncated=0` at 1034 items also retires the
+pagination-horizon concern (`sweep_page_limit`/`sweep_max_pages` sizing) for
+now — the sweep is nowhere near the 2,000-item ceiling.
+
+*Error 1 — the page count.* The estimate divided 155 sweep requests by an
+assumed 22 sweeps/day to get ~7 pages per sweep, then reasoned 6 full pages
+of 200 plus a partial → ~1,200+ rows fetched against 987 distinct → ~250
+implied duplicates. The 22 came from 262 poll requests ÷ 12/hour ≈ a
+21.8-hour log window, which assumes the poll ran continuously — it didn't:
+the container was restarted repeatedly during that session, and each restart
+fires an immediate sweep, so the true sweep count for that window was higher
+than the elapsed-hours estimate implied. The real figure is 6 pages per
+sweep (5 full plus a ~34-item tail) and ~26 sweeps, not 22 — fetched is
+~1,034, not ~1,200+, and the implied duplicate count collapses from ~250 to
+~5.
+
+*Error 2 — the independence assumption, which matters more.* The derivation
+modeled misses as independent per listing per sweep: `0.06³ × 1000 × 22 ≈
+4.7/day` against an observed resurrection rate of 4/day looked like
+validation. It wasn't. Substituting the real ~1% per-sweep miss rate into
+the same independent-miss model predicts `0.01³ × 1000 × 22 ≈ 0.022/day` —
+the model over-predicts by roughly 170× once given a correct input. The
+original "match" was two wrong numbers canceling: a miss rate 6× too high
+landing near the observed value by coincidence, not because the model was
+right.
+
+The implication is the actual finding: **misses are strongly correlated,
+not independent.** A ~1% per-sweep miss rate cannot produce 4 false
+deaths/day under an independence assumption — the same listings must be
+getting missed repeatedly, consistent with low-relevance items ranking low
+in every sweep rather than being randomly dropped each time. That also
+bounds what `MISS_THRESHOLD` 3→5 actually buys: under independence it would
+be the claimed ~250× reduction; under correlation, a systematically
+low-ranked listing misses five consecutive sweeps almost as readily as
+three, so the real reduction is unknown and probably much smaller. **The
+decision to raise `MISS_THRESHOLD` is still correct** — it costs nothing
+given `gone_at = last_seen` (§4.2) and strictly reduces false deaths
+regardless of the correlation structure — but it is now understood to be
+empirically-motivated-and-probably-helpful, not
+arithmetically-derived-and-quantified. Whether it actually worked is a
+question for the resurrection-rate trend over the next 24–48 hours, not for
+this arithmetic.
+
+**This also retracts the implied case for V0.8e.** This section as
+originally written reads as if eBay's relevance-ordering pagination is a
+meaningful failure source, with the natural next step being to stabilize it
+by sorting the sweep on `newlyListed`. The measured 0.48% duplicate rate says
+pagination drift is not a meaningful problem at current listing volumes.
+Sorting by `newlyListed` may still be worth doing, but as a
+discovery-latency improvement for V0.9's alerting (finding new listings
+faster), not as a data-integrity fix — there is no longer a pagination-drift
+case for it.
+
+**Code:** `be63c18` (the collector.py half of V0.8d — `run_sweep_cycle`
+restructuring, `store_sweep_stats` call sites, `_raw_only_listing_fields`),
+`8266e16` (the rest — `storage/sqlite.py` migration 5 and the original
+`MISS_THRESHOLD` derivation, `engine/baselines.py`'s variation exclusion,
+`normalize/listing.py`'s `parse_variation_id`, and this section as
+originally written), `4fbdc07` (test hardening — the migration-5
+backfill-vs-`parse_variation_id` coverage across item_id shapes, and the
+`active_count_before` seeding fix in the early-budget-exhaustion sweeps
+test). Note for anyone using `git log` to find this work later: `be63c18`
+and `8266e16` are committed under the messages "Snapshot script
+implementation" and "Snapshot script for dealwatch" — both about an
+unrelated shell script that happened to land in the same commits, not V0.8d.
+Searching `git log` for "V0.8d" alone finds only `4fbdc07`.
+
 ---
 
 ## 5. Normalization — the actual hard part
