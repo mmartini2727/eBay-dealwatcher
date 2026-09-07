@@ -429,87 +429,207 @@ fast sale, forever. Neither finding retroactively cleans existing
 a backfill + recompute decision for whoever runs it, informed by these two
 fixes, not something to do quietly alongside the code change).
 
-**Correction (2026-09-07): the pagination-drift estimate above was wrong, by
-a lot, and for two separable reasons.** Recorded here in full, on purpose —
-the decision it fed into turned out to still be right, and the way that
-happened is the more useful thing to have on file six months from now than a
-clean derivation would be.
+### V0.8d correction — the derivation was wrong, the decision was not
 
-First recorded row in the new `sweeps` table (2026-09-07 04:20:16 UTC):
-`fetched_count=1034`, `distinct_count=1029`, `active_count_before=1039`,
-`truncated=0`. That's 5 duplicate rows out of 1034 fetched (0.48%) and a
-coverage gap of 10 against 1039 expected (0.96%) — not the ~6% claimed above,
-an overstatement of roughly 6×. This is **n=1**, not a distribution: the
-earlier log-derived coverage warning showed 987 distinct against 1049
-expected (5.9%), so there is real sweep-to-sweep variance not yet
-characterized. `truncated=0` at 1034 items also retires the
-pagination-horizon concern (`sweep_page_limit`/`sweep_max_pages` sizing) for
-now — the sweep is nowhere near the 2,000-item ceiling.
+The `MISS_THRESHOLD` 3→5 change was justified by an independent-miss model:
+a ~6% per-sweep miss rate, so 0.06^3 x 1000 listings x 22 sweeps/day = 4.7
+false deaths/day, against 4 observed. The agreement looked like validation.
+It was coincidence. Two errors, one compounding the other.
 
-*Error 1 — the page count.* The estimate divided 155 sweep requests by an
-assumed 22 sweeps/day to get ~7 pages per sweep, then reasoned 6 full pages
-of 200 plus a partial → ~1,200+ rows fetched against 987 distinct → ~250
-implied duplicates. The 22 came from 262 poll requests ÷ 12/hour ≈ a
-21.8-hour log window, which assumes the poll ran continuously — it didn't:
-the container was restarted repeatedly during that session, and each restart
-fires an immediate sweep, so the true sweep count for that window was higher
-than the elapsed-hours estimate implied. The real figure is 6 pages per
-sweep (5 full plus a ~34-item tail) and ~26 sweeps, not 22 — fetched is
-~1,034, not ~1,200+, and the implied duplicate count collapses from ~250 to
-~5.
+**Page-count error.** The 6% came from dividing 155 sweep requests by an
+assumed 22 sweeps to get 7 pages per sweep, implying ~1,200 rows fetched
+against 987 distinct. The 22 assumed the poll ran continuously; the container
+was restarted repeatedly that session and each restart fires an immediate
+sweep. The real figure is 6 pages per sweep and ~26 sweeps.
 
-*Error 2 — the independence assumption, which matters more.* The derivation
-modeled misses as independent per listing per sweep: `0.06³ × 1000 × 22 ≈
-4.7/day` against an observed resurrection rate of 4/day looked like
-validation. It wasn't. Substituting the real ~1% per-sweep miss rate into
-the same independent-miss model predicts `0.01³ × 1000 × 22 ≈ 0.022/day` —
-the model over-predicts by roughly 170× once given a correct input. The
-original "match" was two wrong numbers canceling: a miss rate 6× too high
-landing near the observed value by coincidence, not because the model was
-right.
+**Independence error, and this is the substantive one.** Direct measurement
+from the `sweeps` table (14 sweeps, 2026-09-07) gives mean coverage 0.979,
+worst 0.933, max duplicates 11 per sweep. First recorded row: fetched 1034,
+distinct 1029, active_before 1039, truncated 0. So the real miss rate is ~2%,
+not 6%. Substituted into the same model it predicts 0.024 false deaths/day
+against ~2 observed — over-predicting by roughly two orders of magnitude when
+given a correct input.
 
-The implication is the actual finding: **misses are strongly correlated,
-not independent.** A ~1% per-sweep miss rate cannot produce 4 false
-deaths/day under an independence assumption — the same listings must be
-getting missed repeatedly, consistent with low-relevance items ranking low
-in every sweep rather than being randomly dropped each time. That also
-bounds what `MISS_THRESHOLD` 3→5 actually buys: under independence it would
-be the claimed ~250× reduction; under correlation, a systematically
-low-ranked listing misses five consecutive sweeps almost as readily as
-three, so the real reduction is unknown and probably much smaller. **The
-decision to raise `MISS_THRESHOLD` is still correct** — it costs nothing
-given `gone_at = last_seen` (§4.2) and strictly reduces false deaths
-regardless of the correlation structure — but it is now understood to be
-empirically-motivated-and-probably-helpful, not
-arithmetically-derived-and-quantified. Whether it actually worked is a
-question for the resurrection-rate trend over the next 24–48 hours, not for
-this arithmetic.
+Misses are therefore **strongly correlated, not independent**: the same
+listings are missed sweep after sweep, consistent with low-relevance items
+ranking below the pagination cutoff every time. Confirmed post-V0.8e by
+`v1|307026418852|0`, which missed five consecutive sweeps — a
+three-in-a-billion event under independence.
 
-**This also retracts the implied case for V0.8e.** This section as
-originally written reads as if eBay's relevance-ordering pagination is a
-meaningful failure source, with the natural next step being to stabilize it
-by sorting the sweep on `newlyListed`. The measured 0.48% duplicate rate says
-pagination drift is not a meaningful problem at current listing volumes.
-Sorting by `newlyListed` may still be worth doing, but as a
-discovery-latency improvement for V0.9's alerting (finding new listings
-faster), not as a data-integrity fix — there is no longer a pagination-drift
-case for it.
+`MISS_THRESHOLD = 5` remains correct: it costs nothing given
+`gone_at = last_seen`, and it strictly reduces false deaths. But it is
+**empirically justified, not arithmetically derived**, and it buys far less
+against correlated misses than 0.02^5 would suggest.
 
-**Code:** `be63c18` (the collector.py half of V0.8d — `run_sweep_cycle`
-restructuring, `store_sweep_stats` call sites, `_raw_only_listing_fields`),
-`8266e16` (the rest — `storage/sqlite.py` migration 5 and the original
-`MISS_THRESHOLD` derivation, `engine/baselines.py`'s variation exclusion,
-`normalize/listing.py`'s `parse_variation_id`, and this section as
-originally written), `4fbdc07` (test hardening — the migration-5
-backfill-vs-`parse_variation_id` coverage across item_id shapes, and the
-`active_count_before` seeding fix in the early-budget-exhaustion sweeps
-test). Note for anyone using `git log` to find this work later: `be63c18`
-and `8266e16` are committed under the messages "Snapshot script
-implementation" and "Snapshot script for dealwatch" — both about an
-unrelated shell script that happened to land in the same commits, not V0.8d.
-Searching `git log` for "V0.8d" alone finds only `4fbdc07`.
+**Pagination-drift hypothesis retired.** The earlier claim that
+relevance-ordered pagination was causing the sweep to skip listings, and that
+a stable sort key would stabilise it, is not supported. 5 duplicates in 1034
+fetched rows. Pagination is fine. `truncated = 0` at 1034 items also confirms
+the sweep is nowhere near the 2,000-item horizon, closing that concern.
 
-### 4.5 V0.8e — wiring `poll.sort` (discovery latency, not data integrity) (2026-09-07)
+Commits: `be63c18` (collector.py), `8266e16` (storage, normalize, baselines,
+docs), `4fbdc07` (test hardening). Note that the first two are labelled
+"Snapshot script implementation" and "Snapshot script for dealwatch"; the
+commit messages do not describe V0.8d and `git log` will not lead here.
+
+### 4.5 V0.8e — wire poll.sort
+
+Deployed 2026-09-07T05:25:11Z (epoch 1788758711).
+
+#### The gap
+
+`profiles/thinkpad-t14.yaml` set `poll.sort: newlyListed`. `PollConfig` had
+the field. `EbayBrowseProvider.search()` never sent it. The field was read by
+nothing. Confirmed from production request URLs. The fast poll was fetching
+page one of relevance ordering, not the newest 50.
+
+#### Measured cost, before the fix
+
+Discovery latency from `itemCreationDate` in stored `raw_json`, restricted to
+listings created during the observation window (n=329):
+
+| bucket | count | avg |
+|---|---|---|
+| <10m | 160 | 6 min |
+| <65m | 158 | 34 min |
+| <6h  | 7   | 96 min |
+| <24h | 3   | 756 min |
+| >24h | 1   | 2218 min |
+
+Roughly half of new listings already landed on relevance page one unaided —
+eBay gives new listings a temporary ranking boost. The other half waited for
+the hourly sweep.
+
+#### Probe, 2026-09-07 (decision gate before wiring)
+
+Same query, two calls seconds apart:
+
+```
+--- unsorted (production behaviour at the time) ---
+count returned : 50
+total (envelope): 1033
+itemCreationDate : n=50/50  min=2025-12-09T21:02:50Z
+                   median=2026-09-01T22:20:37Z  max=2026-09-07T04:51:34Z
+
+--- sort=newlyListed ---
+count returned : 50
+total (envelope): 1007
+itemCreationDate : n=50/50  min=2026-09-04T15:34:09Z
+                   median=2026-09-05T18:23:18Z  max=2026-09-07T04:51:34Z
+
+symmetric difference of item_id sets: 74
+```
+
+eBay honours the parameter. Relevance page one spanned nine months; sorted
+page one spanned 61 hours. The two sets shared only 13 items, so 37 of the 50
+newest listings were absent from relevance page one — independent
+corroboration of the latency histogram. Both lists shared the same max
+creation date, confirming the new-listing relevance boost.
+
+#### The change
+
+`search()` takes a keyword-only `sort: str | None = None`, added to `params`
+only when truthy. `run_fast_poll_cycle` passes `profile.search.poll.sort`;
+`run_sweep_cycle` passes nothing. The sort field lives under `poll` and the
+sweep must not inherit it — if `search()` read the profile itself, the
+sweep's result ordering would silently change and entangle with the coverage
+metric. Verified in production: poll URLs carry `sort=newlyListed`, zero
+`limit=200` (sweep) URLs carry `sort=`.
+
+#### Consequences
+
+**Lifespan discontinuity at 2026-09-07T05:25:11Z.** Catching listings ~28
+minutes earlier makes every post-cutover lifespan that much longer than a
+pre-cutover measurement of the same true lifespan. Against
+`fast_lifespan_hours=24` that is ~2%; against a listing that genuinely sells
+in 90 minutes it is ~30%, and short-lived listings are exactly the population
+the survival signal is built on. Any baseline recompute spanning this date is
+mixing two measurement regimes.
+
+**Poll page one is now "the 50 newest," not "the 50 most relevant."**
+5-minute price-change resolution is lost on relevance-popular older listings;
+they fall back to hourly via the sweep. Scoring uses the final observation, so
+hourly is sufficient.
+
+**Most poll cycles will now produce zero new observations.** In-band arrival
+rate (price 80..2000) measured at ~4 per 11 hours, ~9/day, so a 50-item page
+holds roughly five days of new inventory. Expected behaviour, not a
+regression.
+
+#### Early result
+
+n=3 over 11 hours post-cutover, all under 10 minutes, avg 6 — the ~34-minute
+band is empty. Directionally right but far too thin to conclude; at ~9
+arrivals/day this needs three to four days.
+
+Commits: `63716a9` (probe script), `aeb2956` (wiring: `search()`'s `sort`
+keyword, `run_fast_poll_cycle`/`run_sweep_cycle`, `providers/ebay.py`'s
+docstring).
+
+### 4.6 eBay Browse API — empirical findings (2026-09-07)
+
+Observations from the V0.8e probe and post-deploy verification that don't
+belong to either milestone specifically — general facts about the API worth
+not re-discovering later.
+
+- **`total` is unreliable.** Same query and filters, two calls seconds apart:
+  1033 unsorted, 1007 with `sort=newlyListed`. 26 listings cannot have ended
+  in that window. `total` is approximate and varies with sort — it cannot
+  serve as the denominator for the coverage check. (An earlier note suggesting
+  it as the "honest denominator" is retracted.)
+- **`sort=newlyListed` is honoured** and materially changes result
+  composition: creation-date range on a 50-item page collapsed from nine
+  months to 61 hours.
+- **No hidden inventory.** `total` (1007–1033) sits against
+  `active_count_before` 1039 and `distinct_count` 1029. The sweep sees
+  essentially the whole matching set.
+- **`query_exclude` is not wired.** `profiles/thinkpad-t14.yaml` sets it
+  (`T14s`, `dock`, `palmrest`) but production request URLs show a bare
+  `q=Lenovo ThinkPad T14`. Same never-wired pattern as `poll.sort`. Not yet
+  triaged.
+
+### 4.7 Open: false deaths from persistent sweep invisibility (candidate V0.8f)
+
+~2 resurrections/day post-V0.8e, roughly half of them non-variation. These
+are lower bounds — a listing wrongly marked gone that never re-enters the
+sweep's visible window leaves no trace, and the per-observation storage model
+records sightings only on change, so there is no per-sweep presence history to
+reconstruct from.
+
+Five non-variation false deaths examined: three `spec_status='ok'` with real
+buckets (`1|intel-10th|16`, `1|intel-10th|32` x2), one `partial` (`?|?|16`),
+one `rejected` (no bucket). Against a live-population base rate of 47.7% `ok`
+(492 ok / 131 partial / 382 rejected / 27 not_target), `ok` listings are if
+anything over-represented. The hypothesis that false deaths concentrate on
+rejected non-target junk is **not supported** — they hit real targets,
+including one of the two computed baselines.
+
+The three `ok` cases carried discarded lifespans of 7691, 7871 and 9149
+minutes (5–6 days), near the slow end rather than manufacturing fake fast
+sales. One sample; the mechanism does not guarantee that shape.
+
+Possible generation skew: the three `ok` cases were all intel-10th. If low
+relevance for `Lenovo ThinkPad T14` correlates with older generations, false
+deaths would concentrate in the buckets with the most history and least
+buying interest, leaving the Gen 5–6 AMD targets cleaner. Testable, not
+concluded — n=3.
+
+**Raising the counter further is not the fix.** Five consecutive misses at a
+~2% rate proves the misses are not independent. Two candidate approaches:
+
+1. **Fetch the item URL directly before declaring death.** One API call per
+   candidate, ~2/day against a 5,000/day budget. Gives a definitive live/dead
+   answer instead of inferring from absence. Simpler and strictly more
+   informative.
+2. Record per-sweep presence to distinguish scattered misses from persistent
+   invisibility. More storage and code, and it still only establishes
+   invisibility, not death.
+
+Option 1 is the intended approach.
+
+**Cheap enabler for V0.9:** add `bucket_key` and last observed price to the
+resurrection warning line. Two extra fields in a log line already being
+written; in a month it yields a real sample instead of five rows.
 
 `profiles/thinkpad-t14.yaml` has set `poll.sort: newlyListed` since it was
 written, `PollConfig` has carried the field since `schema.py`, and
