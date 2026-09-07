@@ -535,11 +535,15 @@ seed_baselines:
   # bucket_key itself.)
   # ----------------------------------------------------------
 
-  # Real-data calibration anchor.
-  # Computed fast-sale baseline ~= p25 $229.50 / p50 $249.
+  # Real-data calibration anchor. Re-anchored 2026-09-07 (CLAUDE.md open
+  # items / design.md §5.6): the 230/250 above was set against a stale
+  # computed p50 of $249 (n small at the time); post-backfill recompute now
+  # gives p25 $215.00 / p50 $244.90 (n=24) - this IS the ground truth this
+  # whole chart's semantics are anchored to, so it takes the computed
+  # numbers exactly, not a rounded approximation of them.
   - match: {generation: "2", cpu_family: intel-11th, ram_tier: "16"}
-    p25: 230
-    p50: 250
+    p25: 215.00
+    p50: 244.90
 
   - match: {generation: "3", cpu_family: amd-ryzen-6000, ram_tier: "32"}
     p25: 390
@@ -585,10 +589,56 @@ seed_baselines:
 
 
   # ----------------------------------------------------------
+  # Generation-only bridge (2026-09-07 audit) - the over-broad catch-all.
+  #
+  # Before this: a listing with a known generation but an unrecognized/
+  # bare cpu_family (the ~166-partial "Core i5"/"Ryzen 5" class, CLAUDE.md
+  # open items) fell all the way to the single flat {} catch-all below -
+  # 200/250 regardless of whether it was a $200 Gen 1 or an $800 Gen 6
+  # machine. Against a Gen 6 listing that would score as a screaming deal
+  # at literally any real price; against a Gen 1 listing it would false-
+  # flag the sanity floor. resolve_seed_baseline() picks the entry with
+  # the MOST matched keys, so these generation-only entries only fire when
+  # cpu_family truly can't narrow it further - a listing with a real
+  # cpu_family still matches the 2-key entries above first, unaffected.
+  #
+  # Values are the plain average of that generation's two coarse
+  # (generation+cpu_family) entries above - a mechanical bridge, not a new
+  # data point. Same "estimate using fast-sale semantics" status as every
+  # other non-anchor number in this file; call it out for revision once
+  # this bucket shape has any real fast-sale data of its own.
+  # ----------------------------------------------------------
+
+  - match: {generation: "1"}
+    p25: 175
+    p50: 215
+
+  - match: {generation: "2"}
+    p25: 240
+    p50: 270
+
+  - match: {generation: "3"}
+    p25: 312.50
+    p50: 375
+
+  - match: {generation: "4"}
+    p25: 395
+    p50: 475
+
+  - match: {generation: "5"}
+    p25: 500
+    p50: 612.50
+
+  - match: {generation: "6"}
+    p25: 637.50
+    p50: 750
+
+  # ----------------------------------------------------------
   # Final catch-all
-  # Handles null/unknown cpu_family and anything else that fails
-  # to match a generation/family seed above.
-  # Keep LAST because {} matches everything.
+  # Handles null/unknown generation AND cpu_family - genuinely unmatched
+  # listings only, now that the generation-only bridge above absorbs every
+  # case where generation alone was known. Keep LAST because {} matches
+  # everything.
   # ----------------------------------------------------------
 
   - match: {}
