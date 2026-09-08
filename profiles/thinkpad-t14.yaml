@@ -663,7 +663,7 @@ alerts:
   # dry-run day IS the first-run guard (engine/alerting.py) - flipping this
   # to false does not fire on the ~1,000 already-active listings, only on
   # new listings and genuine price drops from that point on.
-  dry_run: true
+  dry_run: false
   trigger:
     # Tightened 1.00 -> 0.90 (2026-09-07). 1.00 means priced AT the
     # fast-sale quartile - fourth-cheapest in ten, not actually a deal, just
