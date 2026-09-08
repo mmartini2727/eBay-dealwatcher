@@ -128,6 +128,28 @@ lifespan resolution is one hour. A listing that appears and sells in twenty
 minutes records as ≤1h. Adequate for separating priced-to-sell from
 aspirational; finer resolution costs rate budget.
 
+**Known caveat: pre-2026-09-07 baselines may include component listings
+(2026-09-07).** Live dry-run scoring surfaced a bare T14 Gen 1 motherboard
+(`v1|389916775126|0`, $112.95) as the single best deal in the active set —
+it normalized to a whole-machine bucket (`1|amd-ryzen-4000|8`) and scored
+against a whole-machine baseline because no reject rule caught it. Root
+cause: `accessory`'s existing `motherboard`/`mainboard` terms (§5.1) were
+already being defeated by that same rule's `unless` clause, which exempts
+any title mentioning a CPU marker — added to stop Core Ultra whole-laptop
+listings from false-rejecting (see the `accessory` rule's own comment in
+`profiles/thinkpad-t14.yaml` for that history), but a board listing
+routinely names its own onboard CPU, so the exemption was silently
+admitting exactly the component listings those terms exist to catch. Fixed with a new unless-free `whole-component-or-board` reject rule
+(`profiles/thinkpad-t14.yaml`). Existing listings re-normalize on their next
+sighting, so any component listing already in the database flips to
+`spec_status='rejected'` on its next sweep — but its historical
+observations remain, and were already included in any `baselines` row
+computed before this fix landed. Those computed baselines may be slightly
+depressed by an unknown number of component listings that were live at
+recompute time. No action taken; this is a known caveat on existing
+`baselines` rows, not a retroactive cleanup - the next `recompute_baselines`
+run naturally excludes anything rejected by then.
+
 ### 2.2 Implication for build order
 
 The survival baseline needs weeks of accumulated history before it means

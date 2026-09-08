@@ -656,7 +656,13 @@ alerts:
   # new listings and genuine price drops from that point on.
   dry_run: true
   trigger:
-    max_ratio_to_p25: 1.00      # alert at or below the fast-sale quartile
+    # Tightened 1.00 -> 0.90 (2026-09-07). 1.00 means priced AT the
+    # fast-sale quartile - fourth-cheapest in ten, not actually a deal, just
+    # the price the ladder expects a normal fast sale to clear at. Live
+    # dry-run at 1.00 produced 14 alertable listings in the active set; at
+    # 0.90 it's 5. Loosening later is a one-line change if 5/day turns out
+    # too quiet.
+    max_ratio_to_p25: 0.90
   # The buying ceiling, distinct from search.filters.price above (a fetch
   # threshold - never truncate what gets collected). Read to decide whether
   # to alert at all, regardless of how good the deal score is. Kept at 1200
