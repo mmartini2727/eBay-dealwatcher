@@ -10,3 +10,5 @@ services:
     volumes:
       - ./data:/app/data
       - ./profiles:/app/profiles:ro
+    environment:
+      - TZ=America/Los_Angeles
