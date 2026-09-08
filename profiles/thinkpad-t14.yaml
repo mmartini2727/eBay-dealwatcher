@@ -111,6 +111,15 @@ reject:
       - '\bw/?o\s+(ram|ssd|hdd)\b'
     reason: "Drags bucket medians down hard; primary source of false alerts"
 
+  - id: whole-board
+    where: title
+    any:
+      - '\bmotherboard\b'
+      - '\bmainboard\b'
+      - '\bsystem\s+board\b'
+      - '\blogic\s+board\b'
+    reason: "Bare board, not a complete laptop"
+  
   - id: lot-listing
     where: title
     any:
