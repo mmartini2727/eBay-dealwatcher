@@ -671,7 +671,7 @@ alerts:
     # dry-run at 1.00 produced 14 alertable listings in the active set; at
     # 0.90 it's 5. Loosening later is a one-line change if 5/day turns out
     # too quiet.
-    max_ratio_to_p25: 1.05
+    max_ratio_to_p25: 0.90
   # The buying ceiling, distinct from search.filters.price above (a fetch
   # threshold - never truncate what gets collected). Read to decide whether
   # to alert at all, regardless of how good the deal score is. Kept at 1200
