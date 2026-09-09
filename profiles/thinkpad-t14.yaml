@@ -658,6 +658,11 @@ seed_baselines:
 # 8. ALERTS (V0.9)
 # ---------------------------------------------------------------------------
 alerts:
+  # Order-significant; each notifier is attempted independently, so one
+  # failing doesn't block the other. Dedup is notifier-agnostic on purpose
+  # (see design.md §11) - a Pushover outage must not re-fire alerts already
+  # delivered via Discord.
+  notifiers: [discord, pushover]
   webhook_env: DISCORD_WEBHOOK_DEALS
   # true until explicitly flipped: writes alerts rows, posts nothing. The
   # dry-run day IS the first-run guard (engine/alerting.py) - flipping this
