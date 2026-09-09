@@ -74,6 +74,14 @@ curl http://127.0.0.1:8087/health
 ```
 > **Note:** `period` is the LA date the counter belongs to; `ceiling` is `daily_call_limit - daily_reserve_calls`.
 
+`compose.yaml` sets `TZ=America/Los_Angeles` on the container — an IANA
+zone, not a fixed `PST` offset, so it tracks daylight saving automatically
+rather than drifting an hour off twice a year. This keeps the container's
+own clock aligned with the daily budget's midnight-Pacific reset (above)
+and makes `docker compose logs`/alert timestamps read in the same zone as
+"midnight Pacific" everywhere else in this project's docs, instead of
+requiring a UTC-to-Pacific conversion in your head every time.
+
 The application listens on port 8000 inside the container and is published as port 8087 on the Docker host.
 
 From the Docker LXC itself, the health endpoint can be reached at:
@@ -131,7 +139,7 @@ be recovered.
 | V0.6 | **Dumb collector loop — poll and persist, no scoring** | done |
 | V0.7 | ThinkPad T14 profile + normalize engine | done |
 | V0.8 | Scoring engine (a-e: baselines, scoring ladder, bucket_key, sweep/pagination data integrity, `poll.sort`) | done |
-| V0.9 | Discord alerts | done |
+| V0.9 | Discord alerts | done, live-verified 2026-09-08 |
 | V0.9a | Soldered-RAM buyability labeling (pulled out of V0.9 - design.md §5.7) | next |
 | V1.0 | MCP server (streamable HTTP, LAN only) | |
 

@@ -134,14 +134,33 @@ aspirational; finer resolution costs rate budget.
 it normalized to a whole-machine bucket (`1|amd-ryzen-4000|8`) and scored
 against a whole-machine baseline because no reject rule caught it. Root
 cause: `accessory`'s existing `motherboard`/`mainboard` terms (§5.1) were
-already being defeated by that same rule's `unless` clause, which exempts
-any title mentioning a CPU marker — added to stop Core Ultra whole-laptop
-listings from false-rejecting (see the `accessory` rule's own comment in
-`profiles/thinkpad-t14.yaml` for that history), but a board listing
+being defeated by that same rule's `unless` clause, which exempts any title
+mentioning a CPU marker — added to stop Core Ultra whole-laptop listings
+from false-rejecting (see the `accessory` rule's own comment in
+`profiles/thinkpad-t14.yaml` for that history) — but a board listing
 routinely names its own onboard CPU, so the exemption was silently
-admitting exactly the component listings those terms exist to catch. Fixed with a new unless-free `whole-component-or-board` reject rule
-(`profiles/thinkpad-t14.yaml`). Existing listings re-normalize on their next
-sighting, so any component listing already in the database flips to
+admitting exactly the component listings those terms exist to catch.
+
+**Correction to how that root cause was actually established**: an earlier
+version of this entry cited `explain.py`'s trace as showing `accessory`
+"matched but was suppressed by `unless:`" for the offending title. That
+overstates the evidence — the trace actually printed a plain `no match` for
+`accessory` on that title, which is exactly what it also prints for a rule
+that never matched at all. `explain.py` does not currently distinguish
+"the `any:` patterns never matched" from "they matched, and `unless:`
+suppressed it" — both collapse to the same `no match` line. That ambiguity
+is a real diagnostic gap in `explain.py` itself, and it is what sent the
+initial investigation down the wrong path before the root cause above was
+confirmed separately, by testing `accessory` against a bare title with the
+CPU mention removed and observing it fire correctly. Fix `explain.py` to
+print which branch a rule took (never-matched vs. matched-then-suppressed)
+before trusting its trace on a similar case again.
+
+Fixed with a new, unless-free `whole-board` reject rule
+(`profiles/thinkpad-t14.yaml`) — see §11's addendum for why it ships with
+only four board-synonym terms rather than the full component/chassis-part
+candidate list originally drafted. Existing listings re-normalize on their
+next sighting, so any component listing already in the database flips to
 `spec_status='rejected'` on its next sweep — but its historical
 observations remain, and were already included in any `baselines` row
 computed before this fix landed. Those computed baselines may be slightly
@@ -1115,6 +1134,23 @@ listings and genuine further price drops from that point forward. No
 separate backfill script exists for this, or is needed - a day of dry-run
 operation before flipping the flag is the backfill.
 
+**The cost of that guard, stated plainly so it doesn't read as a bug
+report in six months:** every listing in the dry-run backlog is marked
+seen **permanently**, not just for the first live cycle after the flip. A
+listing that alerted once (dry-run or real) at $250 and never moves again
+will never alert again at that same $250 - `cooldown_minutes` expires, but
+`realert_drop_pct` still requires a further drop below the price already on
+file, forever, for as long as that alert row remains the most recent one.
+This is not a bug: re-alerting on an unchanged price is exactly the noise
+the cooldown/re-alert gate exists to suppress. But it is the mechanism that
+made a live system with the alert cycle running, gates all passing, and
+`dry_run: false` set look like nothing was happening - every candidate
+listing already had a row on file from the dry-run day, and an unchanged
+price never clears the drop-required gate. Checking `alerts` table row
+counts (any `delivery_status`, not just `'sent'`) is the correct way to
+confirm the pipeline is alive; an empty Discord channel is not evidence of
+a broken pipeline on its own.
+
 ### The poll-vs-sweep split, and a correction
 
 The fast poll sees new listings (page one, `sort=newlyListed`, V0.8e); the
@@ -1142,3 +1178,65 @@ generation/vendor mapping needed to build it correctly has not been
 verified against Lenovo's own spec sheets. Labeling (rendering the
 attribute in the alert body once `derive:` produces it) ships in a future
 V0.9a; suppressing anything on an unverified guess does not.
+
+### Live-verification addendum (2026-09-08)
+
+**Sweep timing is an interval loop from container start, not a wall-clock
+schedule.** `_sweep_loop`/`_fast_poll_loop` (`engine/collector.py`) each run
+their first cycle immediately when the task starts, then `asyncio.sleep`
+for `sweep_interval_minutes`/`interval_minutes` before the next one - there
+is no anchor to the wall clock (no "always at :00 past the hour"). Two
+consequences worth having on file: the sweep fires immediately on boot,
+not after waiting out its first interval, and **every container restart
+resets the phase** - a sweep that had settled into running at :15 past the
+hour will run at whatever minute the container happened to come back up at,
+and stay there until the next restart. Nothing depends on sweep phase
+today, but a future feature that assumes "the sweep runs on a stable
+schedule" would be assuming something this loop does not guarantee.
+
+**Diagnostic gap confirmed in `explain.py`.** See §2.1's corrected caveat
+entry above - `explain.py`'s trace prints `no match` for a reject rule
+whether its `any:` patterns never matched at all, or they matched and were
+then suppressed by an `unless:` clause. Those are different facts and the
+trace currently can't tell them apart, which cost real diagnostic time
+tracking down the motherboard false-alert above. Not fixed in this
+milestone; noted for whoever next touches `normalize/explain.py`.
+
+**Open item: `accessory`'s `unless: \b(laptop|notebook)\b` is itself
+over-broad.** It exists so a whole-laptop listing that happens to mention
+an accessory word ("T14 laptop with dock included") isn't wrongly
+rejected - but the bare word "laptop" anywhere in the title is sufficient
+to trigger it, including inside a seller's own cross-listing boilerplate.
+A real title observed during this verification pass: `"... Motherboard
+Laptop ..."` - a seller describing a laptop motherboard, using "laptop" as
+a descriptive adjective for what kind of motherboard it is, not asserting
+the listing is a complete laptop. That title's `accessory` match on
+`motherboard` gets exempted by the `unless:` clause for exactly the wrong
+reason. The new `whole-board` rule (below) has no such `unless:` and
+catches this specific title correctly regardless, so it is not an active
+false-negative today - but `accessory`'s own `unless:` remains
+over-broad for any future term added to that rule's `any:` list, and
+should be tightened (e.g. requiring "laptop"/"notebook" to appear away
+from a board/part term, not just anywhere in the title) before it is
+trusted again on its own.
+
+**Why `whole-board` shipped with four terms, not the thirteen originally
+drafted.** The candidate list floated for the new rule (`profiles/
+thinkpad-t14.yaml`'s Task 1 draft) included `palmrest`, `top cover`,
+`bottom cover`, `lcd assembly`, `screen assembly`, `bezel`, `heatsink`,
+`hinge`, and `ribbon cable` alongside `motherboard`/`mainboard`/`system
+board`/`logic board`. Validated against live collected titles (Task 2),
+every one of those nine non-board terms returned **zero matches** across
+the active set; `motherboard`/`mainboard`/`system board`/`logic board`
+were the only terms that actually appeared. Reason, not coincidence: this
+profile's search is scoped to eBay category 177 (PC Laptops & Netbooks) -
+bare chassis/cosmetic parts (a palmrest, a bezel, a heatsink) are
+overwhelmingly listed under Laptop Replacement Parts or similar categories
+instead, so they mostly never enter this profile's result set at the API
+level, before any reject rule gets a chance to run. `accessory`'s existing
+`palmrest`/`bezel`/`heatsink`/`hinge` terms are not proven dead code by
+this - they may still be pulling weight against listings that entered via
+`query_exclude`-missed or cross-category edge cases - but there is no live
+evidence today that `whole-board` needs its own copies of them. Recorded
+here specifically so nobody re-adds the dropped nine to `whole-board`
+speculatively without re-running the same live-title check first.
