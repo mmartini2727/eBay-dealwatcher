@@ -12,6 +12,7 @@ CLAUDE.md) - no test in this file makes a real HTTP call.
 import asyncio
 import json
 
+import pydantic
 import pytest
 
 from dealwatch.engine import alerting
@@ -137,6 +138,74 @@ def test_resolve_webhook_url_raises_when_env_var_is_empty(monkeypatch):
     profile = make_profile()
     with pytest.raises(ProfileCompileError):
         alerting.resolve_webhook_url(profile)
+
+
+# ---------------------------------------------------------------------------
+# resolve_notifier_credentials (V0.9a)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_notifier_credentials_returns_empty_dict_without_an_alerts_block():
+    profile = make_profile(alerts=None)
+    assert alerting.resolve_notifier_credentials(profile) == {}
+
+
+def test_resolve_notifier_credentials_returns_empty_dict_for_an_empty_notifiers_list():
+    profile = make_profile(alerts=make_alerts_config(notifiers=[]))
+    assert alerting.resolve_notifier_credentials(profile) == {}
+
+
+def test_resolve_notifier_credentials_resolves_discord(monkeypatch):
+    monkeypatch.setenv("DISCORD_WEBHOOK_TEST", "https://discord.example/webhook")
+    profile = make_profile(alerts=make_alerts_config(notifiers=["discord"]))
+    credentials = alerting.resolve_notifier_credentials(profile)
+    assert credentials == {"discord": "https://discord.example/webhook"}
+
+
+def test_resolve_notifier_credentials_resolves_pushover(monkeypatch):
+    monkeypatch.setenv("PUSHOVER_APP_TOKEN", "app-token")
+    monkeypatch.setenv("PUSHOVER_USER_KEY", "user-key")
+    profile = make_profile(alerts=make_alerts_config(notifiers=["pushover"]))
+    credentials = alerting.resolve_notifier_credentials(profile)
+    assert credentials == {"pushover": ("app-token", "user-key")}
+
+
+def test_resolve_notifier_credentials_resolves_both_when_both_configured(monkeypatch):
+    monkeypatch.setenv("DISCORD_WEBHOOK_TEST", "https://discord.example/webhook")
+    monkeypatch.setenv("PUSHOVER_APP_TOKEN", "app-token")
+    monkeypatch.setenv("PUSHOVER_USER_KEY", "user-key")
+    profile = make_profile(alerts=make_alerts_config(notifiers=["discord", "pushover"]))
+    credentials = alerting.resolve_notifier_credentials(profile)
+    assert credentials == {
+        "discord": "https://discord.example/webhook",
+        "pushover": ("app-token", "user-key"),
+    }
+
+
+def test_resolve_notifier_credentials_raises_when_pushover_app_token_missing(monkeypatch):
+    monkeypatch.delenv("PUSHOVER_APP_TOKEN", raising=False)
+    monkeypatch.setenv("PUSHOVER_USER_KEY", "user-key")
+    profile = make_profile(alerts=make_alerts_config(notifiers=["pushover"]))
+    with pytest.raises(ProfileCompileError):
+        alerting.resolve_notifier_credentials(profile)
+
+
+def test_resolve_notifier_credentials_raises_when_pushover_user_key_missing(monkeypatch):
+    monkeypatch.setenv("PUSHOVER_APP_TOKEN", "app-token")
+    monkeypatch.delenv("PUSHOVER_USER_KEY", raising=False)
+    profile = make_profile(alerts=make_alerts_config(notifiers=["pushover"]))
+    with pytest.raises(ProfileCompileError):
+        alerting.resolve_notifier_credentials(profile)
+
+
+def test_invalid_notifier_name_is_a_profile_load_error():
+    # schema.py's Literal["discord", "pushover"] type does this - not
+    # resolve_notifier_credentials, and not a runtime ProfileCompileError.
+    # A typo'd notifier name is a shape error, same family as a malformed
+    # regex in a MatchRule, so it should fail exactly like every other
+    # pydantic validation error on this model does.
+    with pytest.raises(pydantic.ValidationError):
+        make_alerts_config(notifiers=["discrod"])
 
 
 # ---------------------------------------------------------------------------
@@ -494,3 +563,188 @@ def test_live_send_failure_still_writes_an_alert_row(tmp_path, monkeypatch):
     assert row is not None
     assert row["dry_run"] == 0
     assert row["delivery_status"] == "failed"
+
+
+# ---------------------------------------------------------------------------
+# run_alert_cycle - multi-notifier (V0.9a). Mocks discord.send_alert AND
+# pushover.send_alert directly (module patches, same convention as above).
+# ---------------------------------------------------------------------------
+
+
+def _rows_for(conn, item_id="item-1"):
+    return conn.execute(
+        "SELECT notifier, delivery_status FROM alerts WHERE item_id = ? "
+        "ORDER BY notifier",
+        (item_id,),
+    ).fetchall()
+
+
+def test_both_notifiers_configured_writes_two_rows(tmp_path, monkeypatch):
+    monkeypatch.setenv("DISCORD_WEBHOOK_TEST", "https://discord.example/webhook")
+    monkeypatch.setenv("PUSHOVER_APP_TOKEN", "app-token")
+    monkeypatch.setenv("PUSHOVER_USER_KEY", "user-key")
+    conn = make_conn(tmp_path)
+    seed_listing(conn, "item-1", price_cents=9000)
+    profile = make_profile(
+        alerts=make_alerts_config(dry_run=False, notifiers=["discord", "pushover"])
+    )
+    seeds = compile_seed_baselines(profile)
+
+    async def fake_send_alert(*args, **kwargs):
+        return "sent"
+
+    monkeypatch.setattr(alerting.discord, "send_alert", fake_send_alert)
+    monkeypatch.setattr(alerting.pushover, "send_alert", fake_send_alert)
+
+    run(alerting.run_alert_cycle(conn, profile, seeds, ["item-1"], now_ts=2000))
+
+    rows = _rows_for(conn)
+    assert [dict(r) for r in rows] == [
+        {"notifier": "discord", "delivery_status": "sent"},
+        {"notifier": "pushover", "delivery_status": "sent"},
+    ]
+
+
+def test_discord_raising_does_not_prevent_pushover(tmp_path, monkeypatch):
+    monkeypatch.setenv("DISCORD_WEBHOOK_TEST", "https://discord.example/webhook")
+    monkeypatch.setenv("PUSHOVER_APP_TOKEN", "app-token")
+    monkeypatch.setenv("PUSHOVER_USER_KEY", "user-key")
+    conn = make_conn(tmp_path)
+    seed_listing(conn, "item-1", price_cents=9000)
+    profile = make_profile(
+        alerts=make_alerts_config(dry_run=False, notifiers=["discord", "pushover"])
+    )
+    seeds = compile_seed_baselines(profile)
+
+    pushover_calls = []
+
+    async def raising_discord(*args, **kwargs):
+        raise RuntimeError("discord blew up")
+
+    async def fake_pushover(*args, **kwargs):
+        pushover_calls.append((args, kwargs))
+        return "sent"
+
+    monkeypatch.setattr(alerting.discord, "send_alert", raising_discord)
+    monkeypatch.setattr(alerting.pushover, "send_alert", fake_pushover)
+
+    run(alerting.run_alert_cycle(conn, profile, seeds, ["item-1"], now_ts=2000))
+
+    assert len(pushover_calls) == 1  # attempted despite discord raising
+    rows = {r["notifier"]: r["delivery_status"] for r in _rows_for(conn)}
+    assert rows == {"discord": "failed", "pushover": "sent"}
+
+
+def test_pushover_raising_does_not_prevent_discord(tmp_path, monkeypatch):
+    monkeypatch.setenv("DISCORD_WEBHOOK_TEST", "https://discord.example/webhook")
+    monkeypatch.setenv("PUSHOVER_APP_TOKEN", "app-token")
+    monkeypatch.setenv("PUSHOVER_USER_KEY", "user-key")
+    conn = make_conn(tmp_path)
+    seed_listing(conn, "item-1", price_cents=9000)
+    profile = make_profile(
+        alerts=make_alerts_config(dry_run=False, notifiers=["discord", "pushover"])
+    )
+    seeds = compile_seed_baselines(profile)
+
+    discord_calls = []
+
+    async def fake_discord(*args, **kwargs):
+        discord_calls.append((args, kwargs))
+        return "sent"
+
+    async def raising_pushover(*args, **kwargs):
+        raise RuntimeError("pushover blew up")
+
+    monkeypatch.setattr(alerting.discord, "send_alert", fake_discord)
+    monkeypatch.setattr(alerting.pushover, "send_alert", raising_pushover)
+
+    run(alerting.run_alert_cycle(conn, profile, seeds, ["item-1"], now_ts=2000))
+
+    assert len(discord_calls) == 1  # attempted despite pushover raising
+    rows = {r["notifier"]: r["delivery_status"] for r in _rows_for(conn)}
+    assert rows == {"discord": "sent", "pushover": "failed"}
+
+
+def test_notifiers_discord_only_writes_one_row_and_never_calls_pushover(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("DISCORD_WEBHOOK_TEST", "https://discord.example/webhook")
+    conn = make_conn(tmp_path)
+    seed_listing(conn, "item-1", price_cents=9000)
+    profile = make_profile(alerts=make_alerts_config(dry_run=False, notifiers=["discord"]))
+    seeds = compile_seed_baselines(profile)
+
+    pushover_calls = []
+
+    async def fake_discord(*args, **kwargs):
+        return "sent"
+
+    async def fake_pushover(*args, **kwargs):
+        pushover_calls.append((args, kwargs))
+        return "sent"
+
+    monkeypatch.setattr(alerting.discord, "send_alert", fake_discord)
+    monkeypatch.setattr(alerting.pushover, "send_alert", fake_pushover)
+
+    run(alerting.run_alert_cycle(conn, profile, seeds, ["item-1"], now_ts=2000))
+
+    assert pushover_calls == []
+    rows = _rows_for(conn)
+    assert len(rows) == 1
+    assert rows[0]["notifier"] == "discord"
+
+
+def test_notifiers_empty_list_sends_nothing_but_still_writes_a_row(tmp_path, monkeypatch):
+    # Empty notifiers is "evaluate and record, tell no one" - not "do
+    # nothing" (design.md's dated entry): without a row, evaluate()'s
+    # cooldown/re-alert gate has nothing to dedup against next cycle.
+    conn = make_conn(tmp_path)
+    seed_listing(conn, "item-1", price_cents=9000)
+    profile = make_profile(alerts=make_alerts_config(dry_run=False, notifiers=[]))
+    seeds = compile_seed_baselines(profile)
+
+    discord_calls = []
+    pushover_calls = []
+    monkeypatch.setattr(
+        alerting.discord, "send_alert",
+        lambda *a, **k: discord_calls.append((a, k)),
+    )
+    monkeypatch.setattr(
+        alerting.pushover, "send_alert",
+        lambda *a, **k: pushover_calls.append((a, k)),
+    )
+
+    run(alerting.run_alert_cycle(conn, profile, seeds, ["item-1"], now_ts=2000))
+
+    assert discord_calls == []
+    assert pushover_calls == []
+    rows = _rows_for(conn)
+    assert len(rows) == 1
+    assert rows[0]["notifier"] == "none"
+    assert rows[0]["delivery_status"] == "skipped"
+
+
+def test_dry_run_writes_one_dry_run_row_per_configured_notifier(tmp_path, monkeypatch):
+    monkeypatch.setenv("DISCORD_WEBHOOK_TEST", "https://discord.example/webhook")
+    monkeypatch.setenv("PUSHOVER_APP_TOKEN", "app-token")
+    monkeypatch.setenv("PUSHOVER_USER_KEY", "user-key")
+    conn = make_conn(tmp_path)
+    seed_listing(conn, "item-1", price_cents=9000)
+    profile = make_profile(
+        alerts=make_alerts_config(dry_run=True, notifiers=["discord", "pushover"])
+    )
+    seeds = compile_seed_baselines(profile)
+
+    calls = []
+    monkeypatch.setattr(
+        alerting.discord, "send_alert", lambda *a, **k: calls.append((a, k))
+    )
+    monkeypatch.setattr(
+        alerting.pushover, "send_alert", lambda *a, **k: calls.append((a, k))
+    )
+
+    run(alerting.run_alert_cycle(conn, profile, seeds, ["item-1"], now_ts=2000))
+
+    assert calls == []  # dry_run never calls a notifier's send_alert
+    rows = {r["notifier"]: r["delivery_status"] for r in _rows_for(conn)}
+    assert rows == {"discord": "dry_run", "pushover": "dry_run"}

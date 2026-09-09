@@ -24,7 +24,7 @@ from pathlib import Path
 import yaml
 
 from dealwatch.config import Settings
-from dealwatch.engine.alerting import resolve_webhook_url, run_alert_cycle
+from dealwatch.engine.alerting import resolve_notifier_credentials, run_alert_cycle
 from dealwatch.engine.scoring import CompiledSeedBaseline, compile_seed_baselines
 from dealwatch.normalize.engine import compile_profile, normalize
 from dealwatch.normalize.listing import (
@@ -561,18 +561,18 @@ class Collector:
 
         # Fail fast, before either loop below ever runs (design.md's V0.9
         # dated entry): a bad regex, an unresolvable bucket_key field, a
-        # duplicate seed_baselines match block, or an alerts.webhook_env
-        # naming an environment variable that's unset or empty are all the
-        # same class of mistake - a startup error, not a silent no-op
-        # discovered at 2am. compile_seed_baselines() runs once here, not
-        # per cycle - it's real regex-adjacent compile work
+        # duplicate seed_baselines match block, or a notifier named in
+        # alerts.notifiers whose credentials are unset or empty (V0.9a) are
+        # all the same class of mistake - a startup error, not a silent
+        # no-op discovered at 2am. compile_seed_baselines() runs once here,
+        # not per cycle - it's real regex-adjacent compile work
         # (compile_seed_baselines validates every match block), unlike
-        # resolve_webhook_url's cheap os.environ lookup, which
+        # resolve_notifier_credentials's cheap os.environ lookups, which
         # run_alert_cycle repeats per cycle for a different reason (see its
         # own docstring).
         compile_profile(profile)
         self._compiled_seeds = compile_seed_baselines(profile)
-        resolve_webhook_url(profile)
+        resolve_notifier_credentials(profile)
 
         self._tasks: list[asyncio.Task] = []
 

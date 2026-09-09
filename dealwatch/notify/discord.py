@@ -2,13 +2,18 @@
 
 Builds one embed from a ScoreResult + a listing's spec dict + the profile's
 AlertsConfig, and POSTs it to a webhook URL the caller already resolved
-(dealwatch.engine.alerting.resolve_webhook_url) - this module never reads
-the environment itself.
+(dealwatch.engine.alerting.resolve_notifier_credentials) - this module
+never reads the environment itself.
 
 This module must not contain any laptop-specific knowledge: no hardcoded
 "Generation"/"CPU"/"RAM" labels, no field names in Python. Everything
 rendered comes from alerts.title_template and alerts.fields, so a profile
 hunting M.2 drives needs only a YAML change here, never a code change.
+
+notify/pushover.py (V0.9a) is this module's sibling, not a subclass of it -
+see that module's docstring and CLAUDE.md for why there is no shared
+transport/notifier base class, only shared pure rendering helpers
+(notify/_shared.py).
 """
 
 import asyncio
@@ -18,6 +23,7 @@ import httpx
 
 from dealwatch.engine.scoring import BASELINE_LAYER_COMPUTED, ScoreResult
 from dealwatch.normalize.schema import AlertsConfig
+from dealwatch.notify._shared import render_field_value, render_title
 
 logger = logging.getLogger(__name__)
 
@@ -28,33 +34,10 @@ _MAX_ATTEMPTS = 2
 _DEFAULT_RETRY_AFTER_SECONDS = 1.0
 
 
-class _RenderSpec(dict):
-    """A spec dict for str.format_map() where a missing key, OR a key whose
-    value is None (a legitimate runtime state - see AlertsConfig's
-    docstring), both render as "unknown" rather than raising or printing
-    "None"."""
-
-    def __missing__(self, key: str) -> str:
-        return "unknown"
-
-    def __getitem__(self, key: str):
-        value = super().__getitem__(key)
-        return "unknown" if value is None else value
-
-
-def _render_title(template: str, spec: dict) -> str:
-    return template.format_map(_RenderSpec(spec))
-
-
-def _render_field_value(spec: dict, name: str) -> str:
-    value = spec.get(name)
-    return "unknown" if value is None else str(value)
-
-
 def build_embed(result: ScoreResult, spec: dict, alerts_cfg: AlertsConfig) -> dict:
     """Pure - no I/O, so it's directly testable without a mock transport."""
     fields = [
-        {"name": name, "value": _render_field_value(spec, name), "inline": True}
+        {"name": name, "value": render_field_value(spec, name), "inline": True}
         for name in alerts_cfg.fields
     ]
 
@@ -80,7 +63,7 @@ def build_embed(result: ScoreResult, spec: dict, alerts_cfg: AlertsConfig) -> di
         description_lines.append("**below sanity floor** - verify before buying")
 
     return {
-        "title": _render_title(alerts_cfg.title_template, spec),
+        "title": render_title(alerts_cfg.title_template, spec),
         "url": result.item_web_url,
         "description": "\n".join(description_lines),
         "fields": fields,

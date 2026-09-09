@@ -903,7 +903,11 @@ real observed sales" from "the seed chart's estimate for this bucket was
 wrong." Collapsing the two into a single score number would discard exactly
 the information a human needs to decide how much to trust it.
 
-### 5.7 Buyability: label, don't suppress (V0.9a, pending) — scope change, 2026-09-07
+### 5.7 Buyability: label, don't suppress (V0.9b, pending) — scope change, 2026-09-07
+
+Renumbered from V0.9a to V0.9b (2026-09-08): V0.9a itself went to
+multi-notifier support instead (§11's dated entry below) - this section's
+content and status are otherwise unchanged.
 
 A listing can match every spec requirement and still be a bad buy — soldered
 RAM is the first known case: a machine whose RAM can't be upgraded is worth
@@ -948,7 +952,7 @@ until checked against Lenovo's own PSREF/spec sheets or a teardown source.
 A wrong guess here is worse than the unknown-RAM case above: it suppresses
 a real deal with false confidence rather than flagging honest uncertainty.
 
-**V0.9a, after that PSREF check:** add the `derive:` rule and put the
+**V0.9b, after that PSREF check:** add the `derive:` rule and put the
 attribute in the alert body (`alerts.fields`, §11) — label, don't suppress.
 If the label is wrong you see it and fix it; if a suppression rule is wrong
 you never see the listing and never learn. Whether suppression is worth
@@ -1168,16 +1172,19 @@ whatever `item_ids` that cycle actually touched, new or not, and gates on
 real data (spec_status, price, ratio, cooldown) rather than on the
 fetch mechanism telling it something is new.
 
-### V0.9a scope change (§5.7)
+### V0.9b scope change (§5.7)
 
 Soldered-RAM buyability suppression, originally scoped as part of this
 milestone's target list, was pulled out during this milestone - see §5.7's
-amended entry. The short version: suppression-via-`reject:` would strip
+amended entry. Renumbered from V0.9a to V0.9b (2026-09-08) once V0.9a
+itself went to multi-notifier support instead (this file's V0.9a dated
+entry below) - the content below is otherwise unchanged from when it was
+written. The short version: suppression-via-`reject:` would strip
 real comps out of buckets that already have almost none, and the specific
 generation/vendor mapping needed to build it correctly has not been
 verified against Lenovo's own spec sheets. Labeling (rendering the
 attribute in the alert body once `derive:` produces it) ships in a future
-V0.9a; suppressing anything on an unverified guess does not.
+V0.9b; suppressing anything on an unverified guess does not.
 
 ### Live-verification addendum (2026-09-08)
 
@@ -1240,3 +1247,78 @@ this - they may still be pulling weight against listings that entered via
 evidence today that `whole-board` needs its own copies of them. Recorded
 here specifically so nobody re-adds the dropped nine to `whole-board`
 speculatively without re-running the same live-title check first.
+
+### V0.9a — multi-notifier support (2026-09-08)
+
+V0.9 shipped with exactly one delivery channel hardcoded into
+`run_alert_cycle` (`discord.send_alert`, called directly). This milestone
+generalizes that to a list, `alerts.notifiers` (`schema.py`'s
+`AlertsConfig`), typed `list[Literal["discord", "pushover"]]` and defaulting
+to `["discord"]` so a profile predating this field alerts exactly as it did
+before. Dispatch is a `name -> module` dict (`engine/alerting.py`'s
+`_NOTIFIER_MODULES`), not a `Notifier` base class or plugin registry - two
+concrete implementations (`notify/discord.py`, `notify/pushover.py`) behind
+a lookup, nothing more. The two modules share only their pure rendering
+rule (a missing or `None` spec field renders as `"unknown"`, never raises) -
+pulled into `notify/_shared.py` once a second notifier needed the identical
+rule, not as a speculative abstraction.
+
+**Every configured notifier is attempted independently per survivor**, each
+wrapped in its own `try/except Exception`, and one `alerts` row is written
+per (survivor, notifier) pair - same `sent_at`, same score fields, differing
+`notifier`/`delivery_status`. A Discord outage must not cost the user the
+Pushover alert they'd otherwise have gotten, and vice versa; sabotage-
+verified by removing the per-notifier `try/except` and confirming both
+directions (`discord` raising, `pushover` raising) go red exactly as
+expected - the surviving notifier stops being attempted and/or the
+exception propagates out of `run_alert_cycle` uncaught. All of a survivor's
+rows are written in a single `BEGIN IMMEDIATE`/`COMMIT` transaction, after
+every notifier for that survivor has been attempted - a crash mid-send must
+not leave the item with rows for some notifiers and not others, since dedup
+(next paragraph) reads across notifiers and a partial write would leave
+that state inconsistent with what was actually sent.
+
+**`alerts.notifiers: []` is valid** and sends nothing, but still writes one
+row per survivor (`notifier='none'`, `delivery_status='skipped'`) - the
+same "a row must exist for the cooldown/re-alert gate to dedup against"
+reasoning V0.9's dry-run rows already established (see this file's earlier
+dry-run-as-first-run-guard entry). Sabotage-verified: removing that
+branch's row write (falling through to writing nothing when `notifiers` is
+empty) turns the "empty list still writes a row" test red.
+
+**Dedup must stay notifier-agnostic - this is the part that actually
+matters.** `last_alert()` (`storage/sqlite.py`) returns the most recent
+alert row for an item regardless of `notifier`, unchanged in shape from
+V0.9, just re-justified: if it filtered by notifier, a Pushover outage
+recovering mid-cycle would find no *prior Pushover-tagged* row for an item
+Discord had already alerted on, and re-fire on the very next cycle even
+though the user already received the Discord alert - dedup has to mean "was
+this item alerted on recently, at all," not "was it alerted on recently via
+this specific channel." Sabotage-verified against the real function (not a
+mock): a row tagged `notifier='pushover'` becomes invisible to
+`last_alert()` once a hardcoded `AND notifier = 'discord'` is added to its
+query - the failure mode a naive "just check Discord's history" edit would
+introduce, since Discord was the only notifier before this milestone. The
+first attempt at this test tagged its row `'discord'` to match the only
+notifier in play at the time, which passed even against the sabotaged
+query by coincidence and proved nothing - the same false-confidence shape
+this file's V0.9 cooldown-boundary sabotage hit already (§11, `<` vs. `<=`
+at an exact boundary). Tagging the row with a *different* notifier than the
+one being sabotaged toward is what actually exercises the invariant.
+
+**Migration 7** adds `alerts.notifier TEXT NOT NULL DEFAULT 'discord'` -
+the default both satisfies SQLite's requirement that a NOT NULL column
+added via `ALTER TABLE` have one, and correctly backfills every pre-V0.9a
+row, since Discord was the only notifier that ever produced one. It also
+replaces `idx_alerts_item_sent_at` with an index over
+`(item_id, sent_at DESC, id DESC)` - before this milestone, one alert event
+produced exactly one row, so a `sent_at` tie within an `item_id` didn't
+happen; multi-notifier fan-out makes that the common case (one alert event,
+N rows, identical `sent_at`), so the index now matches `last_alert()`'s own
+`ORDER BY` exactly instead of leaving the tie-break to an unindexed sort.
+
+**Scripts are now baked into the image** (`Dockerfile`'s `COPY scripts
+./scripts`) instead of `docker cp`'d in by hand after every deploy - see
+CLAUDE.md's Operational notes for why the manual step existed (and is now
+obsolete for anything that isn't a same-session edit to a script file
+without a redeploy).

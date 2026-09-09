@@ -278,6 +278,38 @@ _MIGRATIONS: list[tuple[int, list[str]]] = [
             """,
         ],
     ),
+    (
+        7,
+        [
+            # V0.9a (design.md's dated entry): multi-notifier support - one
+            # alerts row per notifier per alert event, not one row covering
+            # every configured channel. DEFAULT 'discord' both satisfies
+            # SQLite's requirement that a NOT NULL column added via ALTER
+            # TABLE have a default, and backfills every pre-V0.9a row
+            # correctly: every row that exists already IS a Discord send,
+            # since Discord was the only notifier that ever existed. New
+            # rows always pass an explicit notifier (record_alert's
+            # `notifier` parameter) - the default is a backfill mechanism,
+            # not something the live code path relies on going forward.
+            "ALTER TABLE alerts ADD COLUMN notifier TEXT NOT NULL DEFAULT 'discord'",
+            # Replaces (not just supplements) idx_alerts_item_sent_at.
+            # last_alert()'s query is unchanged - ORDER BY sent_at DESC, id
+            # DESC LIMIT 1, deliberately still not filtered by notifier (see
+            # last_alert's docstring on why dedup must stay notifier-
+            # agnostic) - but before this milestone every alert event
+            # produced exactly one row, so ties on sent_at across rows for
+            # the same item_id did not exist. Multi-notifier fan-out makes
+            # that the common case (one alert event, N rows, all sharing
+            # sent_at), so the index now includes id DESC too, matching the
+            # query's own ORDER BY exactly instead of leaving the sent_at
+            # tie-break to an unindexed extra sort step.
+            "DROP INDEX IF EXISTS idx_alerts_item_sent_at",
+            """
+            CREATE INDEX IF NOT EXISTS idx_alerts_item_sent_at
+                ON alerts(item_id, sent_at DESC, id DESC)
+            """,
+        ],
+    ),
 ]
 
 
@@ -720,16 +752,24 @@ def record_alert(
     ratio_to_p25: float,
     sanity_flagged: bool,
     delivery_status: str,
+    notifier: str = "discord",
 ) -> None:
-    """One row per alert cycle survivor, dry-run or not (V0.9, design.md's
-    dated entry) - see last_alert()'s docstring for why dry-run rows are
-    written here at all rather than skipped.
+    """One row per (alert cycle survivor, notifier) pair, dry-run or not
+    (V0.9, extended to multi-notifier at V0.9a - design.md's dated entries)
+    - see last_alert()'s docstring for why dry-run rows are written here at
+    all rather than skipped. `notifier` defaults to `"discord"` so every
+    pre-V0.9a call site (tests included) keeps meaning exactly what it
+    always meant - Discord was the only notifier that existed until now.
 
-    One INSERT, no explicit BEGIN/COMMIT - same reasoning as store_spec()/
-    store_sweep_stats(): a single statement is already atomic under
-    SQLite's autocommit, and this is called from the same connection as
-    other calls that manage their own transaction, so this must not open a
-    nested one.
+    Callers evaluating multiple notifiers for one alert event
+    (engine.alerting.run_alert_cycle) call this once per notifier and are
+    responsible for wrapping those calls in their own transaction - see
+    that module's docstring on why a partial write mid-crash must not leave
+    an item half-deduped. One INSERT here, no explicit BEGIN/COMMIT - same
+    reasoning as store_spec()/store_sweep_stats(): a single statement is
+    already atomic under SQLite's autocommit, and this is called from the
+    same connection as other calls that manage their own transaction, so
+    this must not open a nested one.
     """
     conn.execute(
         """
@@ -737,8 +777,8 @@ def record_alert(
             item_id, profile_id, sent_at, dry_run, price_cents,
             price_is_price_only, bucket_key, baseline_layer, baseline_match,
             baseline_n, baseline_p25_cents, baseline_p50_cents, ratio_to_p25,
-            sanity_flagged, delivery_status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            sanity_flagged, delivery_status, notifier
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             item_id,
@@ -756,19 +796,28 @@ def record_alert(
             ratio_to_p25,
             1 if sanity_flagged else 0,
             delivery_status,
+            notifier,
         ),
     )
 
 
 def last_alert(conn: sqlite3.Connection, item_id: str) -> sqlite3.Row | None:
-    """Most recent alert row for item_id, regardless of `dry_run`. This is
-    load-bearing (V0.9, design.md's dated entry), not an oversight: because
-    this ignores dry_run, a dry-run day's rows double as the first-alert-
-    ever guard for cooldown/re-alert purposes (engine/alerting.py's
-    evaluate()) - flipping dry_run: false the next morning does not fire on
-    every already-active listing, only on new listings and genuine price
-    drops, with no separate backfill script needed to establish that
-    baseline."""
+    """Most recent alert row for item_id, regardless of `dry_run` AND
+    regardless of `notifier` (V0.9, extended at V0.9a - design.md's dated
+    entries). Both are load-bearing, not oversights.
+
+    The dry_run part: a dry-run day's rows double as the first-alert-ever
+    guard for cooldown/re-alert purposes (engine/alerting.py's evaluate()) -
+    flipping dry_run: false the next morning does not fire on every
+    already-active listing, only on new listings and genuine price drops,
+    with no separate backfill script needed to establish that baseline.
+
+    The notifier part (V0.9a): if this filtered by notifier, a Pushover
+    outage recovering mid-cycle would find no prior Pushover row for an
+    item Discord had already alerted on, and re-fire on every recovered
+    cycle even though the user already got the Discord alert - dedup must
+    track "was this item alerted on, at all, recently" once per item, not
+    once per item per channel. Do not add `AND notifier = ?` here."""
     return conn.execute(
         "SELECT * FROM alerts WHERE item_id = ? ORDER BY sent_at DESC, id DESC LIMIT 1",
         (item_id,),

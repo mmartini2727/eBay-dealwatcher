@@ -1124,3 +1124,29 @@ def test_collector_init_does_not_require_a_webhook_env_without_an_alerts_block(t
     profile = make_profile()  # no alerts block at all
 
     Collector(settings, profile)  # must not raise
+
+
+def test_collector_init_raises_when_pushover_configured_without_its_env_vars(
+    tmp_path, monkeypatch
+):
+    # V0.9a: same fail-fast family, extended to a second notifier - a
+    # profile listing "pushover" in alerts.notifiers with no
+    # PUSHOVER_APP_TOKEN/PUSHOVER_USER_KEY set must not start.
+    monkeypatch.delenv("PUSHOVER_APP_TOKEN", raising=False)
+    monkeypatch.delenv("PUSHOVER_USER_KEY", raising=False)
+    monkeypatch.setenv("DISCORD_WEBHOOK_COLLECTOR_TEST", "https://discord.example/webhook")
+    settings = make_settings(tmp_path)
+    profile = _alerts_profile(notifiers=["discord", "pushover"])
+
+    with pytest.raises(ProfileCompileError):
+        Collector(settings, profile)
+
+
+def test_collector_init_succeeds_when_pushover_env_vars_are_set(tmp_path, monkeypatch):
+    monkeypatch.setenv("PUSHOVER_APP_TOKEN", "app-token")
+    monkeypatch.setenv("PUSHOVER_USER_KEY", "user-key")
+    monkeypatch.setenv("DISCORD_WEBHOOK_COLLECTOR_TEST", "https://discord.example/webhook")
+    settings = make_settings(tmp_path)
+    profile = _alerts_profile(notifiers=["discord", "pushover"])
+
+    Collector(settings, profile)  # must not raise

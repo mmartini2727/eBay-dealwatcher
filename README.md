@@ -45,6 +45,8 @@ cp .env.example .env
 | `EBAY_CLIENT_ID` | Portal calls this the App ID |
 | `EBAY_CLIENT_SECRET` | Portal calls this the Cert ID |
 | `DISCORD_WEBHOOK_DEALS` | Alert destination (V0.9) |
+| `PUSHOVER_APP_TOKEN` | Pushover app token (V0.9a) — required only if `pushover` is in a profile's `alerts.notifiers` |
+| `PUSHOVER_USER_KEY` | Pushover user key (V0.9a) — same condition as above |
 | `LOG_LEVEL` | Defaults to INFO |
 
 Browse only needs an **application access token** via the client credentials
@@ -140,7 +142,8 @@ be recovered.
 | V0.7 | ThinkPad T14 profile + normalize engine | done |
 | V0.8 | Scoring engine (a-e: baselines, scoring ladder, bucket_key, sweep/pagination data integrity, `poll.sort`) | done |
 | V0.9 | Discord alerts | done, live-verified 2026-09-08 |
-| V0.9a | Soldered-RAM buyability labeling (pulled out of V0.9 - design.md §5.7) | next |
+| V0.9a | Multi-notifier support (Discord + Pushover) + scripts baked into the image | done |
+| V0.9b | Soldered-RAM buyability labeling (pulled out of V0.9 - design.md §5.7) | next |
 | V1.0 | MCP server (streamable HTTP, LAN only) | |
 
 Ship V0.6 even though the normalizer is a stub. Raw titles and prices are

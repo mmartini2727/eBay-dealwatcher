@@ -642,11 +642,18 @@ def test_migration_6_applies_to_a_database_already_at_version_5(tmp_path, monkey
     # Same production-is-the-upgrade-path reasoning as the migration 5 test
     # above. Confirms the alerts table + its index are real and usable, and
     # a second connect() against an already-v6 file is a true no-op.
+    #
+    # Pinned to v6_only rather than the real (now v7+) _MIGRATIONS list, on
+    # purpose - this test's claim is specifically about migration 6, and a
+    # literal pin is what makes that claim keep meaning something once a
+    # later migration exists (see the migration 7 test below, and CLAUDE.md
+    # on why a pin test must assert a literal, not "whatever's latest").
     import dealwatch.storage.sqlite as storage_module
 
     db_path = tmp_path / "dealwatch.db"
     real_migrations = storage_module._MIGRATIONS
     v5_only = [m for m in real_migrations if m[0] <= 5]
+    v6_only = [m for m in real_migrations if m[0] <= 6]
     monkeypatch.setattr(storage_module, "_MIGRATIONS", v5_only)
 
     conn = storage_module.connect(db_path)
@@ -660,7 +667,7 @@ def test_migration_6_applies_to_a_database_already_at_version_5(tmp_path, monkey
     )
     conn.close()
 
-    monkeypatch.setattr(storage_module, "_MIGRATIONS", real_migrations)
+    monkeypatch.setattr(storage_module, "_MIGRATIONS", v6_only)
 
     upgraded = storage_module.connect(db_path)
     version = upgraded.execute("SELECT version FROM schema_version").fetchone()[0]
@@ -682,6 +689,69 @@ def test_migration_6_applies_to_a_database_already_at_version_5(tmp_path, monkey
     version = reconnected.execute("SELECT version FROM schema_version").fetchone()[0]
     assert version == 6
     assert reconnected.execute("SELECT COUNT(*) FROM alerts").fetchone()[0] == 1
+
+
+def test_migration_7_applies_to_a_database_already_at_version_6(tmp_path, monkeypatch):
+    # V0.9a: notifier column + its default backfill, and the replaced
+    # index. Same "start pinned to the prior version, then let the real
+    # migration list run" shape as the migration 6 test above.
+    import dealwatch.storage.sqlite as storage_module
+
+    db_path = tmp_path / "dealwatch.db"
+    real_migrations = storage_module._MIGRATIONS
+    v6_only = [m for m in real_migrations if m[0] <= 6]
+    monkeypatch.setattr(storage_module, "_MIGRATIONS", v6_only)
+
+    conn = storage_module.connect(db_path)
+    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 6
+    conn.execute(
+        "INSERT INTO listings (item_id, profile_id, title, spec_status, "
+        "first_seen, last_seen, miss_count) VALUES "
+        "('item-1', ?, 't', 'ok', 1000, 1000, 0)",
+        (PROFILE_ID,),
+    )
+    # A pre-V0.9a INSERT - no notifier column exists yet at v6, so this is
+    # exactly the shape every row in a real pre-upgrade database has.
+    conn.execute(
+        "INSERT INTO alerts (item_id, profile_id, sent_at, dry_run, "
+        "price_cents, price_is_price_only, bucket_key, baseline_layer, "
+        "baseline_match, baseline_n, baseline_p25_cents, baseline_p50_cents, "
+        "ratio_to_p25, sanity_flagged, delivery_status) VALUES "
+        "('item-1', ?, 1000, 1, 20000, 0, 'bucket', 'seed', '{}', NULL, "
+        "20000, 25000, 1.0, 0, 'dry_run')",
+        (PROFILE_ID,),
+    )
+    conn.close()
+
+    monkeypatch.setattr(storage_module, "_MIGRATIONS", real_migrations)
+
+    upgraded = storage_module.connect(db_path)
+    assert upgraded.execute("SELECT version FROM schema_version").fetchone()[0] == 7
+
+    # The pre-existing row backfills to 'discord' - it predates any
+    # notifier but IS a Discord send, since Discord was the only notifier
+    # that ever existed before this migration.
+    row = upgraded.execute(
+        "SELECT notifier FROM alerts WHERE item_id = 'item-1'"
+    ).fetchone()
+    assert row["notifier"] == "discord"
+
+    # A new row can specify a different notifier explicitly.
+    upgraded.execute(
+        "INSERT INTO alerts (item_id, profile_id, sent_at, dry_run, "
+        "price_cents, price_is_price_only, bucket_key, baseline_layer, "
+        "baseline_match, baseline_n, baseline_p25_cents, baseline_p50_cents, "
+        "ratio_to_p25, sanity_flagged, delivery_status, notifier) VALUES "
+        "('item-1', ?, 2000, 1, 19000, 0, 'bucket', 'seed', '{}', NULL, "
+        "20000, 25000, 0.95, 0, 'dry_run', 'pushover')",
+        (PROFILE_ID,),
+    )
+    assert upgraded.execute("SELECT COUNT(*) FROM alerts").fetchone()[0] == 2
+    upgraded.close()
+
+    reconnected = storage_module.connect(db_path)
+    assert reconnected.execute("SELECT version FROM schema_version").fetchone()[0] == 7
+    assert reconnected.execute("SELECT COUNT(*) FROM alerts").fetchone()[0] == 2
 
 
 # Every shape parse_variation_id() itself is required to handle correctly
@@ -810,6 +880,79 @@ def test_last_alert_returns_the_most_recent_by_sent_at(tmp_path):
     row = last_alert(conn, "item-1")
     assert row["sent_at"] == 3000
     assert row["price_cents"] == 8500
+
+
+def test_record_alert_defaults_notifier_to_discord(tmp_path):
+    # Every pre-V0.9a call site (this file's other tests included) doesn't
+    # pass notifier at all - it must keep meaning "discord", not become a
+    # TypeError or silently write something else.
+    conn = make_conn(tmp_path)
+    sight(conn, "item-1", 1000)
+
+    record_alert(conn, "item-1", PROFILE_ID, 2000, **_alert_kwargs())
+
+    row = last_alert(conn, "item-1")
+    assert row["notifier"] == "discord"
+
+
+def test_last_alert_dedups_across_notifiers_not_per_notifier(tmp_path):
+    # V0.9a's central risk (design.md's dated entry): if last_alert() only
+    # saw rows for one notifier, a Pushover outage recovering mid-cycle
+    # would find no PRIOR pushover row for an item Discord already alerted
+    # on, and re-fire on the very next cycle even though the user already
+    # got the Discord alert. Dedup must be "was this item alerted on
+    # recently, at all" - not per-channel.
+    #
+    # Deliberately tagged 'pushover', not 'discord' - a row tagged with
+    # whatever the CALLER's own notifier happens to be would pass even a
+    # broken, notifier-filtered last_alert() by coincidence, and prove
+    # nothing (this project has hit that exact false-confidence shape
+    # before, in the cooldown-boundary sabotage - CLAUDE.md/design.md's
+    # dated entries). Tagging it 'pushover' and then querying with no
+    # notifier argument at all - because the real API doesn't take one -
+    # is what actually exercises "found regardless of which channel wrote
+    # it."
+    conn = make_conn(tmp_path)
+    sight(conn, "item-1", 1000)
+
+    record_alert(
+        conn, "item-1", PROFILE_ID, 2000,
+        **_alert_kwargs(price_cents=9000, notifier="pushover"),
+    )
+
+    row = last_alert(conn, "item-1")
+    assert row is not None
+    assert row["notifier"] == "pushover"
+    assert row["price_cents"] == 9000
+
+
+def test_last_alert_dedup_sabotage_filtering_by_notifier_breaks_it(tmp_path, monkeypatch):
+    # Sabotage check for the test above (design.md's dated entry): if
+    # last_alert()'s query gained a hardcoded `AND notifier = 'discord'`
+    # (the shape a naive "just check Discord's history" edit would take,
+    # since Discord was the only notifier before V0.9a), a row written by
+    # ANY other notifier would become invisible to dedup. This directly
+    # exercises that broken query shape (built here, not by mutating
+    # production code) against the same 'pushover'-tagged row the test
+    # above uses, to prove that test would have caught it.
+    conn = make_conn(tmp_path)
+    sight(conn, "item-1", 1000)
+    record_alert(
+        conn, "item-1", PROFILE_ID, 2000,
+        **_alert_kwargs(price_cents=9000, notifier="pushover"),
+    )
+
+    def sabotaged_last_alert(conn, item_id):
+        return conn.execute(
+            "SELECT * FROM alerts WHERE item_id = ? AND notifier = 'discord' "
+            "ORDER BY sent_at DESC, id DESC LIMIT 1",
+            (item_id,),
+        ).fetchone()
+
+    # A dedup check with the sabotaged query finds nothing, even though
+    # the item was just alerted on via Pushover two seconds ago - exactly
+    # the duplicate-alert bug the real last_alert() must not have.
+    assert sabotaged_last_alert(conn, "item-1") is None
 
 
 def test_concurrent_first_connect_against_a_fresh_file_does_not_crash_or_hang(tmp_path):

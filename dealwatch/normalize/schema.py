@@ -18,7 +18,7 @@ dealwatch.normalize.engine.compile_profile's job or dealwatch.engine.
 alerting.resolve_webhook_url's, not this module's.
 """
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -157,13 +157,31 @@ class AlertsConfig(BaseModel):
     validated against what the profile's extract/derive/tiers stages
     actually produce - a field absent from a given listing's spec is a
     legitimate runtime state (a `partial` listing), not a config error, and
-    renders as "unknown" (dealwatch.notify.discord), never raises.
+    renders as "unknown" (dealwatch.notify.discord / dealwatch.notify.
+    pushover), never raises.
+
+    `notifiers` (V0.9a) - which delivery channels to use, in order. A
+    `Literal` type, not a free string validated elsewhere: unlike
+    `webhook_env` (which names an *environment variable*, so its validity
+    can only be checked once the environment is available) the set of valid
+    notifier names is fixed and known at schema-definition time, so a typo
+    here (`"discrod"`) is exactly the kind of shape error pydantic already
+    catches for everything else in this model - no need to duplicate that
+    check in engine/alerting.py. Whether each named notifier's *credentials*
+    are actually present in the environment is still a semantic check
+    (engine.alerting.resolve_notifier_credentials), same division of labor
+    as webhook_env/resolve_webhook_url. Defaults to `["discord"]` so an
+    existing profile predating this field keeps behaving exactly as before.
+    An empty list is valid and means "evaluate and record alerts, notify no
+    one" - see resolve_notifier_credentials's docstring for why a row is
+    still written in that case.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     webhook_env: str
     dry_run: bool = True
+    notifiers: list[Literal["discord", "pushover"]] = ["discord"]
     trigger: AlertTrigger = AlertTrigger()
     # Dollars, matching how seed_baselines.p25/p50 are authored - converted
     # to cents once, at the point of comparison, same as those.

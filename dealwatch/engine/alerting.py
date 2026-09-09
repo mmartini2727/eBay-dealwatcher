@@ -1,15 +1,16 @@
 """Alert evaluation and delivery (V0.9, design.md's dated entry): decides
-which active listings deserve a Discord alert this cycle, and drives
-delivery + persistence for the survivors.
+which active listings deserve an alert this cycle, and drives delivery +
+persistence for the survivors.
 
 evaluate() is the decision logic and is pure aside from reading conn - no
 network, no writes. run_alert_cycle() is the driver: it calls evaluate(),
-then posts (or skips posting, in dry_run) and writes exactly one `alerts`
-row per survivor, dry-run or not (storage/sqlite.py's last_alert()
+then for each survivor, attempts every configured notifier (V0.9a - see
+resolve_notifier_credentials and _NOTIFIER_MODULES below) and writes one
+`alerts` row per notifier, dry-run or not (storage/sqlite.py's last_alert()
 docstring explains why dry-run rows are written at all).
 
-No buyability/suppression rules here (soldered RAM, minimum specs) - V0.9a,
-deliberately deferred (design.md §5.7's scope-change entry). No scores
+No buyability/suppression rules here (soldered RAM, minimum specs) - V0.9a
+scope note (design.md §5.7): labeling only, no suppression. No scores
 table - scores are recomputable from observations + baselines; only alerts
 (a real delivery decision, not a derived number) get persisted.
 """
@@ -24,10 +25,32 @@ from dealwatch.engine.baselines import select_price
 from dealwatch.engine.scoring import CompiledSeedBaseline, ScoreResult, score_listing
 from dealwatch.normalize.engine import OK, PARTIAL, ProfileCompileError
 from dealwatch.normalize.schema import Profile
-from dealwatch.notify import discord
+from dealwatch.notify import discord, pushover
 from dealwatch.storage.sqlite import get_latest_observation, last_alert, record_alert
 
 logger = logging.getLogger(__name__)
+
+# Fixed env var names for Pushover, unlike Discord's `webhook_env` - a
+# profile can point at any environment variable name it likes for its
+# webhook, but Pushover's credential pair is a per-deployment secret, not
+# a per-profile one worth naming in YAML (nothing else about Pushover is
+# profile-specific).
+PUSHOVER_APP_TOKEN_ENV = "PUSHOVER_APP_TOKEN"
+PUSHOVER_USER_KEY_ENV = "PUSHOVER_USER_KEY"
+
+# name -> module, not name -> bound function. Tests monkeypatch
+# dealwatch.notify.discord.send_alert directly (module-attribute patch, no
+# pluggable-transport abstraction - CLAUDE.md); looking up `.send_alert` on
+# the module object at call time, rather than capturing the function
+# reference once at import time, is what makes that patch visible here.
+# This is dispatch, not a notifier abstraction: two concrete modules behind
+# a dict, nothing more (V0.9a out-of-scope note).
+_NOTIFIER_MODULES = {"discord": discord, "pushover": pushover}
+
+# Sentinel written to alerts.notifier when alerts.notifiers is empty -
+# see run_alert_cycle's docstring for why a row is written at all in that
+# case.
+_NO_NOTIFIER = "none"
 
 _ALERT_CANDIDATE_LISTING = """
     SELECT item_id, profile_id, gone_at, spec_status, variation_id,
@@ -62,6 +85,45 @@ def resolve_webhook_url(profile: Profile) -> str | None:
             "it is unset or empty in the environment"
         )
     return value
+
+
+def resolve_notifier_credentials(profile: Profile) -> dict[str, object]:
+    """{} if profile.alerts is None or alerts.notifiers is empty - both
+    mean "no notifier credentials to check." Otherwise, one entry per name
+    in alerts.notifiers: "discord" -> the webhook URL (via
+    resolve_webhook_url, unchanged), "pushover" -> an (app_token, user_key)
+    tuple read from the fixed PUSHOVER_APP_TOKEN_ENV/PUSHOVER_USER_KEY_ENV
+    names above. schema.py's `Literal["discord", "pushover"]` type on
+    `notifiers` already rejects any other value at profile-load time, so
+    every name reaching this loop is one of exactly these two - no `else`
+    branch needed.
+
+    Any missing/empty credential is a ProfileCompileError, the same
+    "startup error, not a silent no-op discovered at 2am" family as
+    resolve_webhook_url and every other compile_profile check. Called once
+    at startup (Collector.__init__) AND once per run_alert_cycle call, same
+    reasoning as resolve_webhook_url's own docstring: re-reading a handful
+    of already-set environment variables is a dict lookup, not a cost worth
+    caching.
+    """
+    if profile.alerts is None:
+        return {}
+
+    credentials: dict[str, object] = {}
+    for name in profile.alerts.notifiers:
+        if name == "discord":
+            credentials["discord"] = resolve_webhook_url(profile)
+        elif name == "pushover":
+            app_token = os.environ.get(PUSHOVER_APP_TOKEN_ENV)
+            user_key = os.environ.get(PUSHOVER_USER_KEY_ENV)
+            if not app_token or not user_key:
+                raise ProfileCompileError(
+                    "alerts.notifiers includes 'pushover', but "
+                    f"{PUSHOVER_APP_TOKEN_ENV} and {PUSHOVER_USER_KEY_ENV} "
+                    "must both be set and non-empty in the environment"
+                )
+            credentials["pushover"] = (app_token, user_key)
+    return credentials
 
 
 def _passes_realert_drop(price_cents: int, last_price_cents: int, realert_drop_pct: int) -> bool:
@@ -164,17 +226,35 @@ async def run_alert_cycle(
     item_ids: list[str],
     now_ts: int,
 ) -> None:
-    """Evaluate item_ids and, for each survivor, post (or skip posting, in
-    dry_run) and write exactly one alerts row - dry_run=1,
-    delivery_status='dry_run' when not posting, else whatever send_alert
-    returns ('sent' or 'failed').
+    """Evaluate item_ids and, for each survivor, attempt every notifier in
+    alerts.notifiers and write one alerts row per notifier - dry_run=1,
+    delivery_status='dry_run' for each when not actually posting, else
+    whatever that notifier's send_alert returns ('sent' or 'failed').
+
+    Each notifier is attempted independently: one raising must not prevent
+    the others from being tried (V0.9a) - a Pushover outage must not cost
+    the user the Discord alert they'd otherwise have gotten, and vice
+    versa. All of a survivor's rows are written in a single transaction,
+    after every notifier for that survivor has been attempted - a crash
+    mid-send must not leave the item with rows for some notifiers and not
+    others, since last_alert() (storage/sqlite.py) reads across notifiers
+    and a partial write would leave dedup state inconsistent with what was
+    actually sent.
+
+    alerts.notifiers=[] is valid and sends nothing, but still writes one
+    row per survivor with notifier='none', delivery_status='skipped' -
+    same reasoning as the dry-run rows (storage/sqlite.py's last_alert()
+    docstring): without a row, evaluate()'s cooldown/re-alert gate has
+    nothing to dedup against, and every cycle would re-evaluate this
+    survivor as if it had never been seen.
 
     A no-op if profile.alerts is None - a profile without an alerts block
     collects and scores but never alerts (AlertsConfig's docstring).
 
-    Callers (engine/collector.py) are responsible for failure isolation:
-    this does not catch exceptions itself, so a bug here must not be
-    allowed to propagate into a poll/sweep loop uncaught.
+    Callers (engine/collector.py) are responsible for failure isolation at
+    the cycle level: this does not catch every exception itself (a bug in
+    evaluate() or in the transaction below still propagates), so a bug here
+    must not be allowed to propagate into a poll/sweep loop uncaught.
     """
     if profile.alerts is None:
         return
@@ -183,8 +263,9 @@ async def run_alert_cycle(
     if not survivors:
         return
 
-    webhook_url = resolve_webhook_url(profile)
-    dry_run = profile.alerts.dry_run
+    alerts_cfg = profile.alerts
+    dry_run = alerts_cfg.dry_run
+    credentials = resolve_notifier_credentials(profile)
 
     async with httpx.AsyncClient() as client:
         for result in survivors:
@@ -193,28 +274,50 @@ async def run_alert_cycle(
             ).fetchone()
             spec = json.loads(row["spec_json"]) if row and row["spec_json"] else {}
 
-            if dry_run:
-                delivery_status = "dry_run"
+            delivery_statuses: dict[str, str] = {}
+            if not alerts_cfg.notifiers:
+                delivery_statuses[_NO_NOTIFIER] = "skipped"
             else:
-                delivery_status = await discord.send_alert(
-                    webhook_url, result, spec, profile.alerts, client=client
-                )
+                for name in alerts_cfg.notifiers:
+                    if dry_run:
+                        delivery_statuses[name] = "dry_run"
+                        continue
+                    try:
+                        send_alert = _NOTIFIER_MODULES[name].send_alert
+                        delivery_statuses[name] = await send_alert(
+                            credentials[name], result, spec, alerts_cfg, client=client
+                        )
+                    except Exception:
+                        logger.exception(
+                            "notifier=%s raised for item_id=%s",
+                            name,
+                            result.item_id,
+                        )
+                        delivery_statuses[name] = "failed"
 
-            record_alert(
-                conn,
-                result.item_id,
-                profile.id,
-                now_ts,
-                dry_run=dry_run,
-                price_cents=result.price_cents,
-                price_is_price_only=result.price_is_price_only,
-                bucket_key=result.bucket_key,
-                baseline_layer=result.baseline_layer,
-                baseline_match=result.baseline_match,
-                baseline_n=result.baseline_n,
-                baseline_p25_cents=result.baseline_p25_cents,
-                baseline_p50_cents=result.baseline_p50_cents,
-                ratio_to_p25=result.ratio_to_p25,
-                sanity_flagged=result.sanity_flagged,
-                delivery_status=delivery_status,
-            )
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                for name, delivery_status in delivery_statuses.items():
+                    record_alert(
+                        conn,
+                        result.item_id,
+                        profile.id,
+                        now_ts,
+                        dry_run=dry_run,
+                        price_cents=result.price_cents,
+                        price_is_price_only=result.price_is_price_only,
+                        bucket_key=result.bucket_key,
+                        baseline_layer=result.baseline_layer,
+                        baseline_match=result.baseline_match,
+                        baseline_n=result.baseline_n,
+                        baseline_p25_cents=result.baseline_p25_cents,
+                        baseline_p50_cents=result.baseline_p50_cents,
+                        ratio_to_p25=result.ratio_to_p25,
+                        sanity_flagged=result.sanity_flagged,
+                        delivery_status=delivery_status,
+                        notifier=name,
+                    )
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
