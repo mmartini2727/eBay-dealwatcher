@@ -165,17 +165,27 @@ def evaluate(
         if row["variation_id"] is not None and not alerts_cfg.include_variations:
             continue  # gate 3: variation price is typically the lowest one
 
+        bucket_key = row["bucket_key"]
+        if alerts_cfg.require_complete_bucket and (
+            bucket_key is None or "?" in bucket_key
+        ):
+            continue  # gate 4: too incomplete to build a baseline from - see
+            # engine/baselines.py's identical no-question-mark filter. Placed
+            # before scoring, not after: there is no reason to resolve a
+            # baseline and compute a ratio for a listing that can never
+            # alert regardless of the result.
+
         observation = get_latest_observation(conn, item_id)
         selected = select_price(
             observation["total_cents"] if observation else None,
             observation["price_cents"] if observation else None,
         )
         if selected is None:
-            continue  # gate 4: no usable price (e.g. an auction with no BIN)
+            continue  # gate 5: no usable price (e.g. an auction with no BIN)
         price_cents, price_is_price_only = selected
 
         if price_cents > round(alerts_cfg.max_price_usd * 100):
-            continue  # gate 5: over the buying ceiling regardless of score
+            continue  # gate 6: over the buying ceiling regardless of score
 
         spec = json.loads(row["spec_json"]) if row["spec_json"] else {}
         result = score_listing(
@@ -183,7 +193,7 @@ def evaluate(
             profile,
             compiled_seeds,
             item_id=item_id,
-            bucket_key=row["bucket_key"],
+            bucket_key=bucket_key,
             spec=spec,
             price_cents=price_cents,
             price_is_price_only=price_is_price_only,
@@ -191,7 +201,7 @@ def evaluate(
         )
 
         if result.ratio_to_p25 > alerts_cfg.trigger.max_ratio_to_p25:
-            continue  # gate 6/7: not a good enough deal against the baseline
+            continue  # gate 7: not a good enough deal against the baseline
 
         prior = last_alert(conn, item_id)
         if prior is not None:

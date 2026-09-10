@@ -308,6 +308,87 @@ def test_gone_at_equals_last_seen_not_swept_at(tmp_path):
     assert row["gone_at"] != swept_at
 
 
+def test_lifespan_mins_is_null_when_never_confirmed_by_a_sweep(tmp_path):
+    # V0.9b (design.md's dated entry): a listing inserted by a fast poll and
+    # never confirmed present by any sweep keeps last_seen == first_seen,
+    # so its lifespan was never measured, not measured-at-zero.
+    conn = make_conn(tmp_path)
+    sight(conn, "item-1", 1000)  # no sweep ever runs for this item
+
+    swept_at = 1000
+    for _ in range(MISS_THRESHOLD):
+        swept_at += 1000
+        record_sweep(conn, [], PROFILE_ID, swept_at=swept_at)
+
+    row = conn.execute(
+        "SELECT gone_at, lifespan_mins FROM listings WHERE item_id = 'item-1'"
+    ).fetchone()
+    assert row["gone_at"] is not None  # still marked dead
+    assert row["lifespan_mins"] is None  # but the lifespan is honestly unknown
+
+
+def test_lifespan_mins_is_a_real_number_when_swept_at_least_once(tmp_path):
+    conn = make_conn(tmp_path)
+    sight(conn, "item-1", 1000)
+    record_sweep(conn, ["item-1"], PROFILE_ID, swept_at=1500)  # last_seen advances
+
+    swept_at = 1500
+    for _ in range(MISS_THRESHOLD):
+        swept_at += 1000
+        record_sweep(conn, [], PROFILE_ID, swept_at=swept_at)
+
+    row = conn.execute(
+        "SELECT gone_at, lifespan_mins FROM listings WHERE item_id = 'item-1'"
+    ).fetchone()
+    assert row["gone_at"] == 1500
+    assert row["lifespan_mins"] == 8  # (1500 - 1000) // 60 == 8, a real measurement
+
+
+def test_lifespan_mins_zero_from_a_real_sweep_is_not_nulled(tmp_path):
+    # The case the milestone explicitly warns against blanket-nulling: a
+    # listing genuinely swept and found dead within the same minute also
+    # rounds to lifespan_mins = 0 - that IS a real measurement (last_seen >
+    # first_seen) and must survive, distinct from the never-swept case
+    # above which also produces 0 pre-V0.9b but for a different reason.
+    conn = make_conn(tmp_path)
+    sight(conn, "item-1", 1000)
+    record_sweep(conn, ["item-1"], PROFILE_ID, swept_at=1030)  # 30s later, still < 60s
+
+    swept_at = 1030
+    for _ in range(MISS_THRESHOLD):
+        swept_at += 1000
+        record_sweep(conn, [], PROFILE_ID, swept_at=swept_at)
+
+    row = conn.execute(
+        "SELECT last_seen, first_seen, lifespan_mins FROM listings WHERE item_id = 'item-1'"
+    ).fetchone()
+    assert row["last_seen"] > row["first_seen"]
+    assert row["lifespan_mins"] == 0  # a real (if fast) measurement, not NULL
+
+
+def test_lifespan_mins_sabotage_dropping_the_case_breaks_the_never_swept_test(tmp_path):
+    # Sabotage check (design.md's dated entry): the unconditional expression
+    # this replaced - lifespan_mins = (last_seen - first_seen) / 60 - would
+    # write 0, not NULL, for the never-swept case. Built here directly
+    # (not by mutating production code) to prove the test above would have
+    # caught a regression back to that expression.
+    conn = make_conn(tmp_path)
+    sight(conn, "item-1", 1000)
+
+    conn.execute("BEGIN IMMEDIATE")
+    conn.execute(
+        "UPDATE listings SET gone_at = last_seen, "
+        "lifespan_mins = (last_seen - first_seen) / 60 "
+        "WHERE item_id = 'item-1'"
+    )
+    conn.execute("COMMIT")
+
+    row = conn.execute(
+        "SELECT lifespan_mins FROM listings WHERE item_id = 'item-1'"
+    ).fetchone()
+    assert row["lifespan_mins"] == 0  # the bug this milestone fixes
+
+
 def test_miss_then_sighting_resets_miss_count_and_never_sets_gone_at(tmp_path):
     conn = make_conn(tmp_path)
     sight(conn, "item-1", 1000)
@@ -336,8 +417,13 @@ def test_miss_then_sighting_resets_miss_count_and_never_sets_gone_at(tmp_path):
 def test_resurrection_clears_gone_at_and_lifespan(tmp_path, caplog):
     conn = make_conn(tmp_path)
     sight(conn, "item-1", 1000)
-    record_sweep(conn, ["item-1"], PROFILE_ID, swept_at=1000)
-    swept_at = 1000
+    # swept_at=1500, not 1000: this test needs a REAL (non-NULL) lifespan to
+    # assert was cleared - using the same timestamp as first_seen would make
+    # last_seen == first_seen and, since V0.9b, produce a NULL lifespan on
+    # death regardless of resurrection (see the never-swept tests below),
+    # which would make this test pass for the wrong reason.
+    record_sweep(conn, ["item-1"], PROFILE_ID, swept_at=1500)
+    swept_at = 1500
     for _ in range(MISS_THRESHOLD):  # MISS_THRESHOLD-many misses -> gone
         swept_at += 1000
         record_sweep(conn, [], PROFILE_ID, swept_at=swept_at)

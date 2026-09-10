@@ -143,7 +143,8 @@ be recovered.
 | V0.8 | Scoring engine (a-e: baselines, scoring ladder, bucket_key, sweep/pagination data integrity, `poll.sort`) | done |
 | V0.9 | Discord alerts | done, live-verified 2026-09-08 |
 | V0.9a | Multi-notifier support (Discord + Pushover) + scripts baked into the image | done |
-| V0.9b | Soldered-RAM buyability labeling (pulled out of V0.9 - design.md §5.7) | next |
+| V0.9b | `?`-bucket alert gate + honest `lifespan_mins` NULLs | done |
+| V0.9c | Soldered-RAM buyability labeling (pulled out of V0.9 - design.md §5.7) | next |
 | V1.0 | MCP server (streamable HTTP, LAN only) | |
 
 Ship V0.6 even though the normalizer is a stub. Raw titles and prices are

@@ -289,7 +289,79 @@ def test_gate3_allows_a_variation_listing_when_include_variations_is_true(tmp_pa
     assert [r.item_id for r in results] == ["v1|999|456"]
 
 
-def test_gate4_skips_a_listing_with_no_usable_price(tmp_path):
+def test_gate4_skips_a_listing_with_a_fully_unknown_bucket_key(tmp_path):
+    conn = make_conn(tmp_path)
+    seed_listing(conn, "item-1", price_cents=9000, bucket_key="?|?|?")
+    profile = make_profile()
+    seeds = compile_seed_baselines(profile)
+
+    results = alerting.evaluate(conn, profile, seeds, ["item-1"], now_ts=2000)
+    assert results == []
+
+
+def test_gate4_skips_a_listing_with_a_partially_unknown_bucket_key(tmp_path):
+    conn = make_conn(tmp_path)
+    seed_listing(conn, "item-1", price_cents=9000, bucket_key="1|?|16")
+    profile = make_profile()
+    seeds = compile_seed_baselines(profile)
+
+    results = alerting.evaluate(conn, profile, seeds, ["item-1"], now_ts=2000)
+    assert results == []
+
+
+def test_gate4_skips_a_listing_with_a_null_bucket_key(tmp_path):
+    conn = make_conn(tmp_path)
+    seed_listing(conn, "item-1", price_cents=9000, bucket_key=None)
+    profile = make_profile()
+    seeds = compile_seed_baselines(profile)
+
+    results = alerting.evaluate(conn, profile, seeds, ["item-1"], now_ts=2000)
+    assert results == []
+
+
+def test_gate4_allows_a_complete_bucket_key(tmp_path):
+    conn = make_conn(tmp_path)
+    seed_listing(conn, "item-1", price_cents=9000, bucket_key="1|intel-10th|16")
+    profile = make_profile()
+    seeds = compile_seed_baselines(profile)
+
+    results = alerting.evaluate(conn, profile, seeds, ["item-1"], now_ts=2000)
+    assert [r.item_id for r in results] == ["item-1"]
+
+
+def test_gate4_require_complete_bucket_false_lets_a_question_mark_bucket_through(tmp_path):
+    # The escape hatch - a profile can explicitly opt out.
+    conn = make_conn(tmp_path)
+    seed_listing(conn, "item-1", price_cents=9000, bucket_key="1|?|16")
+    profile = make_profile(alerts=make_alerts_config(require_complete_bucket=False))
+    seeds = compile_seed_baselines(profile)
+
+    results = alerting.evaluate(conn, profile, seeds, ["item-1"], now_ts=2000)
+    assert [r.item_id for r in results] == ["item-1"]
+
+
+def test_gate4_runs_before_scoring_not_merely_before_alerting(tmp_path, monkeypatch):
+    # A test that only checks the outcome (results == []) would pass even if
+    # this gate were misplaced AFTER scoring - the milestone's own warning.
+    # Patching score_listing itself and asserting it was never called is
+    # what actually proves the gate runs first.
+    conn = make_conn(tmp_path)
+    seed_listing(conn, "item-1", price_cents=9000, bucket_key="1|?|16")
+    profile = make_profile()
+    seeds = compile_seed_baselines(profile)
+
+    calls = []
+    monkeypatch.setattr(
+        alerting, "score_listing", lambda *a, **k: calls.append((a, k))
+    )
+
+    results = alerting.evaluate(conn, profile, seeds, ["item-1"], now_ts=2000)
+
+    assert results == []
+    assert calls == []
+
+
+def test_gate5_skips_a_listing_with_no_usable_price(tmp_path):
     conn = make_conn(tmp_path)
     # An auction row with no BIN at all: price_cents/total_cents both NULL.
     record_sighting(
@@ -308,7 +380,7 @@ def test_gate4_skips_a_listing_with_no_usable_price(tmp_path):
     assert results == []
 
 
-def test_gate5_skips_a_listing_priced_over_the_buying_ceiling(tmp_path):
+def test_gate6_skips_a_listing_priced_over_the_buying_ceiling(tmp_path):
     conn = make_conn(tmp_path)
     seed_listing(conn, "item-1", price_cents=200000)  # $2000
     profile = make_profile(alerts=make_alerts_config(max_price_usd=1000.0))

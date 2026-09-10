@@ -193,6 +193,15 @@ class AlertsConfig(BaseModel):
     # price is typically the LOWEST variation, so these systematically look
     # like better deals than they are unless a profile opts in explicitly.
     include_variations: bool = False
+    # V0.9b - mirrors engine/baselines.py's own no-question-mark filter
+    # (design.md's dated entry): a bucket_key containing "?" (the
+    # normalize engine's marker for "could not extract this field") is too
+    # incomplete to build a baseline FROM, and a listing scored against a
+    # baseline can't have been resolved any more precisely than the bucket
+    # it's scored under - so it's too incomplete to be called a deal
+    # either. True by default; an escape hatch, not a recommendation to
+    # flip it.
+    require_complete_bucket: bool = True
     title_template: str
     fields: list[str] = []
 

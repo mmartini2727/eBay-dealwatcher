@@ -676,11 +676,27 @@ def record_sweep(
                 (profile_id,),
             )
 
+        # lifespan_mins is NULL, not 0, when last_seen never advanced past
+        # first_seen (V0.9b, design.md's dated entry) - that shape means no
+        # sweep ever confirmed this listing present after it was first
+        # recorded, so "how long did it live" was simply never measured, not
+        # measured-at-zero. engine/baselines.py's derive_candidates() already
+        # excludes exactly these rows from the survival baseline via this
+        # same first_seen == last_seen comparison (V0.8b) - that filter is
+        # authoritative and must keep working standalone; this NULL is for
+        # every OTHER reader of the column (ad-hoc queries, the V1.0 MCP
+        # server), which had no way to tell "never measured" from "sold in
+        # under a minute" before this. A listing genuinely swept and found
+        # dead within the same minute still gets a real 0 here - only the
+        # never-confirmed shape gets NULL. gone_at is unchanged either way:
+        # the listing IS dead, only its lifespan is unknown.
         conn.execute(
             """
             UPDATE listings
             SET gone_at = last_seen,
-                lifespan_mins = (last_seen - first_seen) / 60
+                lifespan_mins = CASE WHEN last_seen > first_seen
+                                     THEN (last_seen - first_seen) / 60
+                                     ELSE NULL END
             WHERE profile_id = ? AND gone_at IS NULL AND miss_count >= ?
             """,
             (profile_id, MISS_THRESHOLD),

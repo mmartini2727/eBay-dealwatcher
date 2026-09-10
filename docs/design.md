@@ -903,11 +903,14 @@ real observed sales" from "the seed chart's estimate for this bucket was
 wrong." Collapsing the two into a single score number would discard exactly
 the information a human needs to decide how much to trust it.
 
-### 5.7 Buyability: label, don't suppress (V0.9b, pending) — scope change, 2026-09-07
+### 5.7 Buyability: label, don't suppress (V0.9c, pending) — scope change, 2026-09-07
 
-Renumbered from V0.9a to V0.9b (2026-09-08): V0.9a itself went to
-multi-notifier support instead (§11's dated entry below) - this section's
-content and status are otherwise unchanged.
+Renumbered twice, neither time because of this section's own content.
+V0.9a to V0.9b (2026-09-08): V0.9a itself went to multi-notifier support
+instead (§11's dated entry). V0.9b to V0.9c (2026-09-09): V0.9b itself went
+to the `?`-bucket alert gate and honest lifespan NULLs instead (§11's later
+dated entry). This section's content and status are otherwise unchanged
+both times - it is still pending, still blocked on the same PSREF check.
 
 A listing can match every spec requirement and still be a bad buy — soldered
 RAM is the first known case: a machine whose RAM can't be upgraded is worth
@@ -945,14 +948,30 @@ that it might be soldered — that throws away a real deal to avoid a false
 positive that was never confirmed. Flag it unverified in the alert text
 instead, and let the buyer decide with the caveat visible.
 
-**Open, blocking data question: which generations actually solder RAM is
-not yet confirmed.** Gen 4 Intel and Gen 1/2 (both vendors) are the current
-working guesses, not verified findings, and must not be encoded as a rule
-until checked against Lenovo's own PSREF/spec sheets or a teardown source.
-A wrong guess here is worse than the unknown-RAM case above: it suppresses
-a real deal with false confidence rather than flagging honest uncertainty.
+**RAM configuration by generation (checked against PSREF, 2026-09-09) -
+the blocking data question above is now mostly resolved:**
 
-**V0.9b, after that PSREF check:** add the `derive:` rule and put the
+| Generation | Configuration |
+| --- | --- |
+| Gen 1/2 | Hybrid - 1 slot soldered, 1 SODIMM |
+| Gen 3/4 | Fully soldered |
+| Gen 5 | Dual SODIMM (fully upgradeable) |
+| Gen 6 (AMD) | Dual SODIMM (fully upgradeable) |
+| Gen 6 (Intel) | Depends on Arrow Lake vs. Lunar Lake - not distinguishable from `cpu_family` alone (both currently normalize to `intel-ultra-2`); needs the CPU model number, which this profile does not currently extract |
+
+Gen 3/4 fully-soldered is the single biggest exposure (every listing in
+that bucket ships with whatever RAM it has, no upgrade path at all), and
+Gen 1/2's hybrid configuration means "soldered" isn't even a whole-machine
+fact there - it's a statement about half the installed RAM. **No
+suppression or labeling rule was built from this table in this milestone**
+despite it resolving most of the previously-blocking uncertainty: current
+alert volume in the Gen 3/4 bucket does not justify the implementation
+cost yet, and Gen 6 Intel's model-number gap means any rule covering "every
+generation" would ship with a known hole in it. This table is here so
+whoever picks up V0.9c has the hardware facts on hand rather than
+re-deriving them, not because a rule is imminent.
+
+**V0.9c, after that PSREF check:** add the `derive:` rule and put the
 attribute in the alert body (`alerts.fields`, §11) — label, don't suppress.
 If the label is wrong you see it and fix it; if a suppression rule is wrong
 you never see the listing and never learn. Whether suppression is worth
@@ -1172,19 +1191,21 @@ whatever `item_ids` that cycle actually touched, new or not, and gates on
 real data (spec_status, price, ratio, cooldown) rather than on the
 fetch mechanism telling it something is new.
 
-### V0.9b scope change (§5.7)
+### V0.9c scope change (§5.7)
 
 Soldered-RAM buyability suppression, originally scoped as part of this
 milestone's target list, was pulled out during this milestone - see §5.7's
-amended entry. Renumbered from V0.9a to V0.9b (2026-09-08) once V0.9a
-itself went to multi-notifier support instead (this file's V0.9a dated
-entry below) - the content below is otherwise unchanged from when it was
-written. The short version: suppression-via-`reject:` would strip
-real comps out of buckets that already have almost none, and the specific
-generation/vendor mapping needed to build it correctly has not been
-verified against Lenovo's own spec sheets. Labeling (rendering the
+amended entry. Renumbered twice since: V0.9a to V0.9b (2026-09-08) once
+V0.9a itself went to multi-notifier support instead (this file's V0.9a
+dated entry below), then V0.9b to V0.9c (2026-09-09) once V0.9b itself went
+to the `?`-bucket alert gate and honest lifespan NULLs instead (this file's
+later V0.9b dated entry) - the content below is otherwise unchanged from
+when it was written. The short version: suppression-via-`reject:` would
+strip real comps out of buckets that already have almost none, and the
+specific generation/vendor mapping needed to build it correctly has not
+been verified against Lenovo's own spec sheets. Labeling (rendering the
 attribute in the alert body once `derive:` produces it) ships in a future
-V0.9b; suppressing anything on an unverified guess does not.
+V0.9c; suppressing anything on an unverified guess does not.
 
 ### Live-verification addendum (2026-09-08)
 
@@ -1322,3 +1343,98 @@ N rows, identical `sent_at`), so the index now matches `last_alert()`'s own
 CLAUDE.md's Operational notes for why the manual step existed (and is now
 obsolete for anything that isn't a same-session edit to a script file
 without a redeploy).
+
+### V0.9b — the `?`-bucket alert gate, and honest lifespan NULLs (2026-09-09)
+
+Two unrelated fixes, motivated by the same class of live-data finding:
+something the system does silently was quietly wrong, and both fixes are
+about making the system say "I don't know" instead of a plausible-looking
+wrong answer.
+
+**Part 1 - `evaluate()` gate 4: do not alert on an incomplete bucket key.**
+Live data: 6 of 17 real alerts (35%) had a `?` somewhere in their
+`bucket_key` (`1|?|16`, `1|?|?`, `4|?|16`) - the normalize engine's own
+marker for "could not extract this field." `engine/baselines.py`'s
+`derive_candidates()` already refuses to let a `?`-bearing bucket key
+contribute a baseline *candidate* (its `no_question_mark` filter, V0.8a) -
+a bucket built from partial specs would poison the very percentiles every
+OTHER listing in that bucket gets scored against. Alerting was not holding
+that same line: a listing scored against a baseline can never have been
+resolved more precisely than the bucket key it's scored under, so scoring
+one with a `?` in it and calling the result "a deal" is the same category
+of mistake `baselines.py` already guards against, just on the read side
+instead of the write side. New gate (`alerts.require_complete_bucket`,
+default `true`) checks this immediately after the existing variation
+exclusion and before `score_listing` is ever called - there is no reason
+to resolve a baseline or compute a ratio for a listing that can't alert
+regardless of the result. This is an alert-path gate only: `?`-bucket
+listings are still sighted, still get observations, still count toward
+everything else. The gate is generic by construction (`?` is the engine's
+unknown marker across every profile), so no profile-specific knowledge
+enters `engine/alerting.py`.
+
+Inserting this gate renumbers the gates after it (4 through 8a/8b in
+`evaluate()`'s comments and this file's own historical descriptions of
+them are now one higher each, except cooldown/re-alert which was already
+labeled 8a/8b and needed no shift) - `tests/test_alerting.py`'s
+`test_gate4`/`test_gate5`/`test_gate6` names were updated to match, so a
+test's number is always the gate's actual position in the chain, not a
+label that drifted out of sync with an inserted check.
+
+**Part 2 - `lifespan_mins` is `NULL`, not `0`, when a listing was never
+sweep-confirmed.** `storage/sqlite.py`'s death-marking `UPDATE` (inside
+`record_sweep`) computed `lifespan_mins = (last_seen - first_seen) / 60`
+unconditionally. `first_seen` is set once, at insert; `last_seen` only
+advances when a **sweep** confirms the listing still present. A listing
+inserted by the 5-minute poll and never confirmed by any sweep before
+dying keeps `last_seen == first_seen`, so this wrote `lifespan_mins = 0` -
+indistinguishable from "sold in under a minute," which is precisely the
+band the survival baseline weighs most heavily. Live count: 61 of 694
+non-null lifespans (8.8%) are exactly 0, and zero are negative - consistent
+with this mechanism, not a clock race. `engine/baselines.py`'s
+`derive_candidates()` was never fooled by this - its own
+`first_seen == last_seen` check (V0.8b) already excludes these rows from
+baseline candidacy, and that filter is unaffected by this change; it must
+keep working standalone and must not start depending on
+`lifespan_mins IS NULL` instead. This fix is for every OTHER reader of the
+column that had no equivalent filter: ad-hoc queries, Datasette, the V1.0
+MCP server - anyone reading `lifespan_mins` directly and trusting a `0` to
+mean what it says.
+
+The fix: `lifespan_mins = CASE WHEN last_seen > first_seen THEN
+(last_seen - first_seen) / 60 ELSE NULL END`. `gone_at` is unchanged
+either way - the listing IS dead, only its lifespan is unknown. A listing
+genuinely swept at least once and found dead within the same minute also
+produces `lifespan_mins = 0`, and that IS a real measurement (`last_seen >
+first_seen`) that must survive untouched - the `CASE` distinguishes the two
+0-producing shapes by the same `first_seen`/`last_seen` comparison
+`baselines.py` already uses, not by the value 0 itself.
+`scripts/backfill_zero_lifespan.py` (new, same dry-run/idempotent shape as
+`scripts/repair_false_gone.py`) nulls existing rows matching
+`lifespan_mins = 0 AND last_seen = first_seen` - the second condition is
+load-bearing: a blanket "null every 0" would destroy the genuine
+fast-sale-within-a-sweep measurements alongside the fabricated ones.
+
+Both changes were sabotage-verified against the real functions: removing
+gate 4 turns the `?|?|?` test red (with a downstream `AttributeError` from
+`score_listing` returning `None` inside a mocked-test context, evidence
+the gate's absence really does let the listing reach scoring); dropping
+the `CASE` back to the unconditional expression turns the never-swept
+lifespan test red (`0` where `None` was expected).
+
+Also decided against, per the milestone's out-of-scope list: no Gen 3/4
+soldered-RAM suppression rule (§5.7's RAM table below informs whoever picks
+that up next, but alert volume in that class doesn't currently justify the
+work); no changes to `accessory` or any other reject rule; no changes to
+scoring or baseline math; no new notifier work; no attempt to raise sweep
+coverage or the miss threshold further (the 8.8% figure here is a known
+consequence of hourly sweeps at ~93% coverage, not a new problem to chase
+in this milestone).
+
+Renumbered from V0.9b to V0.9c (2026-09-09): this milestone (the `?`-bucket
+gate and lifespan NULLs) claimed V0.9b, colliding with the soldered-RAM
+labeling milestone that was itself moved here from V0.9a on 2026-09-08 -
+see §5.7's amended heading and this file's V0.9a entry above. Same
+reasoning as that earlier rename: whichever milestone is actually being
+worked on next keeps the next free letter; a not-yet-built one gets pushed,
+not the other way around.
