@@ -1438,3 +1438,116 @@ see §5.7's amended heading and this file's V0.9a entry above. Same
 reasoning as that earlier rename: whichever milestone is actually being
 worked on next keeps the next free letter; a not-yet-built one gets pushed,
 not the other way around.
+
+## 12. V0.10 — Status module and CLI health script (rough draft, 2026-09-09)
+
+Not yet built. Recorded now, ahead of V0.9c finishing, so the design lands
+in one place before implementation starts rather than being reconstructed
+from a conversation later.
+
+### The problem
+
+There is currently no positive signal that collection is working. Every
+`logger` call in `engine/collector.py` is a warning, an info-on-skip, or an
+exception - a healthy sweep logs nothing, so quiet logs are
+indistinguishable from a dead loop. `/health` reports budget only.
+Answering "did a sweep run in the last hour" today means hand-writing SQL
+against `listings.last_seen` on the host.
+
+### The decision that matters
+
+**One `collect_status()`, several renderers.** The status query set is
+wanted by at least four consumers: a CLI script, `/health` or `/status`,
+the V0.11 dashboard, and the V1.0 MCP `status()` tool. Implemented
+per-consumer, they will drift, and "sweeps today" will quietly mean four
+different things. This is the same drift class as the collector and
+`backfill_normalize.py` diverging on `normalize_input_fields()` (CLAUDE.md,
+"Two triggers, one path"), which cost a week of silently unrepaired rows.
+
+    dealwatch/reporting/status.py   collect_status(conn) -> dict
+    scripts/status.py               prints it
+    main.py                         serves it
+    (V0.11)                         renders it
+    (V1.0)                          exposes it as an MCP tool
+
+`collect_status()` takes a connection and returns a plain dict. No
+printing, no formatting, no FastAPI import, no I/O of its own. Every other
+consumer is a thin shell.
+
+### Rough shape of the payload
+
+Grouped by the question each group answers. Exact fields are milestone work.
+
+- **Is it alive** - age of last sweep and last observation, sweeps and poll
+  cycles today, budget used/remaining/ceiling.
+- **Is it collecting cleanly** - active count, new listings today, deaths
+  today, deaths today that were never swept (the unresolved ~8.8%, §11's
+  V0.9b dated entry), `spec_status` breakdown, `pending`/`stale` counts,
+  last sweep's coverage percentage.
+- **Is it finding anything** - alerts today split dry-run vs real, alerts
+  over 7 days, distinct items alerted, best ratio in 24h.
+- **Is the baseline maturing** - buckets in `baselines`, buckets at or
+  above `min_samples`, dead `spec_status='ok'` count, share of scored
+  listings that fell back to a seed rather than a derived baseline.
+
+The last group is the only readout on whether the survival baseline is
+converging or stalled, and is the reason this milestone is worth its own
+slot rather than being folded into V0.11.
+
+`sweeps` (V0.8d) is what makes "sweeps today" honest. Counting distinct
+`listings.last_seen` values approximates it and breaks the moment two
+sweeps land in the same second.
+
+### Live verification
+
+Mocks prove the SQL shape. They cannot prove the numbers are true. Verify
+against the live LXC database by cross-checking at least two fields
+against hand-written SQL, and by confirming the sweep-age field moves
+after a real sweep lands.
+
+## 13. V0.11 — LAN dashboard (rough draft, 2026-09-09)
+
+Not yet built - depends on V0.10's `collect_status()` existing first (§12).
+Recorded now for the same reason as §12.
+
+### Scope
+
+One server-rendered HTML page over `collect_status()` plus a small number
+of bounded list queries. Jinja2, no build step, no framework, no npm.
+`<meta http-equiv="refresh">` for auto-update.
+
+### Decisions
+
+**Read-only, permanently.** Nothing in the UI mutates data, triggers a
+sweep, fires an alert, or edits a profile. Same posture as the MCP server
+(§8): a query interface over data the collector already gathered, not a
+control plane. A dashboard that can act is a dashboard that can act by
+accident.
+
+**No new trust boundary.** The app is already published on 0.0.0.0:8087
+with no authentication and the LXC is not port-forwarded (§3.1). A page on
+the same app adds nothing to the exposure surface and therefore needs no
+auth of its own. This holds only as long as the LAN-only property does.
+
+**Vendor static assets; no CDN.** A dashboard that breaks when the WAN link
+is down fails at one of the times it is most wanted. Any chart library
+ships as a file in `static/`.
+
+**Bound every query.** Existing indexes are `(item_id, observed_at)` and
+`(bucket_key, gone_at)`. A "most recent listings" panel ordering by
+`first_seen DESC` hits neither and full-scans `listings` on every render,
+on a refresh timer, while the collector writes. Either constrain each
+panel with an indexed predicate or add the covering index as a migration -
+decided in-milestone, but decided before the page exists.
+
+### Rough panel set
+
+Status block as plain numbers; alerts-per-day over ~14 days; last N alerts
+with live eBay links; last N listings ingested; baseline coverage as
+buckets-at-threshold over total. One screen.
+
+### Live verification
+
+Load it on the LAN from a machine that is not the LXC, with the WAN link
+down, and confirm every panel renders and the numbers agree with
+`scripts/status.py` run at the same moment.

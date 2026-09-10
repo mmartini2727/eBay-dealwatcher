@@ -145,6 +145,8 @@ be recovered.
 | V0.9a | Multi-notifier support (Discord + Pushover) + scripts baked into the image | done |
 | V0.9b | `?`-bucket alert gate + honest `lifespan_mins` NULLs | done |
 | V0.9c | Soldered-RAM buyability labeling (pulled out of V0.9 - design.md §5.7) | next |
+| V0.10 | Status module + CLI health script (design.md §12) | |
+| V0.11 | LAN dashboard, server-rendered, read-only (design.md §13) | |
 | V1.0 | MCP server (streamable HTTP, LAN only) | |
 
 Ship V0.6 even though the normalizer is a stub. Raw titles and prices are

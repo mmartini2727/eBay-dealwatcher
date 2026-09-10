@@ -72,6 +72,8 @@ dealwatch/
 │ └── _shared.py (V0.9a) rendering helpers shared by the two above
 ├── storage/
 │ └── sqlite.py connection + WAL + forward-only migrations
+├── reporting/
+│ └── status.py (V0.10) collect_status(conn) -> dict — one query set, several renderers (CLI, /health, V0.11 dashboard, V1.0 MCP tool)
 └── mcp_server/
 └── server.py (V1.0) streamable HTTP, LAN only
 ```
