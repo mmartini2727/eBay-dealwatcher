@@ -971,7 +971,7 @@ generation" would ship with a known hole in it. This table is here so
 whoever picks up V0.9c has the hardware facts on hand rather than
 re-deriving them, not because a rule is imminent.
 
-**V0.9c, after that PSREF check:** add the `derive:` rule and put the
+**V0.9c on hold, after that PSREF check:** add the `derive:` rule and put the
 attribute in the alert body (`alerts.fields`, §11) — label, don't suppress.
 If the label is wrong you see it and fix it; if a suppression rule is wrong
 you never see the listing and never learn. Whether suppression is worth
