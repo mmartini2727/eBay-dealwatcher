@@ -10,7 +10,7 @@ UPDATE makes it atomic: two callers racing at the ceiling can't both read
 """
 
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from dealwatch.config import Settings
@@ -28,6 +28,28 @@ class BudgetExhausted(Exception):
 
 def _today_la() -> str:
     return datetime.now(PACIFIC).date().isoformat()
+
+
+def la_day_bounds(now: int) -> tuple[int, int]:
+    """[start, end) epoch seconds of the America/Los_Angeles calendar day
+    containing `now`.
+
+    V0.10 (design.md §12): dealwatch.reporting.status.collect_status needs
+    the day boundary as epoch seconds, because swept_at/first_seen/gone_at/
+    sent_at are all Unix seconds - _today_la()'s ISO date string can't be
+    used in a range filter. This is an addition next to that existing
+    "today" definition, not a replacement or a refactor: a second,
+    independent definition of "today" living in reporting/ is exactly the
+    drift this function exists to prevent. _today_la()/reserve()/status()/
+    DailyBudget are untouched by this - the budget's day boundary is live
+    production behavior across two DST transitions a year and out of scope
+    for a reporting milestone.
+    """
+    day_start = datetime.fromtimestamp(now, PACIFIC).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    day_end = day_start + timedelta(days=1)
+    return int(day_start.timestamp()), int(day_end.timestamp())
 
 
 class DailyBudget:

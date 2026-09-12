@@ -9,7 +9,7 @@ import threading
 from datetime import date, datetime, timedelta
 
 from dealwatch.config import Settings
-from dealwatch.providers.ratelimit import PACIFIC, DailyBudget, _today_la
+from dealwatch.providers.ratelimit import PACIFIC, DailyBudget, _today_la, la_day_bounds
 from dealwatch.storage.sqlite import connect, default_db_path
 
 
@@ -182,3 +182,48 @@ def test_pacific_has_dst_not_a_fixed_offset():
     january = datetime(2026, 1, 15, tzinfo=PACIFIC).utcoffset()
     july = datetime(2026, 7, 15, tzinfo=PACIFIC).utcoffset()
     assert january != july
+
+
+# ---------------------------------------------------------------------------
+# la_day_bounds (V0.10, design.md §12) - the epoch-seconds companion to
+# _today_la(), added for dealwatch.reporting.status. Breaking the agreement
+# between the two would silently give the status module a different
+# "today" than the budget uses - these tests are what keeps that from
+# drifting unnoticed.
+# ---------------------------------------------------------------------------
+
+
+def test_la_day_bounds_agrees_with_today_la():
+    now = int(datetime.now(PACIFIC).timestamp())
+    start, _end = la_day_bounds(now)
+    assert datetime.fromtimestamp(start, PACIFIC).date().isoformat() == _today_la()
+
+
+def test_la_day_bounds_is_a_24_hour_span_on_an_ordinary_day():
+    # 2026-09-10 has no DST transition.
+    now = int(datetime(2026, 9, 10, 15, 0, tzinfo=PACIFIC).timestamp())
+    start, end = la_day_bounds(now)
+    assert end - start == 24 * 3600
+
+
+def test_la_day_bounds_is_23_hours_on_the_spring_forward_day():
+    # 2026-03-08: US DST starts at 2am, so this calendar day is 23 hours
+    # long in UTC terms - a fixed 86400-second span would be wrong here.
+    now = int(datetime(2026, 3, 8, 12, 0, tzinfo=PACIFIC).timestamp())
+    start, end = la_day_bounds(now)
+    assert end - start == 23 * 3600
+
+
+def test_la_day_bounds_is_25_hours_on_the_fall_back_day():
+    # 2026-11-01: US DST ends, so this calendar day is 25 hours long.
+    now = int(datetime(2026, 11, 1, 12, 0, tzinfo=PACIFIC).timestamp())
+    start, end = la_day_bounds(now)
+    assert end - start == 25 * 3600
+
+
+def test_la_day_bounds_start_is_midnight_and_end_is_exclusive():
+    now = int(datetime(2026, 9, 10, 23, 59, 59, tzinfo=PACIFIC).timestamp())
+    start, end = la_day_bounds(now)
+    assert datetime.fromtimestamp(start, PACIFIC) == datetime(2026, 9, 10, 0, 0, 0, tzinfo=PACIFIC)
+    assert datetime.fromtimestamp(end, PACIFIC) == datetime(2026, 9, 11, 0, 0, 0, tzinfo=PACIFIC)
+    assert start <= now < end
