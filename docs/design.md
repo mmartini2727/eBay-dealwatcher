@@ -1594,10 +1594,18 @@ profile exists.** The code comment at this query site in `reporting/
 status.py` states this plainly, with the measured numbers, rather than
 the "O(1) tail read" framing the original design draft implied.
 
-## 13. V0.11 — LAN dashboard (rough draft, 2026-09-09)
+## 13. V0.11 — LAN dashboard (built 2026-09-12, in two prompts)
 
-Not yet built - depends on V0.10's `collect_status()` existing first (§12).
-Recorded now for the same reason as §12.
+Built to this draft in two passes: prompt 1 was the data layer
+(`reporting/panels.py`, `reporting/indicators.py`, `reporting/
+dashboard_data.py`, migration 8's two `profile_id`-leading indexes),
+already shipped and schema-verified at version 8 before prompt 2 started.
+Prompt 2 was the render layer (`main.py`'s `GET /`, `dashboard/templates/
+dashboard.html`) plus six data-layer amendments prompt 1's own live
+verification surfaced - see the addendum below for what those were and
+why. Not yet live-verified against the real LXC database over a WAN-down
+LAN connection - see this section's own "Live verification" plan below,
+still the outstanding step.
 
 ### Scope
 
@@ -1621,6 +1629,16 @@ auth of its own. This holds only as long as the LAN-only property does.
 **Vendor static assets; no CDN.** A dashboard that breaks when the WAN link
 is down fails at one of the times it is most wanted. Any chart library
 ships as a file in `static/`.
+
+*Correction, prompt 2:* no chart library was needed at all, so there is no
+`static/` directory and no `StaticFiles` mount - the alerts-per-day chart
+is 14 plain CSS `<div>`s (a bar-height percentage against the window's
+max, computed once per render), and the page's CSS lives in a single
+inline `<style>` block in `dashboard.html`. One file, nothing to vendor,
+nothing to get a path wrong on. If a real chart library ever becomes
+necessary, *then* it should be vendored as a file exactly as this
+decision already anticipated - the decision was right, the dashboard just
+never needed to invoke it.
 
 **Bound every query.** Existing indexes are `(item_id, observed_at)` and
 `(bucket_key, gone_at)`. A "most recent listings" panel ordering by
@@ -1650,6 +1668,84 @@ addendum has the measurements) - nothing to do about this while there is
 only one profile, but V0.11 must not build on the assumption it stays
 that way.
 
+### Build addendum (prompt 2, 2026-09-12)
+
+**The baseline-coverage denominator, and why `collect_status()` doesn't
+have it.** `collect_status()`'s baseline group reports
+`baseline_buckets_total` - the count of buckets that made it into the
+`baselines` table - and deliberately no denominator: its own docstring
+notes that "buckets at min_samples" would always equal that same total,
+since `compute_baselines()` already drops anything under `min_samples`
+before a row is ever written, so a second field counting that would just
+restate the first under a different name. That's the right call for V0.10's
+question ("is the baseline maturing" - only cares about buckets that
+already have one). The dashboard's coverage panel asks a different
+question - a maturity *fraction* - which needs a real denominator: how
+many distinct, complete (`?`-free) bucket keys exist among this profile's
+*active* listings at all, whether or not they've reached `min_samples`
+yet. That number was never computable from `collect_status()`'s payload,
+so `panels.baseline_coverage()` computes it directly against `listings`
+rather than adding a second, differently-scoped definition of
+`baseline_buckets_total` to the status module. At the time this shipped,
+that fraction was 2/28 (~7%) - the real state of survival-baseline
+maturity, not a bug in the panel. The denominator is scoped to *active*
+listings specifically (`gone_at IS NULL`) so it tracks current market
+inventory, not all-time history - and moves accordingly: a new hardware
+generation appearing lowers it with no baseline regression at all, which
+is why the panel is labeled "complete buckets with computed baselines,"
+never "coverage" (a word that reads as a health score trending toward
+100%, which this number is not built to do).
+
+**`coverage_fraction`, not `coverage_pct`.** The panel's own field is a
+0..1 fraction (0.0714 at 2/28), and naming a fraction `_pct` is exactly
+the scaling mismatch `indicators.py`'s own `last_sweep_coverage_pct`
+handling exists to get right elsewhere in this same payload - except this
+value goes straight to a template panel with no indicators.py layer in
+between to catch it. Renamed to `coverage_fraction`; a second field,
+`coverage_display` ("7%", or "unknown" with no denominator), carries the
+percent-scaled, ready-to-print string, so the *100 arithmetic happens in
+tested Python, not in `dashboard.html` - the one file in this codebase
+the test suite cannot reach directly.
+
+**`indicators.py` was flattened to one level, with a `group` tag, before
+the template was written.** The original per-prompt-1 shape nested every
+alerts-related indicator under one `"alerts"` sub-key while every
+collector-health indicator sat at the top level - meaning the single loop
+the template needed to write (one row per indicator, styled by `state`)
+would `KeyError` the moment it reached that one nested key. Flattened to
+one dict, every entry now carrying `"group": "health" | "alerts" |
+"baseline"`, so the template can loop once and filter by tag instead of
+needing a second, differently-shaped loop for the nested case.
+
+**A failure mode `build_payload()`'s per-section isolation could not
+reach, found only by running the real container.** Every unit and route
+test seeds a database before rendering against it, so none of them ever
+exercised the one thing a genuinely fresh deployment does first:
+`connect_readonly()` itself raising `unable to open database file`
+because nothing has ever created `data/dealwatch.db` yet - no collector
+run (missing credentials, exactly B1's scenario), no `/health` hit
+either. That failure happens in `get_payload()`, *before* `build_payload()`
+ever gets to isolate anything into a per-section `{"error": ...}` - so the
+route 500'd outright on a container's very first request, the opposite of
+this milestone's whole "the page must render when things are broken"
+premise. Confirmed live: a fresh `docker build` + `docker run` with no
+eBay credentials and a bind-mounted `profiles/` 500'd on the first `GET /`
+and started succeeding only after a second request (which happened to
+reach `/health`, whose `DailyBudget` write path creates and migrates the
+file as a side effect). Fixed by giving `get_payload()` its own fallback:
+if opening the connection itself fails, it returns a payload where every
+section already carries that same `{"error": ...}` shape `_safe()`
+produces per-section, rather than letting the exception propagate past
+`build_payload()` entirely. Re-verified against the same fresh-container
+shape after the fix: first request now renders 200 with every panel
+showing "Panel unavailable." `tests/test_dashboard_data.py::
+test_get_payload_survives_a_database_that_does_not_exist_yet` and
+`tests/test_dashboard_route.py::
+test_dashboard_renders_when_the_database_has_never_been_created` pin this
+so it can't regress silently - Docker was the only environment that ever
+exercised it; every sqlite-backed test fixture pre-creates its database
+by construction.
+
 ### Rough panel set
 
 Status block as plain numbers; alerts-per-day over ~14 days; last N alerts
@@ -1661,3 +1757,19 @@ buckets-at-threshold over total. One screen.
 Load it on the LAN from a machine that is not the LXC, with the WAN link
 down, and confirm every panel renders and the numbers agree with
 `scripts/status.py` run at the same moment.
+
+**Done so far (2026-09-12): a local `docker build` + `docker run` of the
+real image, not the real LXC.** Confirmed `pip show -f dealwatch` inside
+the built container lists `dealwatch/dashboard/templates/dashboard.html`
+(hatchling includes package data under `packages = ["dealwatch"]` with no
+extra `pyproject.toml` config needed - verified both against a `.git`-free
+wheel build matching the Dockerfile's exact `COPY` context, and inside the
+actual built image). Confirmed `GET /` and `GET /health` both return 200
+against a bind-mounted `profiles/` with no eBay credentials set (the
+container-never-started-a-collector scenario B1 targets), and found the
+fresh-database failure mode described in the addendum above in the
+process. **Not yet done: the real LXC, real data, WAN-down check this
+section originally called for** - the local Docker run used a
+freshly-created empty-then-single-listing database, not the production
+one, and never exercised the actual sweep/alert history the panels are
+meant to summarize.

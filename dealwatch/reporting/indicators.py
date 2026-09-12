@@ -3,11 +3,22 @@ design.md §13). No database access, no I/O - build_indicators() is a
 function of its inputs only, so every branch is testable without a
 connection.
 
-Each indicator is {"state", "label", "value"}, where state is one of:
+Each indicator is {"state", "label", "value", "group"}, where state is one
+of:
   - "ok"      - evaluated, healthy
   - "warn"    - evaluated, not healthy
   - "unknown" - not evaluable, distinct from unhealthy
   - "info"    - no health judgment; display the value only
+
+and group is one of "health" | "alerts" | "baseline" - which panel section
+the template renders the indicator under. build_indicators() returns one
+flat dict, not the health/alerts split an earlier draft had: a nested
+"alerts" sub-dict meant any single loop over the payload (the template's
+whole rendering strategy) hit a KeyError the moment it reached that key.
+Flat, tagged with `group`, lets one loop render every indicator and filter
+by tag - insertion order is preserved (health, then alerts, then baseline),
+so a template that renders in dict order still groups correctly without
+sorting.
 
 The "unknown" state is this module's entire reason for existing separately
 from a template that just eyeballs collect_status()'s dict. collect_status()
@@ -55,18 +66,33 @@ STALE_WARN = 25
 # `ceiling` itself, enforced by providers/ratelimit.py, not by this module.
 BUDGET_WARN_PCT = 80.0
 
+# 48 hours. A judgment call, not a derived number: anchored on the observed
+# dead spec_status='ok' death rate (~279 over 7 days at the time this was
+# written, design.md §13's live-verification addendum) - baselines going
+# stale for two full days while listings keep dying at that rate means the
+# survival pool has moved meaningfully since the last recompute without
+# anyone knowing. scripts/recompute_baselines.py is manual-only (no cron,
+# no collector hook) - this indicator is the only thing that will ever
+# surface that drift; nothing else in the system watches this age at all.
+BASELINE_STALE_WARN_MINS = 2880
 
-def _indicator(state: str, label: str, value=None) -> dict:
-    return {"state": state, "label": label, "value": value}
+
+def _indicator(state: str, label: str, value, group: str) -> dict:
+    return {"state": state, "label": label, "value": value, "group": group}
 
 
-def _threshold_indicator(value, warn_above, label, *, fmt=str) -> dict:
+def _threshold_indicator(value, warn_above, label, group, *, fmt=str) -> dict:
     """ok/warn/unknown for "a count that should stay below a ceiling."
     `value` is None exactly when the underlying metric is unevaluable."""
     if value is None:
-        return _indicator("unknown", label)
+        return _indicator("unknown", label, None, group)
     state = "warn" if value > warn_above else "ok"
-    return _indicator(state, label, fmt(value))
+    return _indicator(state, label, fmt(value), group)
+
+
+# state -> the word the rollup's value renders, so the template never
+# invents "healthy"/"degraded" itself from a bare ok/warn/unknown state.
+_ROLLUP_VALUE = {"ok": "healthy", "warn": "degraded", "unknown": "unknown"}
 
 
 def build_indicators(
@@ -79,50 +105,63 @@ def build_indicators(
     alive = status["alive"]
     collecting = status["collecting"]
     finding = status["finding"]
+    baseline = status["baseline"]
 
-    # --- collector health -------------------------------------------------
+    # --- collector health ---------------------------------------------
 
     last_sweep_age = alive["last_sweep_started_age_mins"]
     if last_sweep_age is None:
-        last_sweep = _indicator("unknown", "Last sweep")
+        last_sweep = _indicator("unknown", "Last sweep", None, "health")
     else:
         warn_above = SWEEP_AGE_WARN_MULTIPLIER * sweep_interval_minutes
         state = "warn" if last_sweep_age > warn_above else "ok"
-        last_sweep = _indicator(state, "Last sweep", f"{last_sweep_age} min ago")
+        last_sweep = _indicator(state, "Last sweep", f"{last_sweep_age} min ago", "health")
 
     coverage_pct = collecting["last_sweep_coverage_pct"]
     if coverage_pct is None:
-        sweep_coverage = _indicator("unknown", "Sweep coverage")
+        sweep_coverage = _indicator("unknown", "Sweep coverage", None, "health")
     else:
         coverage_pct_display = coverage_pct * 100
         state = "ok" if coverage_pct_display >= COVERAGE_WARN_PCT else "warn"
-        sweep_coverage = _indicator(state, "Sweep coverage", f"{coverage_pct_display:.1f}%")
+        sweep_coverage = _indicator(
+            state, "Sweep coverage", f"{coverage_pct_display:.1f}%", "health"
+        )
 
     consistent = alive["sweep_bookkeeping_consistent"]
     if consistent is None:
-        bookkeeping = _indicator("unknown", "Bookkeeping")
+        bookkeeping = _indicator("unknown", "Bookkeeping", None, "health")
     else:
         bookkeeping = _indicator(
-            "ok" if consistent else "warn", "Bookkeeping", "consistent" if consistent else "mismatch"
+            "ok" if consistent else "warn",
+            "Bookkeeping",
+            "consistent" if consistent else "mismatch",
+            "health",
         )
 
     # Rollup over exactly these three - "unknown" outranks "ok" but not
     # "warn": a component that can't be evaluated is not the same as a
     # clean bill of health, but it also isn't itself an active problem the
-    # way "warn" is.
+    # way "warn" is. Deliberately does NOT include baselines_age (A5,
+    # below): this rollup answers "is the collector alive," baselines_age
+    # answers "is scoring current" - conflating them would let one mask
+    # the other on the one indicator most likely to get glanced at.
     _RANK = {"ok": 0, "unknown": 1, "warn": 2}
     worst = max((last_sweep, sweep_coverage, bookkeeping), key=lambda ind: _RANK[ind["state"]])
-    collector_rollup = _indicator(worst["state"], "Collector")
+    collector_rollup = _indicator(
+        worst["state"], "Collector", _ROLLUP_VALUE[worst["state"]], "health"
+    )
 
     pending_specs = _threshold_indicator(
         collecting["spec_status_counts_active"].get("pending", 0),
         PENDING_WARN,
         "Pending specs",
+        "health",
     )
     stale_specs = _threshold_indicator(
         collecting["spec_status_counts_active"].get("stale", 0),
         STALE_WARN,
         "Stale specs",
+        "health",
     )
 
     budget = alive["budget"]
@@ -133,7 +172,7 @@ def build_indicators(
     # case) - a percentage needs both operands, and guessing either one
     # produces exactly the false "ok" this module exists to prevent.
     if ceiling is None or used is None:
-        budget_indicator = _indicator("unknown", "Budget")
+        budget_indicator = _indicator("unknown", "Budget", None, "health")
     else:
         used_pct = used / ceiling * 100 if ceiling else 100.0
         # design.md's rule table says "ok below BUDGET_WARN_PCT; warn
@@ -142,48 +181,71 @@ def build_indicators(
         # convention in engine/scoring.py: the boundary itself already
         # counts as crossed, not as the last safe value).
         state = "warn" if used_pct >= BUDGET_WARN_PCT else "ok"
-        budget_indicator = _indicator(state, "Budget", f"{used} / {ceiling} ({used_pct:.0f}%)")
+        budget_indicator = _indicator(
+            state, "Budget", f"{used} / {ceiling} ({used_pct:.0f}%)", "health"
+        )
 
     period_is_today = budget["period_is_today"]
     if period_is_today is None:
-        budget_period = _indicator("unknown", "Budget period")
+        budget_period = _indicator("unknown", "Budget period", None, "health")
     else:
         budget_period = _indicator(
             "ok" if period_is_today else "warn",
             "Budget period",
             "current" if period_is_today else "stale",
+            "health",
         )
 
-    # --- alerts -------------------------------------------------------
+    # --- baseline -------------------------------------------------------
 
-    mode = _indicator("warn" if dry_run else "ok", "Mode", "dry run" if dry_run else "live")
+    baselines_age_mins = baseline["baselines_computed_age_mins"]
+    if baselines_age_mins is None:
+        baselines_age = _indicator("unknown", "Baselines age", None, "baseline")
+    else:
+        state = "warn" if baselines_age_mins > BASELINE_STALE_WARN_MINS else "ok"
+        baselines_age = _indicator(
+            state, "Baselines age", f"{baselines_age_mins} min ago", "baseline"
+        )
+
+    # --- alerts -----------------------------------------------------
+
+    mode = _indicator("warn" if dry_run else "ok", "Mode", "dry run" if dry_run else "live", "alerts")
 
     notifiers_indicator = _indicator(
-        "warn" if not notifiers else "ok", "Notifiers", ", ".join(notifiers)
+        "warn" if not notifiers else "ok", "Notifiers", ", ".join(notifiers), "alerts"
     )
 
     failed_today = finding["delivery_status_row_counts_today"].get("failed", 0)
     delivery_failures = _indicator(
-        "ok" if failed_today == 0 else "warn", "Delivery failures today", str(failed_today)
+        "ok" if failed_today == 0 else "warn",
+        "Delivery failures today",
+        str(failed_today),
+        "alerts",
     )
 
     live = finding["alert_events_today_live"]
     dry = finding["alert_events_today_dry"]
-    alerts_today = _indicator("info", "Alerts today", f"{live} live / {dry} dry")
+    # "(PT)" explicit, not just "today" (V0.11's C4 requirement): "today"
+    # and "24h" are different windows that can legitimately disagree (an
+    # alert fired late yesterday evening sits in a rolling 24h window but
+    # not in today's LA-calendar window) - the live data has hit exactly
+    # this case (best_ratio_24h=0.86 next to alerts_today=0). Proximity in
+    # a layout must never be left to imply a shared window.
+    alerts_today = _indicator("info", "Alerts today (PT)", f"{live} live / {dry} dry", "alerts")
 
-    alerts_7d = _indicator("info", "Alerts (7d)", str(finding["alert_events_7d"]))
+    alerts_7d = _indicator("info", "Alerts (7d)", str(finding["alert_events_7d"]), "alerts")
 
     distinct_items_7d = _indicator(
-        "info", "Distinct items alerted (7d)", str(finding["distinct_items_alerted_7d"])
+        "info", "Distinct items alerted (7d)", str(finding["distinct_items_alerted_7d"]), "alerts"
     )
 
     best_ratio = finding["best_ratio_24h"]
     if best_ratio is None:
         # No alerts in the window is not the same as "found a 0.0 ratio
         # deal" - unknown, not a fabricated best-case or worst-case number.
-        best_ratio_24h = _indicator("unknown", "Best ratio (24h)")
+        best_ratio_24h = _indicator("unknown", "Best ratio (24h)", None, "alerts")
     else:
-        best_ratio_24h = _indicator("info", "Best ratio (24h)", f"{best_ratio:.2f}")
+        best_ratio_24h = _indicator("info", "Best ratio (24h)", f"{best_ratio:.2f}", "alerts")
 
     return {
         "collector": collector_rollup,
@@ -194,13 +256,12 @@ def build_indicators(
         "stale_specs": stale_specs,
         "budget": budget_indicator,
         "budget_period": budget_period,
-        "alerts": {
-            "mode": mode,
-            "notifiers": notifiers_indicator,
-            "delivery_failures_today": delivery_failures,
-            "alerts_today": alerts_today,
-            "alerts_7d": alerts_7d,
-            "distinct_items_alerted_7d": distinct_items_7d,
-            "best_ratio_24h": best_ratio_24h,
-        },
+        "baselines_age": baselines_age,
+        "mode": mode,
+        "notifiers": notifiers_indicator,
+        "delivery_failures_today": delivery_failures,
+        "alerts_today": alerts_today,
+        "alerts_7d": alerts_7d,
+        "distinct_items_alerted_7d": distinct_items_7d,
+        "best_ratio_24h": best_ratio_24h,
     }

@@ -105,7 +105,32 @@ def test_alerts_per_day_counts_events_not_rows(tmp_path):
 
     assert len(entries) == 1
     assert entries[0]["day_start"] == _TODAY_START
-    assert entries[0]["count"] == 1
+    assert entries[0]["count_live"] == 1
+
+
+def test_alerts_per_day_splits_live_from_dry_run(tmp_path):
+    # A1: a mode-merged count would make a dry-run calibration day read as
+    # a real spike - live and dry must land in separate fields.
+    conn = make_conn(tmp_path)
+    seed_listing(conn, "item-1")
+    seed_listing(conn, "item-2")
+    seed_alert(conn, "item-1", sent_at=_TODAY_START + 100, dry_run=False)
+    seed_alert(conn, "item-2", sent_at=_TODAY_START + 200, dry_run=True)
+    seed_alert(conn, "item-2", sent_at=_TODAY_START + 300, dry_run=True)
+
+    entries = panels.alerts_per_day(conn, PROFILE, days=1, now=_NOON)
+
+    assert entries[0]["count_live"] == 1
+    assert entries[0]["count_dry"] == 2
+
+
+def test_alerts_per_day_label_is_the_short_calendar_date(tmp_path):
+    conn = make_conn(tmp_path)
+    seed_listing(conn, "item-1")
+
+    entries = panels.alerts_per_day(conn, PROFILE, days=1, now=_NOON)
+
+    assert entries[0]["label"] == "Sep 10"
 
 
 def test_alerts_per_day_is_oldest_first_with_no_gaps(tmp_path):
@@ -122,7 +147,7 @@ def test_alerts_per_day_is_oldest_first_with_no_gaps(tmp_path):
         gap_hours = (later - earlier) / 3600
         assert 23 <= gap_hours <= 25  # 24h normally, 23/25 across a DST boundary
     assert entries[-1]["day_start"] == _TODAY_START
-    assert entries[-1]["count"] == 1
+    assert entries[-1]["count_live"] == 1
 
 
 def test_alerts_per_day_spans_the_fall_back_dst_transition(tmp_path):
@@ -151,7 +176,7 @@ def test_alerts_per_day_spans_the_fall_back_dst_transition(tmp_path):
     assert len(set(day_starts)) == 14  # every day distinct - none skipped or duplicated
     assert nov_1_start in day_starts
     nov_1_entry = next(e for e in entries if e["day_start"] == nov_1_start)
-    assert nov_1_entry["count"] == 1
+    assert nov_1_entry["count_live"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +219,8 @@ def test_recent_alerts_includes_listing_title_and_url(tmp_path):
     assert r["baseline_layer"] == "computed"
     assert r["dry_run"] is False
     assert r["delivery_statuses"] == {"discord": "sent"}
+    assert r["price_display"] == "$90.00"  # A6: seed_alert()'s default price_cents=9000
+    assert r["sent_at_display"] != "unknown"
 
 
 def test_recent_alerts_respects_profile_isolation(tmp_path):
@@ -233,6 +260,18 @@ def test_recent_listings_price_prefers_total_cents_over_price_cents(tmp_path):
     results = panels.recent_listings(conn, PROFILE, limit=10)
 
     assert results[0]["price_cents"] == 10500  # latest observation; total_cents wins
+    assert results[0]["price_display"] == "$105.00"
+    assert results[0]["first_seen_display"] != "unknown"
+
+
+def test_recent_listings_price_display_is_unknown_with_no_observation(tmp_path):
+    conn = make_conn(tmp_path)
+    seed_listing(conn, "item-1", first_seen=1000)
+
+    results = panels.recent_listings(conn, PROFILE, limit=10)
+
+    assert results[0]["price_cents"] is None
+    assert results[0]["price_display"] == "unknown"
 
 
 def test_recent_listings_reports_active_flag(tmp_path):
@@ -264,7 +303,8 @@ def test_baseline_coverage_excludes_incomplete_and_null_bucket_keys(tmp_path):
 
     assert coverage["buckets_observed"] == 2
     assert coverage["buckets_with_baseline"] == 1
-    assert coverage["coverage_pct"] == 0.5
+    assert coverage["coverage_fraction"] == 0.5
+    assert coverage["coverage_display"] == "50%"
 
 
 def test_baseline_coverage_excludes_dead_listings(tmp_path):
@@ -274,4 +314,5 @@ def test_baseline_coverage_excludes_dead_listings(tmp_path):
     coverage = panels.baseline_coverage(conn, PROFILE)
 
     assert coverage["buckets_observed"] == 0
-    assert coverage["coverage_pct"] is None  # not a ZeroDivisionError, not 0.0
+    assert coverage["coverage_fraction"] is None  # not a ZeroDivisionError, not 0.0
+    assert coverage["coverage_display"] == "unknown"

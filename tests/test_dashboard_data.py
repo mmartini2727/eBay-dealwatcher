@@ -129,7 +129,28 @@ def test_cache_treats_a_kwargs_change_as_a_miss(tmp_path):
         first = dashboard_data.get_payload(db_path, ttl_seconds=60, **_kwargs(dry_run=False))
         second = dashboard_data.get_payload(db_path, ttl_seconds=60, **_kwargs(dry_run=True))
 
-        assert first["indicators"]["alerts"]["mode"]["state"] == "ok"
-        assert second["indicators"]["alerts"]["mode"]["state"] == "warn"
+        assert first["indicators"]["mode"]["state"] == "ok"
+        assert second["indicators"]["mode"]["state"] == "warn"
     finally:
         writer.close()
+
+
+def test_get_payload_survives_a_database_that_does_not_exist_yet(tmp_path):
+    # Found via live Docker verification, not theorized: on a container
+    # that has never had a writer create data/dealwatch.db (no collector
+    # started, /health never hit either - exactly the credentials-missing
+    # scenario B1 is about), connect_readonly() itself raises before
+    # build_payload() ever runs, which is a failure mode outside
+    # build_payload()'s own per-section try/except. get_payload() must
+    # still return a renderable payload, not propagate the exception.
+    missing_db_path = tmp_path / "never-created.db"
+
+    payload = dashboard_data.get_payload(missing_db_path, ttl_seconds=60, now=1_000_000, **_kwargs())
+
+    assert payload["generated_at"] == 1_000_000
+    for key in (
+        "status", "indicators", "alerts_per_day", "recent_alerts",
+        "recent_listings", "baseline_coverage",
+    ):
+        assert "error" in payload[key], key
+        assert "unable to open database file" in payload[key]["error"]

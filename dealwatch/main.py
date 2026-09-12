@@ -2,12 +2,16 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 from functools import lru_cache
+from pathlib import Path
 
 from fastapi import Depends, FastAPI, Request
+from fastapi.responses import HTMLResponse
+from fastapi.templating import Jinja2Templates
 
 from dealwatch.config import get_settings
 from dealwatch.engine.collector import Collector, CollectorStats, load_profile
 from dealwatch.providers.ratelimit import DailyBudget
+from dealwatch.reporting.dashboard_data import get_payload
 
 
 settings = get_settings()
@@ -33,13 +37,21 @@ def get_budget() -> DailyBudget:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     live_settings = get_settings()
+
+    # V0.11 B1: loaded unconditionally, before the credentials check below
+    # - parsing a profile YAML needs no eBay credentials, and the
+    # dashboard must render whether or not the collector actually started.
+    # A missing-credentials container is exactly the moment you most want
+    # to look at this page, not a moment it should 500.
+    profile = load_profile(live_settings.profile_path)
+    app.state.profile = profile
+
     collector: Collector | None = None
 
     # Without credentials, TokenManager fails on its first real mint
     # attempt - starting the loops anyway would just spam that failure
     # every cycle. Skip cleanly instead, e.g. for a checkout with no .env.
     if live_settings.ebay_client_id and live_settings.ebay_client_secret:
-        profile = load_profile(live_settings.profile_path)
         collector = Collector(live_settings, profile)
         collector.start()
     else:
@@ -62,6 +74,11 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# V0.11 B3: resolved from __file__, never a relative "templates" - that
+# works from the repo root on the Mac and breaks under any other working
+# directory (a Docker CMD, a systemd unit, pytest run from elsewhere).
+templates = Jinja2Templates(directory=Path(__file__).parent / "dashboard" / "templates")
+
 
 @app.get("/health", tags=["system"])
 async def health(request: Request, budget: DailyBudget = Depends(get_budget)) -> dict:
@@ -75,3 +92,49 @@ async def health(request: Request, budget: DailyBudget = Depends(get_budget)) ->
     )
 
     return {"status": "ok", "budget": budget_status, "collector": collector_status}
+
+
+@app.get("/", response_class=HTMLResponse, tags=["dashboard"])
+def dashboard(request: Request) -> HTMLResponse:
+    """V0.11 (design.md §13). LAN-only, unauthenticated, read-only - same
+    posture as the rest of DealWatch (CLAUDE.md locked decision #2:
+    nothing here is internet-exposed).
+
+    Deliberately `def`, not `async def` (B2's decision, load-bearing, not
+    a style choice): the collector runs in-process on this same event
+    loop, and get_payload() does blocking SQLite I/O underneath. FastAPI
+    runs a sync `def` route in Starlette's anyio threadpool, which gives
+    this request its own worker thread and therefore its own SQLite
+    connection - sqlite3 connections are check_same_thread=True, so this
+    request cannot reuse the collector's connection even if it wanted to.
+    An `async def` version of this same body would run ON the event loop
+    and block every in-flight poll/sweep for as long as this render takes.
+    get_payload() opens its own connection via connect_readonly() - this
+    handler never touches the collector's connection at all.
+    """
+    live_settings = get_settings()
+    profile = request.app.state.profile
+
+    # profile.alerts is Optional (a profile with no `alerts:` block collects
+    # and scores but never alerts - normalize/schema.py's own docstring).
+    # Treated the same as an explicit dry_run=True/no notifiers here: there
+    # is nothing live to report on, so the dashboard should say so rather
+    # than crash on a None.
+    alerts_config = profile.alerts
+    dry_run = alerts_config.dry_run if alerts_config is not None else True
+    notifiers = alerts_config.notifiers if alerts_config is not None else []
+
+    # search.poll.sweep_interval_minutes, not a top-level Profile field -
+    # Profile is extra="ignore" (normalize/schema.py), so a typo'd path
+    # here would fail silently rather than at startup. Read through the
+    # model, never hardcoded.
+    payload = get_payload(
+        live_settings.db_path,
+        profile_id=profile.id,
+        sweep_interval_minutes=profile.search.poll.sweep_interval_minutes,
+        dry_run=dry_run,
+        notifiers=notifiers,
+        ceiling=live_settings.daily_call_limit - live_settings.daily_reserve_calls,
+    )
+
+    return templates.TemplateResponse(request, "dashboard.html", {"payload": payload})

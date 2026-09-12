@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="30">
+<title>DealWatch</title>
+<style>
+  :root {
+    --ok: #2e7d32;
+    --warn: #b8860b;
+    --unknown: #8a8a8a;
+    --bg: #f5f5f4;
+    --panel-bg: #ffffff;
+    --border: #dcdcda;
+    --text: #202020;
+    --muted: #6b6b6b;
+    --link: #1a5fb4;
+    --error-bg: #fdecea;
+    --error-border: #f2b8b5;
+    --error-text: #7a1f1a;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    font-size: 14px;
+    line-height: 1.4;
+    padding: 16px;
+  }
+  h1 {
+    font-size: 1.35rem;
+    margin: 0 0 2px;
+  }
+  .updated {
+    color: var(--muted);
+    font-size: 0.82rem;
+    margin-bottom: 16px;
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 14px;
+    max-width: 1200px;
+  }
+  @media (min-width: 900px) {
+    .grid { grid-template-columns: 1fr 1fr; }
+  }
+  .panel {
+    background: var(--panel-bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 14px 16px;
+    min-width: 0;
+  }
+  .panel h2 {
+    font-size: 0.95rem;
+    margin: 0 0 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: var(--muted);
+  }
+  .error-box {
+    background: var(--error-bg);
+    border: 1px solid var(--error-border);
+    color: var(--error-text);
+    padding: 8px 10px;
+    border-radius: 4px;
+    font-size: 0.82rem;
+  }
+  .indicator-row {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 5px 0;
+    border-bottom: 1px solid #eee;
+  }
+  .indicator-row:last-child { border-bottom: none; }
+  .indicator-label {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+  }
+  .dot {
+    display: inline-block;
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+  .dot.ok { background: var(--ok); }
+  .dot.warn { background: var(--warn); }
+  .dot.unknown { background: var(--unknown); }
+  .indicator-value { font-weight: 600; text-align: right; }
+  .indicator-value.unknown { color: var(--unknown); font-weight: 400; }
+  .indicator-value.warn { color: var(--warn); }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.82rem;
+  }
+  th, td {
+    text-align: left;
+    padding: 5px 6px;
+    border-bottom: 1px solid #eee;
+    vertical-align: top;
+  }
+  th { color: var(--muted); font-weight: 600; }
+  .table-scroll { overflow-x: auto; }
+  a { color: var(--link); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .empty-note { color: var(--muted); font-size: 0.85rem; }
+  .chart {
+    display: flex;
+    align-items: flex-end;
+    gap: 3px;
+    height: 110px;
+    margin-top: 4px;
+  }
+  .bar-col {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    height: 100%;
+    min-width: 0;
+  }
+  .bar-stack {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    flex-direction: column-reverse;
+    justify-content: flex-start;
+    border-bottom: 2px solid var(--border);
+  }
+  .bar-segment.bar-live { background: #1a5fb4; }
+  .bar-segment.bar-dry { background: #a7c3e6; }
+  .bar-label {
+    font-size: 0.62rem;
+    color: var(--muted);
+    margin-top: 5px;
+    white-space: nowrap;
+  }
+  .legend {
+    display: flex;
+    gap: 14px;
+    font-size: 0.78rem;
+    color: var(--muted);
+    margin-top: 8px;
+  }
+  .legend-swatch {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    margin-right: 4px;
+    vertical-align: middle;
+    border-radius: 2px;
+  }
+  .coverage-fraction {
+    font-size: 1.9rem;
+    font-weight: 700;
+  }
+  .coverage-pct {
+    font-size: 1rem;
+    color: var(--muted);
+    margin-left: 8px;
+  }
+  .coverage-note {
+    color: var(--muted);
+    font-size: 0.8rem;
+    margin-top: 8px;
+  }
+
+  /* Dark mode: the viewer's own theme, not a user toggle on this page. */
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1c1c1e;
+      --panel-bg: #262628;
+      --border: #3a3a3c;
+      --text: #e7e7e7;
+      --muted: #9a9a9c;
+      --link: #6ba6f5;
+      --error-bg: #3a2020;
+      --error-border: #5c2c28;
+      --error-text: #f0a7a2;
+    }
+    th { color: var(--muted); }
+    .bar-segment.bar-dry { background: #3a5580; }
+  }
+</style>
+</head>
+<body>
+
+<h1>DealWatch</h1>
+<div class="updated" data-generated-at="{{ payload.generated_at }}" id="updated-label">Updated just now</div>
+
+<div class="grid">
+
+  {# ---------------------------------------------------------------
+     Status block - every indicator except the two budget ones,
+     which get their own panel below (C1's panel order).
+     --------------------------------------------------------------- #}
+  <div class="panel">
+    <h2>Status</h2>
+    {% if 'error' in payload.indicators %}
+      <div class="error-box">Panel unavailable: {{ payload.indicators.error }}</div>
+    {% else %}
+      {% for key, ind in payload.indicators.items() %}
+        {% if key not in ["budget", "budget_period"] %}
+          <div class="indicator-row">
+            <span class="indicator-label">
+              {% if ind.state != "info" %}<span class="dot {{ ind.state }}"></span>{% endif %}
+              {{ ind.label }}
+            </span>
+            <span class="indicator-value {{ ind.state }}">
+              {% if ind.state == "unknown" %}&ndash;{% else %}{{ ind.value }}{% endif %}
+            </span>
+          </div>
+        {% endif %}
+      {% endfor %}
+    {% endif %}
+  </div>
+
+  {# ---------------------------------------------------------------
+     Budget - split out from the status block so the one number with
+     a hard operational ceiling (the eBay call budget) isn't buried
+     among the other fourteen rows.
+     --------------------------------------------------------------- #}
+  <div class="panel">
+    <h2>Budget</h2>
+    {% if 'error' in payload.indicators %}
+      <div class="error-box">Panel unavailable: {{ payload.indicators.error }}</div>
+    {% else %}
+      {% for key, ind in payload.indicators.items() %}
+        {% if key in ["budget", "budget_period"] %}
+          <div class="indicator-row">
+            <span class="indicator-label">
+              {% if ind.state != "info" %}<span class="dot {{ ind.state }}"></span>{% endif %}
+              {{ ind.label }}
+            </span>
+            <span class="indicator-value {{ ind.state }}">
+              {% if ind.state == "unknown" %}&ndash;{% else %}{{ ind.value }}{% endif %}
+            </span>
+          </div>
+        {% endif %}
+      {% endfor %}
+    {% endif %}
+  </div>
+
+  {# ---------------------------------------------------------------
+     Alerts per day (14 days, PT calendar days) - live/dry stacked.
+     --------------------------------------------------------------- #}
+  <div class="panel">
+    <h2>Alerts per day &mdash; 14 days</h2>
+    {% if 'error' in payload.alerts_per_day %}
+      <div class="error-box">Panel unavailable: {{ payload.alerts_per_day.error }}</div>
+    {% else %}
+      {% set day_totals = [] %}
+      {% for entry in payload.alerts_per_day %}
+        {% set _ = day_totals.append(entry.count_live + entry.count_dry) %}
+      {% endfor %}
+      {% set max_count = (day_totals | max) if day_totals else 0 %}
+      <div class="chart">
+        {% for entry in payload.alerts_per_day %}
+          {% set live_pct = (entry.count_live / max_count * 100) if max_count else 0 %}
+          {% set dry_pct = (entry.count_dry / max_count * 100) if max_count else 0 %}
+          <div class="bar-col" title="{{ entry.label }}: {{ entry.count_live }} live, {{ entry.count_dry }} dry">
+            <div class="bar-stack">
+              <div class="bar-segment bar-live" style="height: {{ live_pct }}%;"></div>
+              <div class="bar-segment bar-dry" style="height: {{ dry_pct }}%;"></div>
+            </div>
+            <div class="bar-label">{{ entry.label }}</div>
+          </div>
+        {% endfor %}
+      </div>
+      <div class="legend">
+        <span><span class="legend-swatch bar-live"></span>Live</span>
+        <span><span class="legend-swatch bar-dry"></span>Dry run</span>
+      </div>
+    {% endif %}
+  </div>
+
+  {# ---------------------------------------------------------------
+     Recent alerts.
+     --------------------------------------------------------------- #}
+  <div class="panel">
+    <h2>Recent alerts</h2>
+    {% if 'error' in payload.recent_alerts %}
+      <div class="error-box">Panel unavailable: {{ payload.recent_alerts.error }}</div>
+    {% elif payload.recent_alerts %}
+      <div class="table-scroll">
+      <table>
+        <thead>
+          <tr>
+            <th>When (PT)</th><th>Listing</th><th>Price</th><th>Ratio (p25)</th>
+            <th>Layer</th><th>Mode</th><th>Delivery</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for a in payload.recent_alerts %}
+          <tr>
+            <td>{{ a.sent_at_display }}</td>
+            <td>
+              {% if a.item_web_url %}<a href="{{ a.item_web_url }}" target="_blank" rel="noopener">{{ a.title or a.item_id }}</a>
+              {% else %}{{ a.title or a.item_id }}
+              {% endif %}
+            </td>
+            <td>{{ a.price_display }}</td>
+            <td>{{ a.ratio_display }}</td>
+            <td>{{ a.baseline_layer }}</td>
+            <td>{{ "dry run" if a.dry_run else "live" }}</td>
+            <td>
+              {% for notifier, delivery_status in a.delivery_statuses.items() %}
+                {{ notifier }}: {{ delivery_status }}{% if not loop.last %}, {% endif %}
+              {% endfor %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      </div>
+    {% else %}
+      <p class="empty-note">No alerts yet.</p>
+    {% endif %}
+  </div>
+
+  {# ---------------------------------------------------------------
+     Recent listings.
+     --------------------------------------------------------------- #}
+  <div class="panel">
+    <h2>Recent listings</h2>
+    {% if 'error' in payload.recent_listings %}
+      <div class="error-box">Panel unavailable: {{ payload.recent_listings.error }}</div>
+    {% elif payload.recent_listings %}
+      <div class="table-scroll">
+      <table>
+        <thead>
+          <tr>
+            <th>First seen (PT)</th><th>Listing</th><th>Price</th>
+            <th>Spec status</th><th>Bucket</th><th>Active</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for l in payload.recent_listings %}
+          <tr>
+            <td>{{ l.first_seen_display }}</td>
+            <td>
+              {% if l.item_web_url %}<a href="{{ l.item_web_url }}" target="_blank" rel="noopener">{{ l.title or l.item_id }}</a>
+              {% else %}{{ l.title or l.item_id }}
+              {% endif %}
+            </td>
+            <td>{{ l.price_display }}</td>
+            <td>{{ l.spec_status }}</td>
+            <td>{{ l.bucket_key or "unknown" }}</td>
+            <td>{{ "active" if l.active else "gone" }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      </div>
+    {% else %}
+      <p class="empty-note">No listings yet.</p>
+    {% endif %}
+  </div>
+
+  {# ---------------------------------------------------------------
+     Baseline coverage - labeled deliberately (design.md §13's C6):
+     "coverage" alone reads as a health score. It's a maturity
+     fraction over a denominator that moves with market inventory,
+     not a percentage that should trend toward 100%.
+     --------------------------------------------------------------- #}
+  <div class="panel">
+    <h2>Complete buckets with computed baselines</h2>
+    {% if 'error' in payload.baseline_coverage %}
+      <div class="error-box">Panel unavailable: {{ payload.baseline_coverage.error }}</div>
+    {% else %}
+      <span class="coverage-fraction">{{ payload.baseline_coverage.buckets_with_baseline }} / {{ payload.baseline_coverage.buckets_observed }}</span>
+      <span class="coverage-pct">{{ payload.baseline_coverage.coverage_display }}</span>
+      <p class="coverage-note">
+        Denominator: distinct, fully-resolved ("?"-free) bucket keys among
+        currently active listings. Partial-spec listings are absent from
+        both sides of this ratio, and the denominator moves with market
+        inventory - a new hardware generation appearing can lower this
+        number with no change in baseline progress.
+      </p>
+    {% endif %}
+  </div>
+
+</div>
+
+<script>
+(function () {
+  var el = document.getElementById("updated-label");
+  var generatedAtMs = parseInt(el.getAttribute("data-generated-at"), 10) * 1000;
+  function tick() {
+    var seconds = Math.max(0, Math.round((Date.now() - generatedAtMs) / 1000));
+    el.textContent = "Updated " + seconds + "s ago";
+  }
+  tick();
+  setInterval(tick, 1000);
+})();
+</script>
+
+</body>
+</html>

@@ -23,9 +23,10 @@ running a year."
 
 import sqlite3
 import time
+from datetime import datetime
 
 from dealwatch.engine.baselines import select_price
-from dealwatch.providers.ratelimit import la_day_bounds
+from dealwatch.providers.ratelimit import PACIFIC, la_day_bounds
 from dealwatch.reporting.status import event_count
 
 # `alerts.notifiers` is list[Literal["discord", "pushover"]] - at most 2
@@ -43,10 +44,47 @@ def _is_complete_bucket_key(bucket_key) -> bool:
     return bucket_key is not None and "?" not in bucket_key
 
 
+def _datetime_display(ts: int | None) -> str:
+    """Short LA-local date/time string ("Sep 10 14:32"), or "unknown" for a
+    missing timestamp. Same reasoning as A1's per-day chart label and A6's
+    price_display: date/timezone math is exactly the kind of thing the
+    template must never do (design.md §13, C4/C1's hard constraints) -
+    it's the one file in this codebase with no test coverage, and this
+    codebase has already been burned once by timezone arithmetic done in
+    the wrong place (providers/ratelimit.py's la_day_bounds() exists for
+    that exact reason).
+    """
+    return datetime.fromtimestamp(ts, PACIFIC).strftime("%b %-d %H:%M") if ts is not None else "unknown"
+
+
+def _price_display(cents: int | None) -> str:
+    """"$229.99" from integer cents, or "unknown" when there's no price to
+    show at all (V0.11's A6 amendment) - cents-to-dollars arithmetic
+    doesn't belong in the template, and neither does the fallback text for
+    a missing value; both live here so the template only ever prints a
+    ready-made string.
+    """
+    return f"${cents / 100:,.2f}" if cents is not None else "unknown"
+
+
 def alerts_per_day(
     conn: sqlite3.Connection, profile_id: str, *, days: int = 14, now: int | None = None
 ) -> list[dict]:
-    """One entry per LA calendar day, oldest first: {"day_start", "count"}.
+    """One entry per LA calendar day, oldest first:
+    {"day_start", "label", "count_live", "count_dry"}.
+
+    Split by dry_run (V0.11's A1 amendment): the live data has a 33-event
+    day sitting in this window that is almost certainly V0.9 dry-run
+    calibration traffic, not 33 real notifications - collect_status()'s own
+    "finding" group already splits alert_events_today_live/_dry for
+    exactly this reason (a mode-merged count's tallest bar can be a dry-run
+    artifact, not a real signal), and a chart that re-merges them here
+    would throw that distinction away one panel later.
+
+    `label` is the short LA-calendar-day string (e.g. "Sep 8"), computed
+    here rather than in the template - date formatting is timezone math,
+    and the template is the one place in this codebase that isn't covered
+    by a test suite.
 
     Walks back one calendar day at a time via la_day_bounds(day_start - 1)
     rather than subtracting 86400 - a fixed-seconds walk drifts an hour
@@ -54,15 +92,18 @@ def alerts_per_day(
     test in tests/test_panels.py, which spans the 2026-11-01 fall-back
     transition).
 
-    Each day's count uses status.event_count(), the same distinct-
+    Each day's counts use status.event_count(), the same distinct-
     (item_id, sent_at) dedup collect_status() uses for its own "today"
     fields - a bare COUNT(*) here would double every bar the day a second
     notifier is enabled, while the field directly above the chart on the
-    dashboard kept counting events.
+    dashboard kept counting events. dry_run is constant across every
+    notifier row of one event (set once per alert-cycle evaluation, not
+    per notifier), so adding it to the WHERE clause splits events by mode
+    without ever splitting one event across two bars.
 
     Indexed by idx_alerts_profile_sent_at (profile_id, sent_at) - migration
-    8. Each day is one bounded range scan against that index, not a scan
-    of the whole table.
+    8. Each day is two bounded range scans against that index (one per
+    mode), not a scan of the whole table.
     """
     now = now if now is not None else int(time.time())
     day_start, day_end = la_day_bounds(now)
@@ -70,12 +111,25 @@ def alerts_per_day(
     entries = []
     cur_start, cur_end = day_start, day_end
     for _ in range(days):
-        count = event_count(
+        count_live = event_count(
             conn,
-            "profile_id = ? AND sent_at >= ? AND sent_at < ?",
+            "profile_id = ? AND dry_run = 0 AND sent_at >= ? AND sent_at < ?",
             (profile_id, cur_start, cur_end),
         )
-        entries.append({"day_start": cur_start, "count": count})
+        count_dry = event_count(
+            conn,
+            "profile_id = ? AND dry_run = 1 AND sent_at >= ? AND sent_at < ?",
+            (profile_id, cur_start, cur_end),
+        )
+        label = datetime.fromtimestamp(cur_start, PACIFIC).strftime("%b %-d")
+        entries.append(
+            {
+                "day_start": cur_start,
+                "label": label,
+                "count_live": count_live,
+                "count_dry": count_dry,
+            }
+        )
         cur_start, cur_end = la_day_bounds(cur_start - 1)
 
     entries.reverse()
@@ -146,10 +200,13 @@ def recent_alerts(conn: sqlite3.Connection, profile_id: str, *, limit: int = 20)
             {
                 "item_id": item_id,
                 "sent_at": sent_at,
+                "sent_at_display": _datetime_display(sent_at),
                 "title": title,
                 "price_cents": first[2],
+                "price_display": _price_display(first[2]),
                 "item_web_url": item_web_url,
                 "ratio_to_p25": first[3],
+                "ratio_display": f"{first[3]:.2f}",
                 "baseline_layer": first[4],
                 "dry_run": bool(first[5]),
                 "delivery_statuses": delivery_statuses,
@@ -199,15 +256,18 @@ def recent_listings(conn: sqlite3.Connection, profile_id: str, *, limit: int = 2
             gone_at, total_cents, price_cents,
         ) = row
         selected = select_price(total_cents, price_cents)
+        selected_price_cents = selected[0] if selected is not None else None
         results.append(
             {
                 "item_id": item_id,
                 "first_seen": first_seen,
+                "first_seen_display": _datetime_display(first_seen),
                 "title": title,
                 "item_web_url": item_web_url,
                 "spec_status": spec_status,
                 "bucket_key": bucket_key,
-                "price_cents": selected[0] if selected is not None else None,
+                "price_cents": selected_price_cents,
+                "price_display": _price_display(selected_price_cents),
                 "active": gone_at is None,
             }
         )
@@ -216,9 +276,21 @@ def recent_listings(conn: sqlite3.Connection, profile_id: str, *, limit: int = 2
 
 
 def baseline_coverage(conn: sqlite3.Connection, profile_id: str, *, now: int | None = None) -> dict:
-    """{"buckets_with_baseline", "buckets_observed", "coverage_pct"} - the
-    "buckets-at-threshold over total" panel design.md §13's rough panel set
-    asks for.
+    """{"buckets_with_baseline", "buckets_observed", "coverage_fraction"} -
+    the "buckets-at-threshold over total" panel design.md §13's rough panel
+    set asks for.
+
+    `coverage_fraction`, not `coverage_pct` (V0.11's A2 amendment): the
+    value is a 0..1 fraction (0.0714 at today's 2/28), and a `_pct` name on
+    a fraction is exactly the kind of mismatch indicators.py's own
+    `last_sweep_coverage_pct` scaling exists to catch elsewhere - except
+    this number goes straight to a template panel with no indicators.py
+    layer in between to catch a scaling mistake. Renamed, not rescaled.
+    `coverage_display` ("7%", or "unknown" when there's no denominator) is
+    the percent-scaled, ready-to-print string - the template prints it
+    as-is rather than multiplying by 100 itself, same reasoning as
+    price_display (A6): arithmetic belongs in tested Python, not in the
+    one file this codebase's test suite doesn't reach.
 
     collect_status()'s baseline group already reports
     `baseline_buckets_total` (the numerator: buckets that made it into the
@@ -266,12 +338,16 @@ def baseline_coverage(conn: sqlite3.Connection, profile_id: str, *, now: int | N
     ).fetchall()
     buckets_observed = sum(1 for (bucket_key,) in bucket_keys if _is_complete_bucket_key(bucket_key))
 
-    coverage_pct = (
+    coverage_fraction = (
         buckets_with_baseline / buckets_observed if buckets_observed else None
+    )
+    coverage_display = (
+        f"{coverage_fraction * 100:.0f}%" if coverage_fraction is not None else "unknown"
     )
 
     return {
         "buckets_with_baseline": buckets_with_baseline,
         "buckets_observed": buckets_observed,
-        "coverage_pct": coverage_pct,
+        "coverage_fraction": coverage_fraction,
+        "coverage_display": coverage_display,
     }

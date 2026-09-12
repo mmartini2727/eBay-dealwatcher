@@ -102,6 +102,34 @@ _cache_lock = threading.Lock()
 # must be.
 _cache: dict[str, tuple[float, dict, dict]] = {}
 
+_PAYLOAD_SECTIONS = (
+    "status", "indicators", "alerts_per_day", "recent_alerts",
+    "recent_listings", "baseline_coverage",
+)
+
+
+def _connection_failed_payload(now: int, exc: Exception) -> dict:
+    """Every section as its own {"error": ...}, same shape _safe() produces
+    per-section - for the one failure mode that happens BEFORE any section
+    gets a chance to run at all. Found by live Docker verification, not
+    theorized: on a container that has never had a writer create data/
+    dealwatch.db yet (no collector started, /health never hit either -
+    exactly the credentials-missing case B1 is about), connect_readonly()
+    itself raises "unable to open database file" - mode=ro correctly
+    refuses to create the file, which is the whole point of that
+    function, but that refusal happened outside build_payload()'s
+    per-section try/except, so the route 500'd instead of rendering. This
+    keeps the "always return a renderable payload" contract from
+    get_payload() outward, not just from build_payload() outward.
+    """
+    return {
+        "generated_at": now,
+        **{
+            section: {"error": f"{type(exc).__name__}: {exc}"}
+            for section in _PAYLOAD_SECTIONS
+        },
+    }
+
 
 def get_payload(db_path, *, ttl_seconds: int = 30, **kwargs) -> dict:
     """build_payload()'s result, cached for ttl_seconds keyed on db_path
@@ -129,11 +157,19 @@ def get_payload(db_path, *, ttl_seconds: int = 30, **kwargs) -> dict:
             if now_mono - stored_at < ttl_seconds and cached_kwargs == kwargs:
                 return payload
 
-        conn = connect_readonly(db_path)
         try:
-            payload = build_payload(conn, **kwargs)
-        finally:
-            conn.close()
+            conn = connect_readonly(db_path)
+        except Exception as exc:
+            logger.exception("could not open %r for the dashboard", db_path)
+            now = kwargs.get("now")
+            payload = _connection_failed_payload(
+                now if now is not None else int(time.time()), exc
+            )
+        else:
+            try:
+                payload = build_payload(conn, **kwargs)
+            finally:
+                conn.close()
 
         _cache[key] = (now_mono, kwargs, payload)
         return payload
