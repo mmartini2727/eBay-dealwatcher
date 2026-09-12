@@ -189,11 +189,19 @@ def _age_mins(ts: int | None, now: int) -> int | None:
     return (now - ts) // 60 if ts is not None else None
 
 
-def _event_count(conn: sqlite3.Connection, sql_where: str, params: tuple) -> int:
+def event_count(conn: sqlite3.Connection, sql_where: str, params: tuple) -> int:
     """COUNT of distinct (item_id, sent_at) pairs matching sql_where - one
     alert EVENT, not one alerts ROW. Not COUNT(DISTINCT item_id || '|' ||
     sent_at): item_ids already contain pipes, so that concatenation is not
-    actually collision-free."""
+    actually collision-free.
+
+    Not prefixed with `_` (V0.11, design.md §13): reporting/panels.py's
+    alerts_per_day() needs this exact dedup rule to count histogram bars
+    the same way collect_status()'s own alert_events_* fields do - a
+    second definition here would let the dashboard's daily bars silently
+    disagree with the status payload's "today" count sitting right above
+    them the day a second notifier is enabled.
+    """
     row = conn.execute(
         f"SELECT COUNT(*) FROM (SELECT DISTINCT item_id, sent_at FROM alerts "
         f"WHERE {sql_where})",
@@ -382,12 +390,12 @@ def _finding(
     seven_days_ago = now - 7 * 86400
     one_day_ago = now - 86400
 
-    alert_events_today_live = _event_count(
+    alert_events_today_live = event_count(
         conn,
         "profile_id = ? AND dry_run = 0 AND sent_at >= ? AND sent_at < ?",
         (profile_id, day_start, day_end),
     )
-    alert_events_today_dry = _event_count(
+    alert_events_today_dry = event_count(
         conn,
         "profile_id = ? AND dry_run = 1 AND sent_at >= ? AND sent_at < ?",
         (profile_id, day_start, day_end),
@@ -396,7 +404,7 @@ def _finding(
         "SELECT COUNT(*) FROM alerts WHERE profile_id = ? AND sent_at >= ? AND sent_at < ?",
         (profile_id, day_start, day_end),
     ).fetchone()[0]
-    alert_events_7d = _event_count(
+    alert_events_7d = event_count(
         conn, "profile_id = ? AND sent_at >= ?", (profile_id, seven_days_ago)
     )
     distinct_items_alerted_7d = conn.execute(

@@ -8,11 +8,15 @@ milestone. No network.
 
 import json
 import logging
+import sqlite3
+
+import pytest
 
 from dealwatch.normalize.engine import SpecResult
 from dealwatch.storage.sqlite import (
     MISS_THRESHOLD,
     connect,
+    connect_readonly,
     count_active_listings,
     get_latest_observation,
     get_observations,
@@ -812,7 +816,7 @@ def test_migration_7_applies_to_a_database_already_at_version_6(tmp_path, monkey
     monkeypatch.setattr(storage_module, "_MIGRATIONS", real_migrations)
 
     upgraded = storage_module.connect(db_path)
-    assert upgraded.execute("SELECT version FROM schema_version").fetchone()[0] == 7
+    assert upgraded.execute("SELECT version FROM schema_version").fetchone()[0] == 8
 
     # The pre-existing row backfills to 'discord' - it predates any
     # notifier but IS a Discord send, since Discord was the only notifier
@@ -836,7 +840,7 @@ def test_migration_7_applies_to_a_database_already_at_version_6(tmp_path, monkey
     upgraded.close()
 
     reconnected = storage_module.connect(db_path)
-    assert reconnected.execute("SELECT version FROM schema_version").fetchone()[0] == 7
+    assert reconnected.execute("SELECT version FROM schema_version").fetchone()[0] == 8
     assert reconnected.execute("SELECT COUNT(*) FROM alerts").fetchone()[0] == 2
 
 
@@ -1079,3 +1083,41 @@ def test_concurrent_first_connect_against_a_fresh_file_does_not_crash_or_hang(tm
 
     assert not any(t.is_alive() for t in threads), "a thread is still stuck - deadlock reintroduced"
     assert errors == []
+
+
+# ---------------------------------------------------------------------------
+# connect_readonly (V0.11, design.md §13)
+# ---------------------------------------------------------------------------
+
+
+def test_connect_readonly_rejects_writes(tmp_path):
+    db_path = tmp_path / "dealwatch.db"
+    # Writer stays open: a mode=ro connection cannot create the -shm
+    # sidecar itself, so a WAL database with no live writer is a
+    # different (and separately interesting) case.
+    writer = connect(db_path)
+    try:
+        ro = connect_readonly(db_path)
+        try:
+            assert ro.execute("SELECT version FROM schema_version").fetchone() is not None
+            with pytest.raises(sqlite3.OperationalError, match="readonly"):
+                ro.execute("INSERT INTO schema_version (version) VALUES (99)")
+            # DDL too - mode=ro is not merely a DML restriction.
+            with pytest.raises(sqlite3.OperationalError, match="readonly"):
+                ro.execute("CREATE TABLE scratch (x INTEGER)")
+        finally:
+            ro.close()
+    finally:
+        writer.close()
+
+
+def test_connect_readonly_does_not_create_a_missing_database(tmp_path):
+    # Without mode=ro, sqlite3.connect() on a wrong path silently creates
+    # an empty database and the dashboard renders a page of plausible-
+    # looking zeros - no error, every panel green-adjacent, every number a
+    # lie. This is the test that makes a typo'd bind mount or settings key
+    # loud instead of quiet.
+    missing = tmp_path / "nope.db"
+    with pytest.raises(sqlite3.OperationalError):
+        connect_readonly(missing)
+    assert not missing.exists()

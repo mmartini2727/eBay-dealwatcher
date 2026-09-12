@@ -144,8 +144,8 @@ be recovered.
 | V0.9 | Discord alerts | done, live-verified 2026-09-08 |
 | V0.9a | Multi-notifier support (Discord + Pushover) + scripts baked into the image | done |
 | V0.9b | `?`-bucket alert gate + honest `lifespan_mins` NULLs | done |
-| V0.10 | Status module + CLI health script (design.md §12) | done, live-verified 2026-09-11 |
-| V0.11 | LAN dashboard, server-rendered, read-only (design.md §13) | |
+| V0.10 | Status module + CLI health script (design.md §12) | done |
+| V0.11 | LAN dashboard, server-rendered, read-only (design.md §13) | next |
 | V1.0 | MCP server (streamable HTTP, LAN only) | |
 
 Ship V0.6 even though the normalizer is a stub. Raw titles and prices are

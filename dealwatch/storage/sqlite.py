@@ -310,6 +310,39 @@ _MIGRATIONS: list[tuple[int, list[str]]] = [
             """,
         ],
     ),
+    (
+        8,
+        [
+            # V0.11 (design.md §13): the dashboard's top-N and 14-day-
+            # histogram panels have no selective predicate of their own -
+            # "most recent listings" and "alerts per day" both need every
+            # row for one profile_id, ordered by a timestamp. Before this,
+            # neither `listings` nor `alerts` had an index leading on
+            # profile_id (§12's live-verification addendum: 5 full-scan
+            # listings queries, 8 full-scan alerts queries, all in
+            # reporting/status.py, none touched by this migration).
+            # idx_listings_profile_first_seen also turns out to bound
+            # panels.baseline_coverage()'s distinct-bucket-key count for
+            # free (confirmed via EXPLAIN QUERY PLAN: SQLite is willing to
+            # use a composite index's leading column alone as an equality
+            # seek) - a side effect of this index existing at all, not
+            # something that query was written to depend on.
+            # Deliberately narrow - no covering columns (title, price_cents,
+            # item_web_url). Widening these costs write amplification on
+            # the collector's hot insert path for columns that wouldn't
+            # even make the panel queries index-only, since the panels
+            # still need a row lookup for fields these indexes don't carry
+            # either way.
+            """
+            CREATE INDEX IF NOT EXISTS idx_listings_profile_first_seen
+                ON listings (profile_id, first_seen)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_alerts_profile_sent_at
+                ON alerts (profile_id, sent_at)
+            """,
+        ],
+    ),
 ]
 
 
@@ -405,6 +438,35 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
 
 def default_db_path(settings: Settings) -> Path:
     return Path(settings.db_path)
+
+
+def connect_readonly(db_path: Path | str) -> sqlite3.Connection:
+    """Open db_path via file:...?mode=ro (V0.11, design.md §13) - a runtime
+    path (the dashboard, later the V1.0 MCP server), not a script path.
+    This is a fifth definition of "open read-only", alongside the four
+    already copy-pasted across scripts/ (CLAUDE.md's open item on that
+    count). It stays separate rather than becoming the shared helper that
+    closes that item: an app-package module importing from scripts/ (or
+    vice versa) would be a stranger dependency than four short duplicated
+    functions, and refactoring those four is explicitly out of scope here.
+
+    Runs no migrations and does not set row_factory - the dashboard reads
+    everything positionally, same contract as collect_status(). A
+    mode=ro connection cannot take the write lock _apply_migrations
+    needs, and this path must never be the one that decides schema state.
+
+    WAL caveat: this only works because the process already has a writer
+    (the collector, via connect()) holding the data directory open and
+    maintaining the -wal/-shm sidecar files - a mode=ro connection cannot
+    create them itself. Against a stopped container, or a snapshot copied
+    without its sidecars, the open fails outright rather than silently
+    reading a stale view (same caveat scripts/status.py's open_readonly()
+    already documents) - a read-only filesystem would break this the same
+    way.
+    """
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn.execute("PRAGMA busy_timeout=5000")
+    return conn
 
 
 # ---------------------------------------------------------------------------
