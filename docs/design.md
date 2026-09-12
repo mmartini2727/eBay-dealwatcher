@@ -1439,11 +1439,15 @@ reasoning as that earlier rename: whichever milestone is actually being
 worked on next keeps the next free letter; a not-yet-built one gets pushed,
 not the other way around.
 
-## 12. V0.10 — Status module and CLI health script (rough draft, 2026-09-09)
+## 12. V0.10 — Status module and CLI health script (shipped 2026-09-10, live-verified 2026-09-11)
 
-Not yet built. Recorded now, ahead of V0.9c finishing, so the design lands
-in one place before implementation starts rather than being reconstructed
-from a conversation later.
+Recorded as a rough draft on 2026-09-09, ahead of V0.9c finishing, so the
+design would land in one place before implementation started rather than
+being reconstructed from a conversation later. Built to that draft with
+one refinement (the `sweep_bookkeeping_consistent`/row-factory/
+`CollectorStats`-disambiguation fixes a review pass caught before build) -
+see the live-verification addendum below for what building it actually
+found.
 
 ### The problem
 
@@ -1505,6 +1509,91 @@ against the live LXC database by cross-checking at least two fields
 against hand-written SQL, and by confirming the sweep-age field moves
 after a real sweep lands.
 
+**Done, 2026-09-11.** Two fields cross-checked against hand-written SQL
+against the live database and agreed; the sweep-age field was confirmed
+moving after a real sweep landed; `sweep_bookkeeping_consistent` was
+confirmed `True` against real data (not just the empty/synthetic cases the
+test suite covers).
+
+### Live-verification addendum (2026-09-11) - scan cost, corrected and measured
+
+The build surfaced two cost questions the rough draft above didn't ask,
+both worth carrying into V0.11 rather than fixing here - this milestone
+was explicitly scoped not to touch the schema, so neither gets a fix, only
+an accurate writeup.
+
+**Scan accounting, corrected.** An early pass through this module
+undercounted its own full-table-scan queries by roughly an order of
+magnitude (it initially reported "two," in `_collecting` only). The actual
+count, checked query-by-query against the real index set: **17 full-scan-
+equivalent queries** - 5 against `listings`, 4 against `sweeps`, 8 against
+`alerts`. None of `listings`, `sweeps`, or `alerts` has an index leading on
+`profile_id` (`listings` only has `(bucket_key, gone_at)` plus its
+`item_id` primary key; `sweeps` has no index at all beyond the implicit
+rowid, confirmed - migration 5 creates the table and nothing else touches
+it; `alerts`' only index, `idx_alerts_item_sent_at`, leads on `item_id`).
+`baselines` is the one exception - its primary key is `(profile_id,
+bucket_key)`, so `profile_id` genuinely leads it, and both `baselines`
+queries are real indexed seeks (`SEARCH baselines USING COVERING INDEX`,
+confirmed via `EXPLAIN QUERY PLAN`), not scans.
+
+One methodology note worth keeping on file: several bare `MAX()`/`MIN()`
+queries against columns with no index at all (`listings.last_seen`,
+`sweeps.swept_at`, `alerts.ratio_to_p25`) are labeled `SEARCH` by SQLite's
+own query-plan formatter, not `SCAN` - despite there being no index to
+seek through. Confirmed this is cosmetic, not real, by comparing VM
+opcode counts between a `SEARCH`-labeled and a `SCAN`-labeled query with
+an identical `WHERE profile_id = ?` shape: both compile to exactly one
+`Rewind`/`Next` loop over the whole table. `EXPLAIN QUERY PLAN`'s wording
+alone is not sufficient evidence of an index seek for a bare-aggregate
+query; the index set itself is the authoritative source.
+
+All of this is small today, which is why it doesn't change anything about
+how V0.10 shipped. It matters for V0.11, where `collect_status()` gets
+called on every dashboard page refresh, and `alerts` is the one table
+among these that grows without bound.
+
+**`last_price_change_at` - O(1) today, not by construction.** This query
+(`SELECT o.observed_at FROM observations o JOIN listings l USING (item_id)
+WHERE l.profile_id = ? ORDER BY o.id DESC LIMIT 1`) walks `observations`
+backwards by rowid and stops at the first row whose owning listing matches
+the target profile. `EXPLAIN QUERY PLAN`:
+
+    SCAN o
+    SEARCH l USING INDEX sqlite_autoindex_listings_1 (item_id=?)
+
+No `USE TEMP B-TREE FOR ORDER BY` - it doesn't materialize and sort.
+Measured directly via instruction-level profiling (`sqlite3.Connection.
+set_progress_handler` firing on every VM opcode), not inferred from the
+plan shape alone:
+
+  - Single profile, 2,500 observations, all belonging to the queried
+    profile (today's actual deployment shape): **~20 VM steps.** Genuinely
+    O(1) - the first row it checks is always the answer.
+  - A synthetic second profile added, with 2,500 observations all more
+    recent than the first profile's: querying the *older* profile costs
+    **~15,000 VM steps** - it has to walk past every one of the other
+    profile's newer rows before reaching this profile's own last one.
+    Querying the newer profile stays cheap (~20 steps) - the cost is
+    asymmetric and depends entirely on which profile is more recently
+    active, not on total database size.
+  - A same-shape `EXISTS` rewrite (`SELECT observed_at FROM observations o
+    WHERE EXISTS (SELECT 1 FROM listings l WHERE l.item_id = o.item_id AND
+    l.profile_id = ?) ORDER BY o.id DESC LIMIT 1`) was measured too, on the
+    theory that it might let the planner drive the join differently. It
+    produced an identical plan shape and statistically the same step
+    counts (21 vs. 24 in the cheap case, 15021 vs. 15019 in the skewed
+    one) - SQLite optimizes both forms the same way. Changing the query's
+    form does not fix this.
+
+The real fix needs a `profile_id` column on `observations` (or an
+equivalent per-profile tracking structure) - a schema change, out of scope
+for this milestone by design. Safe as shipped for today's single-profile
+deployment; **V0.11 must not assume this query stays O(1) once a second
+profile exists.** The code comment at this query site in `reporting/
+status.py` states this plainly, with the measured numbers, rather than
+the "O(1) tail read" framing the original design draft implied.
+
 ## 13. V0.11 — LAN dashboard (rough draft, 2026-09-09)
 
 Not yet built - depends on V0.10's `collect_status()` existing first (§12).
@@ -1539,6 +1628,27 @@ ships as a file in `static/`.
 on a refresh timer, while the collector writes. Either constrain each
 panel with an indexed predicate or add the covering index as a migration -
 decided in-milestone, but decided before the page exists.
+
+**`collect_status()` arrives from V0.10 with no caching and a real cost,
+inherited, not new.** §12's live-verification addendum found 17 of its
+queries are full-scan-equivalent - 8 of them against `alerts`, the one
+table among the ones it reads that grows without bound, and none of
+`listings`/`sweeps`/`alerts` has an index leading on `profile_id`. Small
+today; `<meta http-equiv="refresh">` calling this fresh on every render,
+from every open dashboard tab, is exactly the usage pattern that turns
+"small today" into a real cost later, and V0.10 deliberately shipped
+without caching or the schema changes (a `profile_id`-leading index on
+`alerts`/`sweeps`/`listings`) that would fix the underlying cost, since
+V0.10 was scoped not to touch the schema at all. V0.11 does not have that
+excuse - it should either cache `collect_status()`'s result for some short
+interval (a refresh page reloading every few seconds does not need a
+fresh scan every time) or add the missing indexes as part of its own
+migration, decided before the page ships, not discovered after. Also
+inherited, separately: `last_price_change_at`'s observations join is
+genuinely O(1) today only because a single profile exists (§12's
+addendum has the measurements) - nothing to do about this while there is
+only one profile, but V0.11 must not build on the assumption it stays
+that way.
 
 ### Rough panel set
 
