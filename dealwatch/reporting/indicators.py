@@ -23,6 +23,10 @@ already-fetched data (the alerts_per_day() array, collect_status()'s
 distinct_items_alerted_7d, and panels.best_ratio_window()'s result) with
 no database access of its own.
 
+build_best_ratio_chart() (V0.12b Part B) is a fourth - chart-ready bar
+heights and display strings over panels.best_ratio_per_day()'s raw
+per-day output, no database access of its own.
+
 and group is one of "health" | "alerts" | "baseline" - which panel section
 the template renders the indicator under. build_indicators() returns one
 flat dict, not the health/alerts split an earlier draft had: a nested
@@ -395,3 +399,73 @@ def build_alerts_summary(
             f"{best_ratio_14d:.2f}" if best_ratio_14d is not None else "no alerts in window"
         ),
     }
+
+
+def build_best_ratio_chart(entries: list[dict]) -> list[dict]:
+    """Chart-ready entries for the best-ratio-per-day panel (V0.12b Part
+    B), built from panels.best_ratio_per_day()'s raw output: one dict per
+    day, oldest first, each {"day_start", "label", "ratio_display",
+    "baseline_layer", "bar_pct"}.
+
+    B2: bar length is 1 - ratio, not ratio - distance BELOW p25, so a
+    LONGER bar means a BETTER deal (matching the panel's own "distance
+    below p25" axis label). Plotting ratio directly would draw the chart
+    backwards: worse deals (ratio close to 1, or above it) would draw as
+    the tallest bars. Clamped at zero - ratio_to_p25 could in principle
+    land at or above 1.0 (priced at or above its own baseline's p25),
+    which would make 1 - ratio negative; a negative bar height is a
+    rendering bug, not information, same clamp reasoning as
+    build_budget_pacing()'s used/ceiling clamp above.
+
+    B3: heights are scaled to the LARGEST 1 - ratio in the window, not
+    plotted on a fixed 0..1 axis - live ratios cluster between 0.7 and
+    0.95 (distance-below-p25 of 0.05 to 0.3), so an unscaled chart would
+    draw every bar as a near-invisible 5-30%-tall stub. Scaling makes the
+    chart readable but makes bar height a RELATIVE measure within this
+    window only, not comparable across two different renders of this
+    panel - `ratio_display` (the real, unscaled value, computed here so
+    the template never formats a float) is what keeps the chart honest
+    despite that; the template prints both the bar and the number, never
+    just the bar. `bar_pct` is None (not 0) for a no-alert day (B5) - a
+    real 0%-tall bar and "no data at all" must render differently, or a
+    day with nothing to report would look identical to the worst possible
+    day. If every entry has bar_pct None (an alert-free 14-day window,
+    B6), the template renders one explanatory line instead of an empty
+    chart frame - checked via `ratio_display` being falsy for every
+    entry, not a separate flag this function would otherwise need to add.
+
+    `baseline_layer` is passed through unchanged for the template to
+    color the bar by (B4) - "seed" and "computed" are not the same
+    measurement (one is a hand-authored guess, the other derived from
+    observed sales), and this function has no opinion on which colors
+    render for which; that's dashboard.html's job, with a legend.
+    """
+    heights = [max(1 - e["ratio"], 0.0) for e in entries if e["ratio"] is not None]
+    max_height = max(heights) if heights else 0.0
+
+    chart = []
+    for e in entries:
+        if e["ratio"] is None:
+            chart.append(
+                {
+                    "day_start": e["day_start"],
+                    "label": e["label"],
+                    "ratio_display": None,
+                    "baseline_layer": None,
+                    "bar_pct": None,
+                }
+            )
+            continue
+
+        height = max(1 - e["ratio"], 0.0)
+        bar_pct = (height / max_height * 100) if max_height else 0.0
+        chart.append(
+            {
+                "day_start": e["day_start"],
+                "label": e["label"],
+                "ratio_display": f"{e['ratio']:.2f}",
+                "baseline_layer": e["baseline_layer"],
+                "bar_pct": bar_pct,
+            }
+        )
+    return chart

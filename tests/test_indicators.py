@@ -28,6 +28,7 @@ from dealwatch.reporting.indicators import (
     PENDING_WARN,
     SWEEP_AGE_WARN_MULTIPLIER,
     build_alerts_summary,
+    build_best_ratio_chart,
     build_budget_pacing,
     build_indicators,
 )
@@ -492,3 +493,91 @@ def test_budget_pacing_day_fraction_reflects_pt_not_utc():
     pacing = build_budget_pacing(status, now)
 
     assert pacing["day_pct"] == pytest.approx(79.2, abs=0.1)
+
+
+# ---------------------------------------------------------------------------
+# build_best_ratio_chart (V0.12b Part B)
+# ---------------------------------------------------------------------------
+
+
+def _ratio_day(day_start, ratio, baseline_layer="seed"):
+    return {"day_start": day_start, "label": "x", "ratio": ratio, "baseline_layer": baseline_layer}
+
+
+def test_best_ratio_chart_bar_length_is_distance_below_p25_not_ratio():
+    # B2: bar length is 1 - ratio, so the SMALLER ratio (the bigger
+    # discount) must draw the TALLER bar - plotting ratio directly would
+    # rank them backwards.
+    entries = [_ratio_day(0, 0.90), _ratio_day(1, 0.60)]  # 0.60 is the better deal
+
+    chart = build_best_ratio_chart(entries)
+
+    better, worse = chart[1], chart[0]  # ratio 0.60, ratio 0.90
+    assert better["bar_pct"] > worse["bar_pct"]
+    assert better["bar_pct"] == 100.0  # scaled to the largest 1 - ratio in the window
+
+
+def test_best_ratio_chart_scales_to_the_largest_discount_in_the_window():
+    entries = [_ratio_day(0, 0.90), _ratio_day(1, 0.70), _ratio_day(2, 0.80)]
+
+    chart = build_best_ratio_chart(entries)
+
+    # 1 - ratio: 0.10, 0.30, 0.20 -> scaled to max (0.30): 33.3%, 100%, 66.7%
+    assert chart[0]["bar_pct"] == pytest.approx(33.33, abs=0.1)
+    assert chart[1]["bar_pct"] == pytest.approx(100.0)
+    assert chart[2]["bar_pct"] == pytest.approx(66.67, abs=0.1)
+
+
+def test_best_ratio_chart_clamps_a_ratio_at_or_above_one_to_a_zero_height_bar():
+    # ratio_to_p25 >= 1.0 (priced at or above its own baseline's p25)
+    # would make 1 - ratio negative - clamped to 0, never a negative bar
+    # height.
+    entries = [_ratio_day(0, 1.20), _ratio_day(1, 0.70)]
+
+    chart = build_best_ratio_chart(entries)
+
+    assert chart[0]["bar_pct"] == 0.0
+    assert chart[1]["bar_pct"] == 100.0
+
+
+def test_best_ratio_chart_none_day_has_none_bar_pct_and_no_ratio_display():
+    # B5: a no-alert day is a gap, not a zero-height bar - bar_pct=None
+    # is how the template tells "no data" apart from a real 0%-tall bar.
+    entries = [_ratio_day(0, None, baseline_layer=None), _ratio_day(1, 0.70)]
+
+    chart = build_best_ratio_chart(entries)
+
+    assert chart[0]["bar_pct"] is None
+    assert chart[0]["ratio_display"] is None
+    assert chart[0]["baseline_layer"] is None
+    assert chart[1]["bar_pct"] == 100.0
+    assert chart[1]["ratio_display"] == "0.70"
+
+
+def test_best_ratio_chart_all_none_window_is_every_entry_none(tmp_path):
+    # B6: the template's "no alerts in the last 14 days" fallback checks
+    # for exactly this shape (every ratio_display falsy) - pin that every
+    # entry in an all-None window actually has one.
+    entries = [_ratio_day(i, None, baseline_layer=None) for i in range(14)]
+
+    chart = build_best_ratio_chart(entries)
+
+    assert len(chart) == 14
+    assert all(e["bar_pct"] is None for e in chart)
+    assert all(not e["ratio_display"] for e in chart)
+
+
+def test_best_ratio_chart_baseline_layer_is_passed_through_for_colouring():
+    entries = [_ratio_day(0, 0.70, baseline_layer="computed")]
+
+    chart = build_best_ratio_chart(entries)
+
+    assert chart[0]["baseline_layer"] == "computed"
+
+
+def test_best_ratio_chart_ratio_display_formats_to_two_decimals():
+    entries = [_ratio_day(0, 0.723456)]
+
+    chart = build_best_ratio_chart(entries)
+
+    assert chart[0]["ratio_display"] == "0.72"

@@ -183,3 +183,30 @@ never run or reported.
 Payload verification is not visual verification. Every dashboard
 milestone gets an explicit browser step whose result is reported back,
 not assumed.
+
+## L9 — a compound class selector silently never matches the legend swatch
+
+Found while wiring V0.12b's own legend: `.bar-segment.bar-live` and
+`.bar-segment.bar-dry` require an element to carry BOTH classes. The real
+bar segments do (`class="bar-segment bar-live"`), but the legend swatches
+never did (`class="legend-swatch bar-live"`, no `.bar-segment`) - so the
+Live/Dry-run legend has shown no colour at all since the alerts-per-day
+chart was built. `.legend-swatch` itself sets `display: inline-block`
+with an explicit `width`/`height`, so this is NOT L7's bug (inline
+elements ignoring block dimensions) - the swatch has always had correct
+geometry, just no colour. A different mechanism, same shape of mistake:
+a selector written against the assumption that a colour class always
+appears alongside a specific structural class, on an element where it
+doesn't.
+
+Fixed by unscoping the colour rules (`.bar-live`, `.bar-dry`,
+`.ratio-bar-computed`, `.ratio-bar-seed` - no `.bar-segment` prefix), so
+one class colours whichever element carries it, structural class or not.
+Written correctly from the start for V0.12b's own new legend, then
+applied back to the pre-existing bug once noticed.
+
+Same lesson as L7 anyway: a colour/geometry rule that depends on a
+second class being present needs that dependency checked against every
+element the class is used on, not just the one the rule was written
+for - a template's `<span>`/`<div>` choice was L7's version of this,
+a legend reusing a bar's class name is this one's.

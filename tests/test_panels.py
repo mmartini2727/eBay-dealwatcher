@@ -744,9 +744,14 @@ def test_baseline_queue_renders_explicit_unresolved_state_with_no_fallback(tmp_p
 # ---------------------------------------------------------------------------
 
 
-def _seed_alert_ratio(conn, item_id, *, sent_at, ratio_to_p25, profile_id=PROFILE):
+def _seed_alert_ratio(
+    conn, item_id, *, sent_at, ratio_to_p25, profile_id=PROFILE, baseline_layer="seed", dry_run=False
+):
     seed_listing(conn, item_id, profile_id=profile_id)
-    seed_alert(conn, item_id, profile_id=profile_id, sent_at=sent_at, ratio_to_p25=ratio_to_p25)
+    seed_alert(
+        conn, item_id, profile_id=profile_id, sent_at=sent_at, ratio_to_p25=ratio_to_p25,
+        baseline_layer=baseline_layer, dry_run=dry_run,
+    )
 
 
 def test_best_ratio_window_returns_none_for_an_empty_window(tmp_path):
@@ -775,3 +780,113 @@ def test_best_ratio_window_excludes_alerts_outside_the_window(tmp_path):
     result = panels.best_ratio_window(conn, PROFILE, days=14, now=_NOON)
 
     assert result == pytest.approx(0.80)  # not the 0.10 outside the window
+
+
+# ---------------------------------------------------------------------------
+# best_ratio_per_day() (V0.12b Part A)
+# ---------------------------------------------------------------------------
+
+
+def test_best_ratio_per_day_empty_window_is_all_none(tmp_path):
+    # A3: an alert-free window must be 14 entries with ratio=None and
+    # baseline_layer=None each - not an empty list, and not zeros (a 0.0
+    # would read as the best possible deal ever found).
+    conn = make_conn(tmp_path)
+
+    entries = panels.best_ratio_per_day(conn, PROFILE, days=14, now=_NOON)
+
+    assert len(entries) == 14
+    assert all(e["ratio"] is None for e in entries)
+    assert all(e["baseline_layer"] is None for e in entries)
+
+
+def test_best_ratio_per_day_returns_the_minimum_and_its_own_layer(tmp_path):
+    # A5: seeded so the minimum-ratio row has a DIFFERENT baseline_layer
+    # from the other rows that day - a fixed/arbitrary layer pick would
+    # pass a test where every row that day shares one layer. The other
+    # two rows are "computed"; the actual minimum is "seed" - the result
+    # must report "seed", not "computed" (which a bug picking, say, the
+    # first-inserted row's layer would wrongly report).
+    conn = make_conn(tmp_path)
+    _seed_alert_ratio(
+        conn, "item-1", sent_at=_TODAY_START + 100, ratio_to_p25=0.90, baseline_layer="computed"
+    )
+    _seed_alert_ratio(
+        conn, "item-2", sent_at=_TODAY_START + 200, ratio_to_p25=0.72, baseline_layer="seed"
+    )  # the minimum
+    _seed_alert_ratio(
+        conn, "item-3", sent_at=_TODAY_START + 300, ratio_to_p25=0.95, baseline_layer="computed"
+    )
+
+    entries = panels.best_ratio_per_day(conn, PROFILE, days=1, now=_NOON)
+
+    assert entries[0]["ratio"] == pytest.approx(0.72)
+    assert entries[0]["baseline_layer"] == "seed"
+
+
+def test_best_ratio_per_day_days_with_no_alerts_are_none_others_are_not(tmp_path):
+    conn = make_conn(tmp_path)
+    _seed_alert_ratio(conn, "item-1", sent_at=_TODAY_START + 100, ratio_to_p25=0.80)
+
+    entries = panels.best_ratio_per_day(conn, PROFILE, days=14, now=_NOON)
+
+    assert entries[-1]["day_start"] == _TODAY_START
+    assert entries[-1]["ratio"] == pytest.approx(0.80)
+    assert all(e["ratio"] is None for e in entries[:-1])
+
+
+def test_best_ratio_per_day_labels_match_alerts_per_day_for_the_same_window(tmp_path):
+    # A2: the two charts must line up column-for-column - built from the
+    # identical label format, not merely a coincidentally similar one.
+    conn = make_conn(tmp_path)
+    seed_listing(conn, "item-1")
+
+    alerts_entries = panels.alerts_per_day(conn, PROFILE, days=14, now=_NOON)
+    ratio_entries = panels.best_ratio_per_day(conn, PROFILE, days=14, now=_NOON)
+
+    assert [e["label"] for e in alerts_entries] == [e["label"] for e in ratio_entries]
+    assert [e["day_start"] for e in alerts_entries] == [e["day_start"] for e in ratio_entries]
+
+
+def test_best_ratio_per_day_spans_the_fall_back_dst_transition(tmp_path):
+    # Same fixture shape as alerts_per_day()'s own DST test - `now`
+    # anchored a few days AFTER the 2026-11-01 fall-back transition so
+    # the 14-day walk-back has to cross it as an intermediate step, not
+    # start on it (walking back from the transition day itself never
+    # exercises the bug - see alerts_per_day()'s own DST test comment).
+    conn = make_conn(tmp_path)
+    nov_1_start = int(datetime(2026, 11, 1, 0, 0, tzinfo=PACIFIC).timestamp())
+    now = int(datetime(2026, 11, 4, 12, 0, tzinfo=PACIFIC).timestamp())
+    _seed_alert_ratio(conn, "item-1", sent_at=nov_1_start + 24 * 3600 + 60, ratio_to_p25=0.85)
+
+    entries = panels.best_ratio_per_day(conn, PROFILE, days=14, now=now)
+
+    assert len(entries) == 14
+    day_starts = [e["day_start"] for e in entries]
+    assert len(set(day_starts)) == 14  # every day distinct - none skipped or duplicated
+    for earlier, later in zip(day_starts, day_starts[1:]):
+        gap_hours = (later - earlier) / 3600
+        assert 23 <= gap_hours <= 25  # 24h normally, 25h across this exact transition
+    assert nov_1_start in day_starts
+    nov_1_entry = next(e for e in entries if e["day_start"] == nov_1_start)
+    assert nov_1_entry["ratio"] == pytest.approx(0.85)
+
+
+def test_best_ratio_per_day_dry_run_filter_matches_best_ratio_24h(tmp_path):
+    # A4: best_ratio_24h (status.py) has no dry_run clause at all - a
+    # dry-run alert counts as "a deal found" there, so it must count
+    # here too. Seeded with a dry-run alert whose ratio is LOWER than
+    # any live one that day - if this function excluded dry-run rows
+    # (a filter best_ratio_24h doesn't have), the reported minimum would
+    # be the live 0.90, not the dry-run 0.60.
+    conn = make_conn(tmp_path)
+    _seed_alert_ratio(
+        conn, "live-item", sent_at=_TODAY_START + 100, ratio_to_p25=0.90, dry_run=False
+    )
+    _seed_alert_ratio(
+        conn, "dry-item", sent_at=_TODAY_START + 200, ratio_to_p25=0.60, dry_run=True
+    )
+
+    entries = panels.best_ratio_per_day(conn, PROFILE, days=1, now=_NOON)
+
+    assert entries[0]["ratio"] == pytest.approx(0.60)

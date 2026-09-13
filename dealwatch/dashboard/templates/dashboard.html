@@ -56,6 +56,7 @@
   }
   @media (min-width: 900px) {
     .grid { grid-template-columns: 1fr 1fr; }
+    .panel-wide { grid-column: 1 / -1; }
   }
   .panel {
     background: var(--panel-bg);
@@ -232,12 +233,31 @@
     width: 100%;
     flex-shrink: 0;
   }
-  .bar-segment.bar-live { background: #1a5fb4; }
-  .bar-segment.bar-dry { background: #a7c3e6; }
+  {# ---------------------------------------------------------------
+     Unscoped from .bar-segment on purpose - these colour classes are
+     shared with the legend swatches (.legend-swatch bar-live etc.),
+     which never carry .bar-segment. A compound `.bar-segment.bar-live`
+     selector (the form this started as) matches the real bars but
+     silently never matches the legend swatch, which has the right
+     width/height (.legend-swatch sets those directly, unaffected by
+     L7) but no colour at all - found while wiring this chart's own
+     legend and fixed for bar-live/bar-dry's pre-existing copy of the
+     same mistake at the same time.
+     --------------------------------------------------------------- #}
+  .bar-live { background: #1a5fb4; }
+  .bar-dry { background: #a7c3e6; }
+  .ratio-bar-computed { background: var(--ok); }
+  .ratio-bar-seed { background: var(--warn); }
   .bar-label {
     font-size: 0.62rem;
     color: var(--muted);
     margin-top: 5px;
+    white-space: nowrap;
+  }
+  .bar-value {
+    font-size: 0.62rem;
+    font-weight: 600;
+    margin-top: 2px;
     white-space: nowrap;
   }
   .legend {
@@ -301,7 +321,7 @@
       --error-text: #f0a7a2;
     }
     th { color: var(--muted); }
-    .bar-segment.bar-dry { background: #3a5580; }
+    .bar-dry { background: #3a5580; }
     .pacing-track { background: #333; }
     .group-heading { border-top-color: #3a3a3c; }
     .queue-list li { border-bottom-color: #333; }
@@ -457,6 +477,47 @@
           <div class="stat-label">Best ratio (14 days)</div>
         </div>
       </div>
+    {% endif %}
+  </div>
+
+  {# ---------------------------------------------------------------
+     Best ratio per day (V0.12b) - full-width (grid-column: 1 / -1)
+     so it always renders as its own row directly under the alerts
+     chart above, regardless of grid auto-placement, and so it has
+     room for 14 columns plus a printed ratio under each one. Reuses
+     .chart/.bar-col/.bar-stack/.bar-segment from the alerts chart
+     verbatim (same column widths and gaps, B1) so the two charts'
+     day-columns line up without a second set of layout rules.
+     --------------------------------------------------------------- #}
+  <div class="panel panel-wide">
+    <h2>Best ratio per day &mdash; 14 days</h2>
+    <p class="panel-note">
+      Bar height: distance below p25 (longer bar = bigger discount),
+      scaled to the largest discount in this window - not a fixed 0-100%
+      axis. The number under each bar is the real ratio to p25.
+    </p>
+    {% if 'error' in payload.best_ratio_chart %}
+      <div class="error-box">Panel unavailable: {{ payload.best_ratio_chart.error }}</div>
+    {% elif payload.best_ratio_chart and (payload.best_ratio_chart | selectattr("ratio_display") | list) %}
+      <div class="chart">
+        {% for e in payload.best_ratio_chart %}
+          <div class="bar-col" title="{{ e.label }}: {{ (e.ratio_display + ' (' + e.baseline_layer + ')') if e.ratio_display else 'no alerts' }}">
+            <div class="bar-stack">
+              {% if e.bar_pct is not none %}
+                <div class="bar-segment {{ 'ratio-bar-computed' if e.baseline_layer == 'computed' else 'ratio-bar-seed' }}" style="height: {{ e.bar_pct }}%;"></div>
+              {% endif %}
+            </div>
+            <div class="bar-value">{{ e.ratio_display or "" }}</div>
+            <div class="bar-label">{{ e.label }}</div>
+          </div>
+        {% endfor %}
+      </div>
+      <div class="legend">
+        <span><span class="legend-swatch ratio-bar-computed"></span>Computed baseline</span>
+        <span><span class="legend-swatch ratio-bar-seed"></span>Seed baseline</span>
+      </div>
+    {% else %}
+      <p class="empty-note">No alerts in the last 14 days.</p>
     {% endif %}
   </div>
 

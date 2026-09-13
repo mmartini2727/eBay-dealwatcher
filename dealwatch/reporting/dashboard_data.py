@@ -40,6 +40,12 @@ result already computed for the chart above it, plus one new bounded
 query, panels.best_ratio_window()) follows the identical
 depends-on-status-and-one-panel-section pattern _build_indicators()/
 _build_pacing() already use.
+
+V0.12b addendum: `best_ratio_chart` is independent of `status` and
+`alerts_per_day` - it's built entirely from its own query
+(panels.best_ratio_per_day()) transformed by a pure function
+(indicators.build_best_ratio_chart()), so unlike `alerts_summary` it
+needs no error-propagation check against another section before running.
 """
 
 import logging
@@ -49,7 +55,12 @@ import time
 
 from dealwatch.engine.scoring import CompiledSeedBaseline
 from dealwatch.reporting import panels
-from dealwatch.reporting.indicators import build_alerts_summary, build_budget_pacing, build_indicators
+from dealwatch.reporting.indicators import (
+    build_alerts_summary,
+    build_best_ratio_chart,
+    build_budget_pacing,
+    build_indicators,
+)
 from dealwatch.reporting.status import collect_status
 from dealwatch.storage.sqlite import connect_readonly
 
@@ -159,6 +170,11 @@ def build_payload(
             best_ratio_14d,
         )
 
+    best_ratio_chart_result = _safe(
+        "best_ratio_chart",
+        lambda: build_best_ratio_chart(panels.best_ratio_per_day(conn, profile_id, now=now)),
+    )
+
     return {
         "generated_at": now,
         "profile_id": profile_id,
@@ -174,6 +190,7 @@ def build_payload(
         "budget_pacing": _safe("budget_pacing", _build_pacing),
         "alerts_per_day": alerts_per_day_result,
         "alerts_summary": _safe("alerts_summary", _build_alerts_summary),
+        "best_ratio_chart": best_ratio_chart_result,
         "recent_alerts": _safe("recent_alerts", lambda: panels.recent_alerts(conn, profile_id)),
         "recent_listings": _safe(
             "recent_listings", lambda: panels.recent_listings(conn, profile_id)
@@ -216,7 +233,8 @@ _cache: dict[str, tuple[float, dict, dict, int]] = {}
 
 _PAYLOAD_SECTIONS = (
     "status", "indicators", "budget_pacing", "alerts_per_day", "alerts_summary",
-    "recent_alerts", "recent_listings", "baseline_coverage", "computed_baselines", "baseline_queue",
+    "best_ratio_chart", "recent_alerts", "recent_listings", "baseline_coverage",
+    "computed_baselines", "baseline_queue",
 )
 
 # A transient connection failure (a bind mount reattaching, a snapshot

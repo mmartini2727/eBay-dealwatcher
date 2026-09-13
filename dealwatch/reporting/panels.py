@@ -40,6 +40,11 @@ derive_candidates() itself.
 `alerts_per_day()` is - one indexed range scan via
 idx_alerts_profile_sent_at, computing only the window's two boundary
 timestamps rather than one row per day.
+
+`best_ratio_per_day()` (V0.12b Part A) is the per-day companion to
+`best_ratio_window()` - one MIN(ratio_to_p25) range scan per day, same
+index, same day-by-day walk `alerts_per_day()` uses (`_walk_back_days()`,
+extracted so the DST-safe boundary walk exists in exactly one place).
 """
 
 import sqlite3
@@ -93,6 +98,24 @@ def _price_display(cents: int | None) -> str:
     return f"${cents / 100:,.2f}" if cents is not None else "unknown"
 
 
+def _walk_back_days(now: int, days: int):
+    """Yield (day_start, day_end) LA calendar-day boundaries for `days`
+    days ending with today, most recent first (V0.12b Part A1) - the
+    walk alerts_per_day() and best_ratio_per_day() both need, extracted
+    so there is exactly one place it's written.
+
+    Walks via la_day_bounds(cur_start - 1), never a fixed `- 86400`: a
+    fixed-seconds step drifts an hour across a DST boundary and
+    mislabels/misbounds every day before it (see the DST test in
+    tests/test_panels.py, which spans the 2026-11-01 fall-back
+    transition).
+    """
+    cur_start, cur_end = la_day_bounds(now)
+    for _ in range(days):
+        yield cur_start, cur_end
+        cur_start, cur_end = la_day_bounds(cur_start - 1)
+
+
 def alerts_per_day(
     conn: sqlite3.Connection, profile_id: str, *, days: int = 14, now: int | None = None
 ) -> list[dict]:
@@ -112,11 +135,8 @@ def alerts_per_day(
     and the template is the one place in this codebase that isn't covered
     by a test suite.
 
-    Walks back one calendar day at a time via la_day_bounds(day_start - 1)
-    rather than subtracting 86400 - a fixed-seconds walk drifts an hour
-    across a DST boundary and mislabels every bar before it (see the DST
-    test in tests/test_panels.py, which spans the 2026-11-01 fall-back
-    transition).
+    Walks via _walk_back_days() (V0.12b Part A1) - shared with
+    best_ratio_per_day() below, not a second, separately-written walk.
 
     Each day's counts use status.event_count(), the same distinct-
     (item_id, sent_at) dedup collect_status() uses for its own "today"
@@ -132,11 +152,9 @@ def alerts_per_day(
     mode), not a scan of the whole table.
     """
     now = now if now is not None else int(time.time())
-    day_start, day_end = la_day_bounds(now)
 
     entries = []
-    cur_start, cur_end = day_start, day_end
-    for _ in range(days):
+    for cur_start, cur_end in _walk_back_days(now, days):
         count_live = event_count(
             conn,
             "profile_id = ? AND dry_run = 0 AND sent_at >= ? AND sent_at < ?",
@@ -156,7 +174,84 @@ def alerts_per_day(
                 "count_dry": count_dry,
             }
         )
-        cur_start, cur_end = la_day_bounds(cur_start - 1)
+
+    entries.reverse()
+    return entries
+
+
+def best_ratio_per_day(
+    conn: sqlite3.Connection, profile_id: str, *, days: int = 14, now: int | None = None
+) -> list[dict]:
+    """One entry per LA calendar day, oldest first (V0.12b Part A):
+    {"day_start", "label", "ratio", "baseline_layer"}.
+
+    A1: walks via _walk_back_days(), the same shared walk alerts_per_day()
+    uses - not a second implementation of the DST-safe boundary walk.
+
+    A2: `label` is built identically to alerts_per_day()'s own
+    (`datetime.fromtimestamp(cur_start, PACIFIC).strftime("%b %-d")`) so
+    the two charts' day-columns line up column-for-column when stacked.
+    Computed here, in Python, never in the template.
+
+    A3: a day with no alerts returns ratio=None, baseline_layer=None -
+    never ratio=0.0. A 0.0 would mean "sold for literally $0 against its
+    baseline's p25," the best deal ever found - a day with nothing to
+    report must not look like that day. Same "absent is not zero"
+    discipline as indicators.py's unknown state, sharper here: the wrong
+    value isn't just uninformative, it's backwards (the best-looking
+    number the chart can show, for the day with no data at all).
+
+    A4: no dry_run filter - matches status.py's best_ratio_24h exactly
+    (`SELECT MIN(ratio_to_p25) FROM alerts WHERE profile_id = ? AND
+    sent_at >= ?`, no dry_run clause). Whether a dry-run alert should
+    count as "a deal found" is a real question, not an oversight this
+    function is ignoring - it takes the same side best_ratio_24h already
+    takes (yes), so the two ratios that can appear on this same page
+    differ only because of their windows (rolling 24h vs. LA calendar
+    day), never because of a silently different filter underneath. If
+    that answer ever changes, it must change for both together, not one.
+
+    A5: `baseline_layer` is read as a bare column alongside
+    MIN(ratio_to_p25) in the same single-aggregate, no-GROUP-BY query -
+    relying on SQLite's documented behavior that in exactly this shape,
+    every bare column in the SELECT list comes from the input row that
+    produced the aggregate value (https://www.sqlite.org/lang_select.html,
+    "Bare columns in an aggregate query"), not an arbitrary row that
+    happens to share the minimum. This is SQLite-specific and non-obvious
+    enough that a reader unaware of it would reasonably assume
+    `baseline_layer` is uncorrelated with the printed ratio - it isn't.
+    Verified empirically against this exact query shape (a fixture where
+    the minimum-ratio row's layer differs from the other rows in the same
+    day) before relying on it, not just from the documentation. Chosen
+    over a correlated subquery to match the one-query-per-day shape
+    status.py's best_ratio_24h and this module's own best_ratio_window()
+    already use - a second subquery per day would be a different query
+    shape for an already-established pattern, not a simplification.
+
+    Indexed by idx_alerts_profile_sent_at (profile_id, sent_at) -
+    EXPLAIN QUERY PLAN confirms `SEARCH alerts USING INDEX
+    idx_alerts_profile_sent_at (profile_id=? AND sent_at>? AND
+    sent_at<?)`, the same index alerts_per_day() and best_ratio_window()
+    rely on. Fourteen bounded range seeks, not fourteen scans.
+    """
+    now = now if now is not None else int(time.time())
+
+    entries = []
+    for cur_start, cur_end in _walk_back_days(now, days):
+        ratio, baseline_layer = conn.execute(
+            "SELECT MIN(ratio_to_p25), baseline_layer FROM alerts "
+            "WHERE profile_id = ? AND sent_at >= ? AND sent_at < ?",
+            (profile_id, cur_start, cur_end),
+        ).fetchone()
+        label = datetime.fromtimestamp(cur_start, PACIFIC).strftime("%b %-d")
+        entries.append(
+            {
+                "day_start": cur_start,
+                "label": label,
+                "ratio": ratio,
+                "baseline_layer": baseline_layer,
+            }
+        )
 
     entries.reverse()
     return entries
