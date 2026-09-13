@@ -31,7 +31,15 @@ V0.11a addendum) at low single-digit milliseconds against a database sized
 to today's real listing count, staying comfortably under 50ms even at 10x
 that scale - cheap enough today to sit in the same 30s cache as everything
 else, but the one function in this module that could stop being cheap
-without a code change, purely from history accumulating.
+without a code change, purely from history accumulating. V0.12 Part B
+adds one bounded point lookup against `listings`' own PRIMARY KEY per
+rendered queue entry (at most `limit`, default 10) - negligible next to
+derive_candidates() itself.
+
+`best_ratio_window()` (V0.12 Part C4) is bounded the same way
+`alerts_per_day()` is - one indexed range scan via
+idx_alerts_profile_sent_at, computing only the window's two boundary
+timestamps rather than one row per day.
 """
 
 import sqlite3
@@ -43,6 +51,7 @@ from dealwatch.engine.baselines import (
     group_fast_candidates_by_bucket,
     select_price,
 )
+from dealwatch.engine.scoring import CompiledSeedBaseline, parse_spec_json, resolve_seed_baseline
 from dealwatch.providers.ratelimit import PACIFIC, la_day_bounds
 from dealwatch.reporting.status import event_count
 
@@ -151,6 +160,47 @@ def alerts_per_day(
 
     entries.reverse()
     return entries
+
+
+def best_ratio_window(
+    conn: sqlite3.Connection, profile_id: str, *, days: int = 14, now: int | None = None
+) -> float | None:
+    """MIN(ratio_to_p25) over the LA-calendar-day-bounded `days`-day
+    window (V0.12 Part C4) - the window `alerts_per_day(days=days)` walks
+    day by day, but this only needs its two boundary timestamps, not one
+    row per day. Walks back via la_day_bounds(), the same DST-safe
+    boundary function alerts_per_day() uses (and for the identical
+    reason: a fixed `days * 86400` window drifts an hour across a DST
+    transition and silently shifts which alerts fall inside it) - not a
+    reimplementation, the same function.
+
+    Distinct from status.py's best_ratio_24h, which stays exactly as it
+    is: a ROLLING 24h window, unrelated to calendar-day boundaries. Both
+    may render on the same page and must be labeled with their own
+    windows - the live data already shows why conflating them is wrong:
+    best_ratio_24h can read 0.86 while today's LA-calendar-day alert
+    count is 0, because that alert fired yesterday evening, inside the
+    rolling 24h window but outside today's calendar day.
+
+    No dry_run filter, matching best_ratio_24h's own definition
+    (reporting/status.py) - neither has ever filtered by mode. Returns
+    None when the window has no alerts at all, never 0.0 - a 0.0 would
+    read as "found a perfect deal," not "nothing happened."
+
+    Indexed by idx_alerts_profile_sent_at (profile_id, sent_at) - one
+    bounded range scan, the same index alerts_per_day() and recent_alerts()
+    already rely on.
+    """
+    now = now if now is not None else int(time.time())
+    window_start, _ = la_day_bounds(now)
+    for _ in range(days - 1):
+        window_start, _ = la_day_bounds(window_start - 1)
+    _, window_end = la_day_bounds(now)
+
+    return conn.execute(
+        "SELECT MIN(ratio_to_p25) FROM alerts WHERE profile_id = ? AND sent_at >= ? AND sent_at < ?",
+        (profile_id, window_start, window_end),
+    ).fetchone()[0]
 
 
 def recent_alerts(conn: sqlite3.Connection, profile_id: str, *, limit: int = 20) -> list[dict]:
@@ -415,12 +465,74 @@ def baseline_queue(
     *,
     min_samples: int,
     fast_lifespan_hours: int,
+    compiled_seeds: list[CompiledSeedBaseline],
     limit: int = 10,
 ) -> list[dict]:
     """Buckets that do NOT have a computed baseline yet, ranked by FAST-
     candidate count descending: {"bucket_key", "fast_candidates",
-    "min_samples"} (V0.11a Part E; ranking fixed in V0.11b Part A - see
-    below).
+    "min_samples", "progress_pct", "seed_p25_display", "seed_p50_display"}
+    (V0.11a Part E; ranking fixed in V0.11b Part A; progress bar and seed
+    values added in V0.12 Parts A/B - see below).
+
+    V0.12 Part A: `progress_pct` is `fast_candidates / min_samples`
+    clamped to 100 for the bar's CSS width - but `fast_candidates` itself
+    is NEVER clamped. recompute_baselines.py is manual (no cron, no
+    collector hook - CLAUDE.md), so a bucket can sit at, say, 13/12 for
+    days if nobody has run it: that's exactly the "recompute is overdue"
+    signal design.md §13's V0.11a addendum surfaced as a real 6.7-day
+    gap. Clamping the count itself to min_samples would render 13/12 as
+    an indistinguishable, comfortably-full 12/12 and hide the exact thing
+    this panel exists to catch.
+
+    V0.12 Part B: each entry also carries the seed_baselines value this
+    bucket would currently score against, resolved through
+    engine.scoring.resolve_seed_baseline() - the SAME function
+    score_listing() calls on every scored listing, never a second,
+    hand-rolled match here. `compiled_seeds` is `compile_seed_baselines()`'s
+    output (already dollars->cents converted) - this function receives it
+    pre-compiled, the same way it receives min_samples/fast_lifespan_hours
+    pre-resolved from the profile, rather than importing normalize.schema
+    or calling compile_seed_baselines() itself.
+
+    The spec dict `resolve_seed_baseline()` needs comes from one
+    representative candidate's OWN `listings.spec_json` (parsed via
+    engine.scoring.parse_spec_json() - the same helper
+    scripts/score_active.py uses to build the identical dict for
+    score_listing()) - never by parsing bucket_key's three pipe-delimited
+    segments back into field names. bucket_key is derived FROM the spec
+    by the normalize engine; reversing that derivation here would be a
+    second, undocumented mapping from string position to field name that
+    the normalize engine's own profile YAML already owns, and it would
+    silently drift the day a profile's bucket_key shape changes. The spec
+    lookup happens only for the (at most `limit`) entries that survive
+    ranking, not for every distinct fast bucket - the expensive part of
+    this function is already derive_candidates() below, not one more
+    point lookup per rendered row.
+
+    The representative candidate is chosen deterministically (min by
+    item_id), not "whichever one derive_candidates() happens to return
+    first" - _DEAD_OK_LISTINGS (engine/baselines.py) has no ORDER BY, so
+    that order is an implementation artifact (SQLite's default scan
+    order), not a contract, and a refresh could otherwise show a
+    different seed for a bucket that hasn't actually changed. Determinism
+    alone isn't what makes this sound, though - see the comment at the
+    call site for the actual invariant (every seed_baselines match key in
+    use today is also a bucket_key component) and what breaks it.
+
+    seed_baselines has no RAM dimension (design.md §5.6) - a `match`
+    block matches on generation/cpu_family only, so two bucket_keys
+    differing only in ram_tier resolve to the IDENTICAL seed. That's
+    correct, not a bug: dashboard.html carries a one-line note under this
+    panel saying so, rather than leaving three visually-identical seed
+    values looking like a rendering mistake.
+
+    resolve_seed_baseline() returning None (Part B4) means the profile has
+    no `match: {}` fallback entry - score_listing() treats this as a
+    ValueError (a profile-authoring gap, not a listing problem); this
+    panel has no listing to raise about, so it renders an explicit
+    "unresolved" string for both seed fields instead of leaving them
+    blank or coercing to $0.00 - the same "absent is not zero" discipline
+    indicators.py's unknown state already applies to health indicators.
 
     Ranked by fast count, not total dead count. Qualification for a
     baseline depends entirely on the FAST population reaching
@@ -487,10 +599,59 @@ def baseline_queue(
 
     fast_by_bucket = group_fast_candidates_by_bucket(candidates, fast_lifespan_hours)
 
-    queue = [
-        {"bucket_key": bucket_key, "fast_candidates": len(fast), "min_samples": min_samples}
-        for bucket_key, fast in fast_by_bucket.items()
-        if bucket_key not in computed
+    ranked = [
+        (bucket_key, fast) for bucket_key, fast in fast_by_bucket.items() if bucket_key not in computed
     ]
-    queue.sort(key=lambda entry: -entry["fast_candidates"])
-    return queue[:limit]
+    ranked.sort(key=lambda item: -len(item[1]))
+    ranked = ranked[:limit]
+
+    queue = []
+    for bucket_key, fast in ranked:
+        fast_candidates = len(fast)
+        progress_pct = min(fast_candidates / min_samples, 1.0) * 100 if min_samples else 100.0
+
+        # One representative candidate's own spec_json - not every
+        # candidate's, and not derived from bucket_key. min() by item_id,
+        # not fast[0]: _DEAD_OK_LISTINGS (engine/baselines.py) has no
+        # ORDER BY, so "first in derive_candidates()'s result" is
+        # whatever order SQLite happens to scan the table in (empirically,
+        # insertion order today) - an implementation artifact, not a
+        # documented guarantee, and not safe to build a deterministic
+        # panel on. min(item_id) is itself still an ARBITRARY choice of
+        # listing - it is sound ONLY because every seed_baselines match
+        # key in use today (generation, cpu_family) is already a
+        # bucket_key component (CLAUDE.md's V0.8c bucket_key narrowing:
+        # [generation, cpu_family, ram_tier]), so every listing sharing
+        # this bucket_key necessarily has the same generation/cpu_family
+        # and therefore resolves to the identical seed regardless of
+        # which one is picked - only the CHOICE needs to be deterministic
+        # (so a refresh can't show a different seed for a bucket that
+        # hasn't changed), not the listing itself.
+        #
+        # This stops being sound the moment any seed_baselines match
+        # block keys on a spec field OUTSIDE the bucket_key (condition,
+        # screen, storage - anything not in [generation, cpu_family,
+        # ram_tier]): two listings sharing this bucket_key could then
+        # legitimately resolve to two different seeds, and "one
+        # representative row" would silently pick whichever one, with no
+        # way for the panel to say it's showing only one of several true
+        # answers. See docs/learnings.md's entry on this exact assumption
+        # before adding a seed match key outside the bucket_key fields.
+        representative_item_id = min(c.item_id for c in fast)
+        spec_row = conn.execute(
+            "SELECT spec_json FROM listings WHERE item_id = ?", (representative_item_id,)
+        ).fetchone()
+        spec = parse_spec_json(spec_row[0] if spec_row is not None else None)
+        seed = resolve_seed_baseline(compiled_seeds, spec)
+
+        queue.append(
+            {
+                "bucket_key": bucket_key,
+                "fast_candidates": fast_candidates,
+                "min_samples": min_samples,
+                "progress_pct": progress_pct,
+                "seed_p25_display": _price_display(seed.p25_cents) if seed is not None else "unresolved",
+                "seed_p50_display": _price_display(seed.p50_cents) if seed is not None else "unresolved",
+            }
+        )
+    return queue

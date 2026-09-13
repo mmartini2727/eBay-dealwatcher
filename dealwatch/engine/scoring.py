@@ -22,6 +22,7 @@ bucket-coarsening step would, with hand-authored numbers instead of a
 wider, noisier pool.
 """
 
+import json
 from dataclasses import dataclass
 from typing import Any
 
@@ -73,6 +74,19 @@ def compile_seed_baselines(profile: Profile) -> list[CompiledSeedBaseline]:
             )
         )
     return compiled
+
+
+def parse_spec_json(spec_json: str | None) -> dict:
+    """Deserialize listings.spec_json into the dict resolve_seed_baseline()
+    expects - {} for a listing that was never normalized (spec_json NULL
+    or empty), never None. One implementation so scripts/score_active.py
+    (score_listing()'s own caller) and reporting/panels.py's
+    baseline_queue() (V0.12 Part B - a second reader of the same column,
+    for the same purpose: resolving a seed) can't drift on what "no spec
+    yet" means. score_listing() itself still takes `spec: dict` directly,
+    same as before - this is only for callers reading it off a raw row.
+    """
+    return json.loads(spec_json) if spec_json else {}
 
 
 def resolve_seed_baseline(

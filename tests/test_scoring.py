@@ -14,6 +14,7 @@ from dealwatch.engine.collector import load_profile
 from dealwatch.engine.scoring import (
     CompiledSeedBaseline,
     compile_seed_baselines,
+    parse_spec_json,
     resolve_seed_baseline,
     score_listing,
 )
@@ -53,6 +54,27 @@ def seed_computed_baseline(conn, bucket_key, *, n=12, p25_cents, p50_cents):
         ],
         computed_at=1000,
     )
+
+
+# ---------------------------------------------------------------------------
+# parse_spec_json() - shared by scripts/score_active.py and
+# reporting/panels.py's baseline_queue() (V0.12 Part B)
+# ---------------------------------------------------------------------------
+
+
+def test_parse_spec_json_none_is_empty_dict():
+    assert parse_spec_json(None) == {}
+
+
+def test_parse_spec_json_empty_string_is_empty_dict():
+    assert parse_spec_json("") == {}
+
+
+def test_parse_spec_json_deserializes_real_json():
+    assert parse_spec_json('{"generation": "5", "cpu_family": "intel-ultra-1"}') == {
+        "generation": "5",
+        "cpu_family": "intel-ultra-1",
+    }
 
 
 # ---------------------------------------------------------------------------

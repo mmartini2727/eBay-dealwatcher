@@ -96,3 +96,39 @@ auto-exclusion of this bucket. One violation at low n is not evidence the
 premise is wrong for this bucket, only evidence worth watching as the
 sample grows. If this bucket (or others) keeps violating the premise as
 `n` increases, that's the point at which it stops being a footnote.
+
+## L5. `baseline_queue()`'s seed lookup picks ONE listing per bucket - sound only because no seed matches outside the bucket_key today
+
+V0.12 Part B resolves each queued bucket's seed value by reading ONE
+representative candidate's `spec_json` and calling `resolve_seed_baseline()`
+on it (`reporting/panels.py`). Which listing gets picked is now
+deterministic (`min()` by `item_id`, fixed after this shipped without it -
+`_DEAD_OK_LISTINGS` has no `ORDER BY`, so "first row `derive_candidates()`
+returns" was an implementation artifact of SQLite's default scan order,
+not a guarantee, and would have let an unrelated schema/index change
+silently flip which listing's spec drove the displayed seed).
+
+Determinism alone does not make picking one listing correct, though - it
+only makes the panel's answer consistent from one refresh to the next.
+The actual invariant that makes "any one listing in the bucket" a valid
+substitute for "every listing in the bucket" is this: **every
+`seed_baselines` match key in use today (`generation`, `cpu_family`) is
+already a component of `bucket_key`** (`[generation, cpu_family,
+ram_tier]` since V0.8c). Every listing sharing a `bucket_key` therefore
+necessarily shares the same `generation`/`cpu_family`, so every one of
+them resolves to the identical seed - which one gets read is irrelevant
+to the *answer*, only to whether the answer is reproducible.
+
+**This breaks the moment a `seed_baselines` match block keys on any spec
+field outside `bucket_key`** - `condition`, `screen`, `storage`, anything
+not in `[generation, cpu_family, ram_tier]`. At that point two listings
+sharing a `bucket_key` could legitimately resolve to two *different*
+seeds, and "read one representative listing" stops being a shortcut and
+starts being a silent wrong answer for whichever listings didn't get
+picked - deterministic, plausible-looking, and quietly disagreeing with
+what `score_listing()` would actually compute for those other listings'
+real alerts. The comment at `baseline_queue()`'s call site says this
+explicitly. Before adding a `seed_baselines` match key outside
+`bucket_key`'s three fields, this function needs to change - at minimum,
+resolve per-candidate and either show a range or flag the bucket as
+seed-ambiguous, not silently keep reading one row.

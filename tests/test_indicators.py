@@ -27,6 +27,7 @@ from dealwatch.reporting.indicators import (
     COVERAGE_WARN_PCT,
     PENDING_WARN,
     SWEEP_AGE_WARN_MULTIPLIER,
+    build_alerts_summary,
     build_budget_pacing,
     build_indicators,
 )
@@ -422,6 +423,60 @@ def test_budget_pacing_consumed_is_clamped_at_100_when_used_exceeds_ceiling():
     pacing = build_budget_pacing(status, now=1_000_000)
 
     assert pacing["budget_pct"] == 100.0
+
+
+def _alert_day(day_start, count_live, count_dry):
+    return {"day_start": day_start, "label": "x", "count_live": count_live, "count_dry": count_dry}
+
+
+# ---------------------------------------------------------------------------
+# build_alerts_summary (V0.12 Part C)
+# ---------------------------------------------------------------------------
+
+
+def test_alerts_summary_14d_total_differs_from_a_7d_only_sum():
+    # A fixture where the two happen to match proves nothing - that's the
+    # exact coincidence design.md's V0.12 entry calls out in the live
+    # data (both read 51 only because the older seven bars are zero).
+    # Here the older seven days are deliberately non-zero.
+    older_seven = [_alert_day(i, 2, 0) for i in range(7)]
+    recent_seven = [_alert_day(i, 3, 0) for i in range(7, 14)]
+    entries = older_seven + recent_seven
+
+    summary = build_alerts_summary(entries, distinct_items_7d=5, best_ratio_14d=0.8)
+
+    seven_day_only_sum = sum(e["count_live"] + e["count_dry"] for e in recent_seven)
+    assert seven_day_only_sum == 21
+    assert summary["total_14d"] == 35
+    assert summary["total_14d"] != seven_day_only_sum
+
+
+def test_alerts_summary_distinct_items_7d_is_passed_through_unmodified():
+    summary = build_alerts_summary([], distinct_items_7d=12, best_ratio_14d=None)
+    assert summary["distinct_items_7d"] == 12
+
+
+def test_alerts_summary_average_uses_live_counts_not_merged_with_a_large_dry_run_day():
+    # A 33-event dry-run day (V0.9 calibration traffic) sitting among
+    # otherwise-quiet live days - the average must not blend it into one
+    # merged per-day figure the way a naive (count_live + count_dry) sum
+    # divided by days would.
+    entries = [_alert_day(0, 1, 33)] + [_alert_day(i, 1, 0) for i in range(1, 14)]
+
+    summary = build_alerts_summary(entries, distinct_items_7d=0, best_ratio_14d=None)
+
+    assert "1.0/day live" in summary["avg_per_day_display"]
+    assert "2.4/day dry" in summary["avg_per_day_display"]  # 33/14, not (14+33)/14
+
+
+def test_alerts_summary_best_ratio_none_renders_no_alerts_in_window():
+    summary = build_alerts_summary([], distinct_items_7d=0, best_ratio_14d=None)
+    assert summary["best_ratio_14d_display"] == "no alerts in window"
+
+
+def test_alerts_summary_best_ratio_formats_to_two_decimals():
+    summary = build_alerts_summary([], distinct_items_7d=0, best_ratio_14d=0.723456)
+    assert summary["best_ratio_14d_display"] == "0.72"
 
 
 def test_budget_pacing_day_fraction_reflects_pt_not_utc():

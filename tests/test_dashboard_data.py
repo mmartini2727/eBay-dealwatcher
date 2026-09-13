@@ -27,14 +27,16 @@ def _kwargs(**overrides):
         daily_reserve_calls=250,
         min_samples=12,
         fast_lifespan_hours=24,
+        compiled_seeds=[],
     )
     base.update(overrides)
     return base
 
 
 _ALL_SECTIONS = (
-    "status", "indicators", "budget_pacing", "alerts_per_day", "recent_alerts",
-    "recent_listings", "baseline_coverage", "computed_baselines", "baseline_queue",
+    "status", "indicators", "budget_pacing", "alerts_per_day", "alerts_summary",
+    "recent_alerts", "recent_listings", "baseline_coverage", "computed_baselines",
+    "baseline_queue",
 )
 
 

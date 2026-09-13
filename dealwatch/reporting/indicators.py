@@ -17,6 +17,12 @@ a health check) but has the exact same "pure function over collect_
 status()'s payload, no I/O" shape as build_indicators() itself, so it
 lives here rather than starting a third module for one function.
 
+build_alerts_summary() (V0.12 Part C) is a third such function - four
+ready-to-render figures under the 14-day alerts chart, computed from
+already-fetched data (the alerts_per_day() array, collect_status()'s
+distinct_items_alerted_7d, and panels.best_ratio_window()'s result) with
+no database access of its own.
+
 and group is one of "health" | "alerts" | "baseline" - which panel section
 the template renders the indicator under. build_indicators() returns one
 flat dict, not the health/alerts split an earlier draft had: a nested
@@ -338,4 +344,54 @@ def build_budget_pacing(status: dict, now: int) -> dict:
         ),
         "day_pct": round(day_fraction * 100, 1),
         "day_pct_display": f"{day_fraction * 100:.0f}%",
+    }
+
+
+def build_alerts_summary(
+    alerts_per_day: list[dict], distinct_items_7d: int, best_ratio_14d: float | None
+) -> dict:
+    """Four ready-to-render figures under the 14-day alerts chart (V0.12
+    Part C): {"total_14d", "distinct_items_7d", "avg_per_day_display",
+    "best_ratio_14d_display"}.
+
+    `total_14d` sums THIS SAME array's count_live + count_dry - not
+    status.py's `alert_events_7d`, which answers a different, 7-day
+    question and would silently mislabel a 14-day panel. The two read
+    identically today (51) purely because the older seven bars in the
+    live window are all zero; that's a coincidence of how recently
+    alerting went live, not a property that holds once real history
+    fills those older days.
+
+    `distinct_items_7d` is passed straight through, unmodified, from
+    collect_status()'s own 7-day figure - it keeps its own honest label
+    ("7 days") rather than being implied to share this panel's 14-day
+    window just because it renders next to it.
+
+    `avg_per_day_display` splits live and dry rather than merging them
+    (same reasoning as alerts_per_day()'s own count_live/count_dry split,
+    reporting/panels.py): the V0.9 calibration day that motivated that
+    split (33 dry-run events in one day) would inflate a MERGED average
+    by roughly that day's count divided by the window length - about
+    +2.4/day here - for as long as it stays in the 14-day window. Divides
+    by `len(alerts_per_day)`, not a hardcoded 14, so this stays correct
+    if a caller ever passes a different window length.
+
+    `best_ratio_14d_display` is None-safe: panels.best_ratio_window()
+    returns None for an alert-free window, and "no alerts in window" is
+    what renders for that, never a fabricated "0.00" that would read as
+    a perfect deal.
+    """
+    total_14d = sum(entry["count_live"] + entry["count_dry"] for entry in alerts_per_day)
+
+    n_days = len(alerts_per_day) or 1
+    avg_live = sum(entry["count_live"] for entry in alerts_per_day) / n_days
+    avg_dry = sum(entry["count_dry"] for entry in alerts_per_day) / n_days
+
+    return {
+        "total_14d": total_14d,
+        "distinct_items_7d": distinct_items_7d,
+        "avg_per_day_display": f"{avg_live:.1f}/day live, {avg_dry:.1f}/day dry",
+        "best_ratio_14d_display": (
+            f"{best_ratio_14d:.2f}" if best_ratio_14d is not None else "no alerts in window"
+        ),
     }

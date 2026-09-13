@@ -7,15 +7,34 @@ layer, no reason to run listings through the collector or scoring to test
 it.
 """
 
+import json
 from datetime import datetime
 
 import pytest
 
+from dealwatch.engine.scoring import compile_seed_baselines
+from dealwatch.normalize.schema import PollConfig, Profile, SearchConfig
 from dealwatch.providers.ratelimit import PACIFIC
 from dealwatch.reporting import panels
 from dealwatch.storage.sqlite import connect
 
 PROFILE = "thinkpad-t14"
+
+
+def make_seeds(seed_baselines):
+    """compile_seed_baselines() needs a Profile, but panels.py's
+    baseline_queue() only ever sees its already-compiled output
+    (V0.12 Part B2) - this builds just enough of a Profile to compile a
+    given seed_baselines list, matching test_scoring.py's make_profile()
+    shape."""
+    profile = Profile(
+        id=PROFILE,
+        name="Test Profile",
+        search=SearchConfig(queries=["q"], filters={}, poll=PollConfig()),
+        scoring={},
+        seed_baselines=seed_baselines,
+    )
+    return compile_seed_baselines(profile)
 
 
 def make_conn(tmp_path):
@@ -35,13 +54,14 @@ def seed_listing(
     gone_at=None,
     lifespan_mins=None,
     item_web_url=None,
+    spec_json=None,
 ):
     conn.execute(
         "INSERT INTO listings (item_id, profile_id, title, spec_status, "
         "bucket_key, first_seen, last_seen, miss_count, gone_at, lifespan_mins, "
-        "item_web_url) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
+        "item_web_url, spec_json) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)",
         (item_id, profile_id, title, spec_status, bucket_key, first_seen,
-         last_seen, gone_at, lifespan_mins, item_web_url),
+         last_seen, gone_at, lifespan_mins, item_web_url, spec_json),
     )
 
 
@@ -371,16 +391,23 @@ def test_computed_baselines_is_profile_scoped(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def _seed_candidate(conn, item_id, bucket_key, *, first_seen, price_cents=20000, lifespan_seconds=600):
+def _seed_candidate(
+    conn, item_id, bucket_key, *, first_seen, price_cents=20000, lifespan_seconds=600, spec=None
+):
     """A listing shaped exactly like one derive_candidates() would accept:
     dead, sweep-confirmed (first_seen != last_seen), spec_status='ok', no
     variation_id, a complete bucket_key, and a priced observation.
     lifespan_seconds defaults to 600 (10 min) - fast under any realistic
     fast_lifespan_hours threshold; pass a much larger value to seed a
-    SLOW candidate (V0.11b Part A's ranking fix needs both shapes)."""
+    SLOW candidate (V0.11b Part A's ranking fix needs both shapes).
+    spec (V0.12 Part B) is serialized into spec_json - baseline_queue()
+    reads it back via the real parse_spec_json() to resolve a seed;
+    defaults to {} (an empty spec, matching a listing whose fields never
+    parsed) when not given."""
     seed_listing(
         conn, item_id, bucket_key=bucket_key, first_seen=first_seen,
         last_seen=first_seen + lifespan_seconds // 2, gone_at=first_seen + lifespan_seconds,
+        spec_json=json.dumps(spec if spec is not None else {}),
     )
     seed_observation(
         conn, item_id, first_seen + lifespan_seconds // 2, price_cents=price_cents
@@ -420,7 +447,9 @@ def test_baseline_queue_excludes_computed_buckets_and_orders_by_fast_candidate_c
     )
     seed_observation(conn, "incomplete", 5400, price_cents=19000)
 
-    queue = panels.baseline_queue(conn, PROFILE, min_samples=12, fast_lifespan_hours=24, limit=10)
+    queue = panels.baseline_queue(
+        conn, PROFILE, min_samples=12, fast_lifespan_hours=24, compiled_seeds=[], limit=10
+    )
 
     bucket_keys = [q["bucket_key"] for q in queue]
     assert "1|intel-10th|16" not in bucket_keys  # already has a baseline
@@ -472,7 +501,9 @@ def test_baseline_queue_ranks_by_fast_count_not_total_dead_count(tmp_path):
         )
     # 15 total dead in this bucket, 11 fast.
 
-    queue = panels.baseline_queue(conn, PROFILE, min_samples=12, fast_lifespan_hours=24, limit=10)
+    queue = panels.baseline_queue(
+        conn, PROFILE, min_samples=12, fast_lifespan_hours=24, compiled_seeds=[], limit=10
+    )
 
     # Total-dead ordering would put MORE_DEAD_FEWER_FAST (21) first.
     # Fast-count ordering (the fix) puts FEWER_DEAD_MORE_FAST (11) first.
@@ -488,7 +519,9 @@ def test_baseline_queue_respects_limit(tmp_path):
     for b in range(15):
         _seed_candidate(conn, f"item-{b}", f"bucket-{b}", first_seen=1000 + b)
 
-    queue = panels.baseline_queue(conn, PROFILE, min_samples=12, fast_lifespan_hours=24, limit=5)
+    queue = panels.baseline_queue(
+        conn, PROFILE, min_samples=12, fast_lifespan_hours=24, compiled_seeds=[], limit=5
+    )
 
     assert len(queue) == 5
 
@@ -503,6 +536,242 @@ def test_baseline_queue_restores_row_factory_when_derive_raises(tmp_path, monkey
     monkeypatch.setattr(panels, "derive_candidates", _boom)
 
     with pytest.raises(RuntimeError):
-        panels.baseline_queue(conn, PROFILE, min_samples=12, fast_lifespan_hours=24)
+        panels.baseline_queue(
+            conn, PROFILE, min_samples=12, fast_lifespan_hours=24, compiled_seeds=[]
+        )
 
     assert conn.row_factory is None  # restored even on the raising path
+
+
+# ---------------------------------------------------------------------------
+# baseline_queue - progress bar clamp and seed values (V0.12 Parts A/B)
+# ---------------------------------------------------------------------------
+
+
+def test_baseline_queue_progress_pct_is_clamped_but_fast_candidates_is_not(tmp_path):
+    # V0.12 Part A1: recompute_baselines.py is manual, so a bucket can sit
+    # past min_samples for days with nobody having run it - that's
+    # exactly the signal this test protects. 13 fast candidates against
+    # min_samples=12 must show 13 (not clamped to 12) with a bar clamped
+    # at 100 (not 108.3).
+    conn = make_conn(tmp_path)
+    conn.row_factory = None
+    for i in range(13):
+        _seed_candidate(conn, f"item-{i}", "1|intel-10th|16", first_seen=1000 + i)
+
+    queue = panels.baseline_queue(
+        conn, PROFILE, min_samples=12, fast_lifespan_hours=24, compiled_seeds=[]
+    )
+
+    assert len(queue) == 1
+    assert queue[0]["fast_candidates"] == 13  # the true count, never clamped
+    assert queue[0]["progress_pct"] == 100.0  # the bar, clamped
+
+
+def test_baseline_queue_progress_pct_below_threshold_is_not_clamped(tmp_path):
+    conn = make_conn(tmp_path)
+    conn.row_factory = None
+    for i in range(3):
+        _seed_candidate(conn, f"item-{i}", "1|intel-10th|16", first_seen=1000 + i)
+
+    queue = panels.baseline_queue(
+        conn, PROFILE, min_samples=12, fast_lifespan_hours=24, compiled_seeds=[]
+    )
+
+    assert queue[0]["fast_candidates"] == 3
+    assert queue[0]["progress_pct"] == pytest.approx(25.0)  # 3/12, no clamping needed
+
+
+def test_baseline_queue_resolves_the_best_matching_seed_not_the_fallback(tmp_path):
+    # V0.12 Part B1: a bucket whose candidates' spec matches a SPECIFIC
+    # seed entry must get that seed, not the {} universal fallback -
+    # proves resolve_seed_baseline()'s most-matched-keys rule is actually
+    # being exercised here, not bypassed.
+    conn = make_conn(tmp_path)
+    conn.row_factory = None
+    spec = {"generation": "5", "cpu_family": "intel-ultra-1"}
+    for i in range(3):
+        _seed_candidate(conn, f"item-{i}", "5|intel-ultra-1|32", first_seen=1000 + i, spec=spec)
+
+    seeds = make_seeds(
+        [
+            {"match": {}, "p25": 100, "p50": 150},
+            {"match": {"generation": "5", "cpu_family": "intel-ultra-1"}, "p25": 525, "p50": 625},
+        ]
+    )
+
+    queue = panels.baseline_queue(
+        conn, PROFILE, min_samples=12, fast_lifespan_hours=24, compiled_seeds=seeds
+    )
+
+    assert queue[0]["seed_p25_display"] == "$525.00"
+    assert queue[0]["seed_p50_display"] == "$625.00"
+
+
+def test_baseline_queue_seed_resolution_uses_best_match_not_first_generation_match(tmp_path):
+    # Deliberately overlapping match blocks (per the milestone's own
+    # warning: a fixture where a naive check and the real algorithm
+    # happen to agree proves nothing). A coarse generation-only entry
+    # comes FIRST in file order and would win under any "first seed
+    # whose generation matches" shortcut; a second entry's match block
+    # requires a DIFFERENT cpu_family than this spec has, so it fails
+    # entirely under the real algorithm (all() over its own match dict),
+    # not just a weaker one. Only the third entry actually matches every
+    # field of its own match block against this spec - the real
+    # best-matched-keys-wins algorithm must pick it over the coarser
+    # first entry.
+    conn = make_conn(tmp_path)
+    conn.row_factory = None
+    spec = {"generation": "5", "cpu_family": "intel-ultra-1"}
+    for i in range(3):
+        _seed_candidate(conn, f"item-{i}", "5|intel-ultra-1|32", first_seen=1000 + i, spec=spec)
+
+    seeds = make_seeds(
+        [
+            {"match": {"generation": "5"}, "p25": 400, "p50": 450},
+            {"match": {"generation": "5", "cpu_family": "amd-ryzen-8000"}, "p25": 300, "p50": 350},
+            {"match": {"generation": "5", "cpu_family": "intel-ultra-1"}, "p25": 525, "p50": 625},
+        ]
+    )
+
+    queue = panels.baseline_queue(
+        conn, PROFILE, min_samples=12, fast_lifespan_hours=24, compiled_seeds=seeds
+    )
+
+    assert queue[0]["seed_p25_display"] == "$525.00"
+    assert queue[0]["seed_p50_display"] == "$625.00"
+
+
+def test_baseline_queue_ram_agnostic_buckets_share_the_same_seed(tmp_path):
+    # V0.12 Part B3: seed_baselines has no RAM dimension - two buckets
+    # differing only in ram_tier must resolve to the IDENTICAL seed. This
+    # pins that behavior deliberately, so a future reader doesn't "fix"
+    # what looks like duplicate values by mistake.
+    conn = make_conn(tmp_path)
+    conn.row_factory = None
+    spec = {"generation": "1", "cpu_family": "intel-10th"}
+    for i in range(3):
+        _seed_candidate(conn, f"a-{i}", "1|intel-10th|8", first_seen=1000 + i, spec=spec)
+    for i in range(3):
+        _seed_candidate(conn, f"b-{i}", "1|intel-10th|32", first_seen=2000 + i, spec=spec)
+
+    seeds = make_seeds(
+        [{"match": {"generation": "1", "cpu_family": "intel-10th"}, "p25": 165, "p50": 195}]
+    )
+
+    queue = panels.baseline_queue(
+        conn, PROFILE, min_samples=12, fast_lifespan_hours=24, compiled_seeds=seeds
+    )
+
+    by_bucket = {q["bucket_key"]: q for q in queue}
+    assert by_bucket["1|intel-10th|8"]["seed_p25_display"] == "$165.00"
+    assert by_bucket["1|intel-10th|32"]["seed_p25_display"] == "$165.00"
+    assert by_bucket["1|intel-10th|8"]["seed_p50_display"] == "$195.00"
+    assert by_bucket["1|intel-10th|32"]["seed_p50_display"] == "$195.00"
+
+
+def test_baseline_queue_picks_the_representative_listing_deterministically(tmp_path):
+    # Follow-up to V0.12 Part B: the representative candidate for a
+    # bucket's seed lookup must be chosen deterministically (min item_id),
+    # not whichever row derive_candidates() happens to return first -
+    # _DEAD_OK_LISTINGS (engine/baselines.py) has no ORDER BY, so
+    # insertion order is an implementation artifact, not a guarantee.
+    #
+    # Seeds two candidates in the SAME bucket with deliberately DIFFERENT
+    # spec_json - not a realistic shape today (see the invariant comment
+    # at baseline_queue()'s own call site: this can only happen once a
+    # seed matches on a field outside the bucket_key), but the selection
+    # mechanism itself must be pinned independent of whether that
+    # invariant currently holds. Inserted in an order where the
+    # lexicographically LATER item_id is the one a bare "first row
+    # returned" bug would pick.
+    conn = make_conn(tmp_path)
+    conn.row_factory = None
+
+    _seed_candidate(
+        conn, "zzz-item", "1|intel-10th|16", first_seen=1000,
+        spec={"generation": "9", "cpu_family": "unknown"},  # resolves to the {} fallback
+    )
+    _seed_candidate(
+        conn, "aaa-item", "1|intel-10th|16", first_seen=1001,
+        spec={"generation": "1", "cpu_family": "intel-10th"},  # resolves to the specific match
+    )
+
+    seeds = make_seeds(
+        [
+            {"match": {}, "p25": 100, "p50": 150},
+            {"match": {"generation": "1", "cpu_family": "intel-10th"}, "p25": 165, "p50": 195},
+        ]
+    )
+
+    queue = panels.baseline_queue(
+        conn, PROFILE, min_samples=12, fast_lifespan_hours=24, compiled_seeds=seeds
+    )
+
+    # "aaa-item" (min item_id) must drive resolution, regardless of the
+    # fact that "zzz-item" was inserted - and therefore returned by
+    # derive_candidates() - first.
+    assert queue[0]["seed_p25_display"] == "$165.00"
+    assert queue[0]["seed_p50_display"] == "$195.00"
+
+
+def test_baseline_queue_renders_explicit_unresolved_state_with_no_fallback(tmp_path):
+    # V0.12 Part B4: a profile with no `match: {}` fallback entry means
+    # resolve_seed_baseline() can return None for a bucket whose spec
+    # matches nothing more specific. Must render an explicit "unresolved"
+    # state, never a blank string or a fabricated $0.00 - same "absent is
+    # not zero" discipline as indicators.py's unknown state.
+    conn = make_conn(tmp_path)
+    conn.row_factory = None
+    for i in range(3):
+        _seed_candidate(
+            conn, f"item-{i}", "9|unknown-cpu|16", first_seen=1000 + i,
+            spec={"generation": "9", "cpu_family": "unknown-cpu"},
+        )
+
+    seeds = make_seeds([{"match": {"generation": "1"}, "p25": 165, "p50": 195}])  # no {} fallback
+
+    queue = panels.baseline_queue(
+        conn, PROFILE, min_samples=12, fast_lifespan_hours=24, compiled_seeds=seeds
+    )
+
+    assert queue[0]["seed_p25_display"] == "unresolved"
+    assert queue[0]["seed_p50_display"] == "unresolved"
+
+
+# ---------------------------------------------------------------------------
+# best_ratio_window() (V0.12 Part C4)
+# ---------------------------------------------------------------------------
+
+
+def _seed_alert_ratio(conn, item_id, *, sent_at, ratio_to_p25, profile_id=PROFILE):
+    seed_listing(conn, item_id, profile_id=profile_id)
+    seed_alert(conn, item_id, profile_id=profile_id, sent_at=sent_at, ratio_to_p25=ratio_to_p25)
+
+
+def test_best_ratio_window_returns_none_for_an_empty_window(tmp_path):
+    conn = make_conn(tmp_path)
+
+    assert panels.best_ratio_window(conn, PROFILE, days=14, now=_NOON) is None
+
+
+def test_best_ratio_window_returns_the_minimum_ratio_in_the_window(tmp_path):
+    conn = make_conn(tmp_path)
+    _seed_alert_ratio(conn, "item-1", sent_at=_TODAY_START + 100, ratio_to_p25=0.90)
+    _seed_alert_ratio(conn, "item-2", sent_at=_TODAY_START + 200, ratio_to_p25=0.72)  # best
+    _seed_alert_ratio(conn, "item-3", sent_at=_TODAY_START + 300, ratio_to_p25=0.95)
+
+    result = panels.best_ratio_window(conn, PROFILE, days=14, now=_NOON)
+
+    assert result == pytest.approx(0.72)
+
+
+def test_best_ratio_window_excludes_alerts_outside_the_window(tmp_path):
+    conn = make_conn(tmp_path)
+    # 20 days before `now` - outside a 14-day window.
+    _seed_alert_ratio(conn, "old-item", sent_at=_TODAY_START - 20 * 86400, ratio_to_p25=0.10)
+    _seed_alert_ratio(conn, "in-window", sent_at=_TODAY_START + 100, ratio_to_p25=0.80)
+
+    result = panels.best_ratio_window(conn, PROFILE, days=14, now=_NOON)
+
+    assert result == pytest.approx(0.80)  # not the 0.10 outside the window

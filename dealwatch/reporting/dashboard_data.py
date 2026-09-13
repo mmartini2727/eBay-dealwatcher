@@ -30,6 +30,16 @@ identical "Panel unavailable" boxes rather than one banner. Fixed by
 widening to sqlite3.DatabaseError and having _safe() let that one
 exception type escape instead of converting it - see both functions'
 own docstrings.
+
+V0.12 addendum: `baseline_queue()` now also takes `compiled_seeds`
+(engine.scoring.compile_seed_baselines()'s output, resolved once per
+request in main.py) so its entries can show the seed each bucket would
+currently score against. A new `alerts_summary` section (built by
+indicators.build_alerts_summary(), fed by the SAME alerts_per_day()
+result already computed for the chart above it, plus one new bounded
+query, panels.best_ratio_window()) follows the identical
+depends-on-status-and-one-panel-section pattern _build_indicators()/
+_build_pacing() already use.
 """
 
 import logging
@@ -37,8 +47,9 @@ import sqlite3
 import threading
 import time
 
+from dealwatch.engine.scoring import CompiledSeedBaseline
 from dealwatch.reporting import panels
-from dealwatch.reporting.indicators import build_budget_pacing, build_indicators
+from dealwatch.reporting.indicators import build_alerts_summary, build_budget_pacing, build_indicators
 from dealwatch.reporting.status import collect_status
 from dealwatch.storage.sqlite import connect_readonly
 
@@ -95,9 +106,11 @@ def build_payload(
     daily_reserve_calls: int | None = None,
     min_samples: int = 12,
     fast_lifespan_hours: int = 24,
+    compiled_seeds: list[CompiledSeedBaseline] | None = None,
     now: int | None = None,
 ) -> dict:
     now = now if now is not None else int(time.time())
+    compiled_seeds = compiled_seeds if compiled_seeds is not None else []
 
     status = _safe("status", lambda: collect_status(conn, profile_id, ceiling=ceiling, now=now))
 
@@ -125,6 +138,27 @@ def build_payload(
             raise RuntimeError("status section failed; budget pacing skipped")
         return build_budget_pacing(status, now)
 
+    alerts_per_day_result = _safe(
+        "alerts_per_day", lambda: panels.alerts_per_day(conn, profile_id, now=now)
+    )
+
+    def _build_alerts_summary():
+        # V0.12 Part C: depends on BOTH status (for distinct_items_7d) and
+        # the alerts_per_day section (for the 14-day sum/average) - a
+        # failure in either leaves this with nothing real to compute from,
+        # same dependency-propagation shape as indicators/budget_pacing
+        # above.
+        if isinstance(status, dict) and "error" in status:
+            raise RuntimeError("status section failed; alerts summary skipped")
+        if isinstance(alerts_per_day_result, dict) and "error" in alerts_per_day_result:
+            raise RuntimeError("alerts_per_day section failed; alerts summary skipped")
+        best_ratio_14d = panels.best_ratio_window(conn, profile_id, now=now)
+        return build_alerts_summary(
+            alerts_per_day_result,
+            status["finding"]["distinct_items_alerted_7d"],
+            best_ratio_14d,
+        )
+
     return {
         "generated_at": now,
         "profile_id": profile_id,
@@ -138,9 +172,8 @@ def build_payload(
         "status": status,
         "indicators": _safe("indicators", _build_indicators),
         "budget_pacing": _safe("budget_pacing", _build_pacing),
-        "alerts_per_day": _safe(
-            "alerts_per_day", lambda: panels.alerts_per_day(conn, profile_id, now=now)
-        ),
+        "alerts_per_day": alerts_per_day_result,
+        "alerts_summary": _safe("alerts_summary", _build_alerts_summary),
         "recent_alerts": _safe("recent_alerts", lambda: panels.recent_alerts(conn, profile_id)),
         "recent_listings": _safe(
             "recent_listings", lambda: panels.recent_listings(conn, profile_id)
@@ -159,7 +192,11 @@ def build_payload(
         "baseline_queue": _safe(
             "baseline_queue",
             lambda: panels.baseline_queue(
-                conn, profile_id, min_samples=min_samples, fast_lifespan_hours=fast_lifespan_hours
+                conn,
+                profile_id,
+                min_samples=min_samples,
+                fast_lifespan_hours=fast_lifespan_hours,
+                compiled_seeds=compiled_seeds,
             ),
         ),
     }
@@ -178,8 +215,8 @@ _cache_lock = threading.Lock()
 _cache: dict[str, tuple[float, dict, dict, int]] = {}
 
 _PAYLOAD_SECTIONS = (
-    "status", "indicators", "budget_pacing", "alerts_per_day", "recent_alerts",
-    "recent_listings", "baseline_coverage", "computed_baselines", "baseline_queue",
+    "status", "indicators", "budget_pacing", "alerts_per_day", "alerts_summary",
+    "recent_alerts", "recent_listings", "baseline_coverage", "computed_baselines", "baseline_queue",
 )
 
 # A transient connection failure (a bind mount reattaching, a snapshot

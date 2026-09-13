@@ -186,10 +186,21 @@
     font-size: 0.85rem;
   }
   .queue-list li {
-    padding: 3px 0;
+    padding: 7px 0;
     border-bottom: 1px solid #f2f2f2;
   }
   .queue-list li:last-child { border-bottom: none; }
+  .queue-item-label {
+    font-weight: 600;
+    margin-bottom: 4px;
+    word-break: break-all;
+  }
+  .queue-item .pacing-row { margin-bottom: 4px; }
+  .queue-count { flex: 0 0 92px; }
+  .queue-item-seed {
+    color: var(--muted);
+    font-size: 0.78rem;
+  }
   .chart {
     display: flex;
     align-items: flex-end;
@@ -250,6 +261,23 @@
     font-size: 0.8rem;
     margin-top: 8px;
   }
+  .alerts-summary {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 10px;
+    margin-top: 14px;
+    padding-top: 12px;
+    border-top: 1px solid #eee;
+  }
+  .stat-value {
+    font-size: 1.15rem;
+    font-weight: 700;
+  }
+  .stat-label {
+    color: var(--muted);
+    font-size: 0.72rem;
+    margin-top: 1px;
+  }
 
   /* Dark mode: the viewer's own theme, not a user toggle on this page. */
   @media (prefers-color-scheme: dark) {
@@ -269,6 +297,7 @@
     .pacing-track { background: #333; }
     .group-heading { border-top-color: #3a3a3c; }
     .queue-list li { border-bottom-color: #333; }
+    .alerts-summary { border-top-color: #3a3a3c; }
   }
 </style>
 </head>
@@ -396,6 +425,29 @@
       <div class="legend">
         <span><span class="legend-swatch bar-live"></span>Live</span>
         <span><span class="legend-swatch bar-dry"></span>Dry run</span>
+      </div>
+    {% endif %}
+
+    {% if 'error' in payload.alerts_summary %}
+      <div class="error-box">Panel unavailable: {{ payload.alerts_summary.error }}</div>
+    {% else %}
+      <div class="alerts-summary">
+        <div class="stat">
+          <div class="stat-value">{{ payload.alerts_summary.total_14d }}</div>
+          <div class="stat-label">Events (14 days)</div>
+        </div>
+        <div class="stat">
+          <div class="stat-value">{{ payload.alerts_summary.distinct_items_7d }}</div>
+          <div class="stat-label">Distinct items (7 days)</div>
+        </div>
+        <div class="stat">
+          <div class="stat-value">{{ payload.alerts_summary.avg_per_day_display }}</div>
+          <div class="stat-label">Average per day</div>
+        </div>
+        <div class="stat">
+          <div class="stat-value">{{ payload.alerts_summary.best_ratio_14d_display }}</div>
+          <div class="stat-label">Best ratio (14 days)</div>
+        </div>
       </div>
     {% endif %}
   </div>
@@ -541,9 +593,21 @@
     {% if 'error' in payload.baseline_queue %}
       <div class="error-box">Panel unavailable: {{ payload.baseline_queue.error }}</div>
     {% elif payload.baseline_queue %}
+      <p class="panel-note">
+        Seeds match on generation and CPU family only - buckets differing
+        only in RAM tier show the same seed values on purpose, not by
+        mistake.
+      </p>
       <ul class="queue-list">
         {% for q in payload.baseline_queue %}
-        <li>{{ q.bucket_key }} &mdash; {{ q.fast_candidates }} / {{ q.min_samples }} fast candidates</li>
+        <li class="queue-item">
+          <div class="queue-item-label">{{ q.bucket_key }}</div>
+          <div class="pacing-row">
+            <span class="pacing-track"><span class="pacing-fill pacing-budget" style="width: {{ q.progress_pct }}%;"></span></span>
+            <span class="pacing-value queue-count">{{ q.fast_candidates }} / {{ q.min_samples }} fast</span>
+          </div>
+          <div class="queue-item-seed">seed p25 {{ q.seed_p25_display }} &middot; p50 {{ q.seed_p50_display }}</div>
+        </li>
         {% endfor %}
       </ul>
     {% else %}

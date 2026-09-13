@@ -10,6 +10,7 @@ from fastapi.templating import Jinja2Templates
 
 from dealwatch.config import get_settings
 from dealwatch.engine.collector import Collector, CollectorStats, load_profile
+from dealwatch.engine.scoring import compile_seed_baselines
 from dealwatch.providers.ratelimit import DailyBudget
 from dealwatch.reporting.dashboard_data import get_payload
 
@@ -134,6 +135,15 @@ def dashboard(request: Request) -> HTMLResponse:
     # 24) scripts/recompute_baselines.py and scripts/baseline_report.py
     # already use, so the dashboard's baseline queue can't silently
     # disagree with either script about what "qualifies" or "fast" means.
+    #
+    # compile_seed_baselines() is pure and cheap (validates/converts an
+    # already-parsed list already sitting on `profile` - no I/O) - called
+    # fresh per request, same as the two profile.scoring reads above,
+    # rather than cached on app.state at startup. Feeds baseline_queue()'s
+    # seed-value resolution (V0.12 Part B) via the exact same function
+    # score_listing() itself calls, never a second match implementation.
+    compiled_seeds = compile_seed_baselines(profile)
+
     payload = get_payload(
         live_settings.db_path,
         profile_id=profile.id,
@@ -145,6 +155,7 @@ def dashboard(request: Request) -> HTMLResponse:
         daily_reserve_calls=live_settings.daily_reserve_calls,
         min_samples=profile.scoring.get("min_samples", 12),
         fast_lifespan_hours=profile.scoring.get("fast_lifespan_hours", 24),
+        compiled_seeds=compiled_seeds,
     )
 
     return templates.TemplateResponse(request, "dashboard.html", {"payload": payload})

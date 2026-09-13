@@ -27,11 +27,10 @@ estimate was wrong" must never look the same at a glance.
 """
 
 import argparse
-import json
 
 from dealwatch.engine.baselines import select_price
 from dealwatch.engine.collector import load_profile
-from dealwatch.engine.scoring import compile_seed_baselines, score_listing
+from dealwatch.engine.scoring import compile_seed_baselines, parse_spec_json, score_listing
 from dealwatch.normalize.engine import compile_profile
 from dealwatch.storage.sqlite import connect, get_latest_observation, store_sanity_flags
 
@@ -62,7 +61,7 @@ def run_score_active(profile, conn, *, limit: int) -> str:
             continue
         price_cents, price_is_price_only = selected
 
-        spec = json.loads(row["spec_json"]) if row["spec_json"] else {}
+        spec = parse_spec_json(row["spec_json"])
         result = score_listing(
             conn,
             profile,
