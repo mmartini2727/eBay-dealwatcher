@@ -132,3 +132,54 @@ explicitly. Before adding a `seed_baselines` match key outside
 `bucket_key`'s three fields, this function needs to change - at minimum,
 resolve per-candidate and either show a range or flag the bucket as
 seed-ambiguous, not silently keep reading one row.
+
+## L6 — min(item_id) is deterministic per snapshot, not stable over time
+
+baseline_queue() resolves a bucket's seed from one listing's spec, chosen
+by min(item_id) over the bucket's fast candidates. That is deterministic
+for a given database state but not stable across time: a new dead
+candidate with a lexicographically lower eBay id changes which row is
+picked.
+
+Harmless while L5's invariant holds, since every listing in a bucket
+resolves to the same seed. If the invariant ever breaks, the symptom is
+a seed value that changes on its own with no config change. Read that as
+"the invariant broke," not "the panel is flapping."
+
+## L7 — height and width are silently ignored on inline elements
+
+The dashboard's pacing bars never rendered from V0.11a through V0.12.
+.pacing-track and .pacing-fill were styled with height: 10px and
+height: 100%, but the template used <span>, which is display: inline by
+default. Height and width do not apply to non-replaced inline elements.
+The browser accepted the declarations and dropped them — no console
+error, no visual cue that anything was ignored.
+
+Separately, .bar-segment had colour rules under .bar-segment.bar-live
+and .bar-segment.bar-dry but no base rule, so the chart's segments had
+zero width despite correct inline heights.
+
+Fixed with display: block on the pacing classes and
+width: 100%; flex-shrink: 0 on .bar-segment. flex-shrink: 0 matters:
+column flex children shrink on the main axis by default, so two
+segments summing to 100% can still be squeezed.
+
+The payload, the computed percentages, and the emitted markup were all
+correct throughout. Only rendered geometry was wrong.
+
+## L8 — dashboard milestones need a reported visual check
+
+Two V0.11/V0.12 defects were invisible to the full test suite and could
+only be caught by loading the page:
+
+  1. A fresh container with no database 500'd, because connect_readonly()
+     raised outside build_payload()'s per-section isolation.
+  2. Every bar on the page rendered empty (L7).
+
+The bars survived an entire milestone because V0.11a's live-verification
+list included "budget bar shorter than the day bar" and that step was
+never run or reported.
+
+Payload verification is not visual verification. Every dashboard
+milestone gets an explicit browser step whose result is reported back,
+not assumed.
