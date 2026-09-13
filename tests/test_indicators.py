@@ -64,6 +64,7 @@ def _status(**overrides):
         },
         "baseline": {
             "baselines_computed_age_mins": 60,
+            "dead_spec_ok_count": 484,
         },
     }
     for group, fields in overrides.items():
@@ -125,7 +126,7 @@ def test_every_indicator_is_tagged_with_its_group():
         "mode", "notifiers", "delivery_failures_today", "alerts_today",
         "alerts_7d", "distinct_items_alerted_7d", "best_ratio_24h",
     }
-    baseline_keys = {"baselines_age"}
+    baseline_keys = {"baselines_age", "dead_spec_ok_listings"}
 
     for key in health_keys:
         assert result[key]["group"] == "health", key
@@ -328,6 +329,19 @@ def test_baselines_age_one_minute_past_threshold_warns():
         _status(baseline={"baselines_computed_age_mins": BASELINE_STALE_WARN_MINS + 1})
     )
     assert result["baselines_age"]["state"] == "warn"
+
+
+def test_dead_spec_ok_listings_label_disambiguates_from_the_baseline_candidate_count():
+    # V0.11b Part E: this is collect_status()'s own dead_spec_ok_count,
+    # unchanged - it has no variation_id filter, unlike
+    # engine.baselines._DEAD_OK_LISTINGS (the baseline_queue/
+    # computed_baselines candidate pool). Both numbers are correct and
+    # will never agree; the label is what stops that from reading as a
+    # bug the next time someone compares them.
+    result = _build(_status(baseline={"dead_spec_ok_count": 484}))
+    assert result["dead_spec_ok_listings"]["state"] == "info"
+    assert result["dead_spec_ok_listings"]["value"] == "484"
+    assert "variations" in result["dead_spec_ok_listings"]["label"]
 
 
 # ---------------------------------------------------------------------------

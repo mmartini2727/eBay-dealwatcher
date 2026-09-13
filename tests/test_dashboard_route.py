@@ -171,6 +171,31 @@ def test_dashboard_renders_when_the_database_has_never_been_created(tmp_path, mo
     assert r.text.count("Panel unavailable") == 0
 
 
+def test_dashboard_renders_a_single_banner_for_a_corrupted_database_file(tmp_path, monkeypatch):
+    # V0.11b Part C/D: the realistic version of "database unavailable" -
+    # a botched snapshot restore (README's documented procedure) leaves a
+    # truncated or wrong file at DB_PATH. Unlike the never-created case
+    # above, connect_readonly() itself succeeds against this file (mode=ro
+    # doesn't read the file header until the first real query) - the
+    # failure only surfaces once the route actually queries it. Must still
+    # be ONE banner and a 200, not six "Panel unavailable" boxes and not a
+    # 500.
+    db_path = tmp_path / "dealwatch.db"
+    db_path.write_bytes(b"not a sqlite database at all, just garbage bytes 1234567890")
+
+    monkeypatch.setenv("DB_PATH", str(db_path))
+    monkeypatch.setenv("PROFILE_PATH", _REAL_PROFILE_PATH)
+    monkeypatch.setenv("EBAY_CLIENT_ID", "")
+    monkeypatch.setenv("EBAY_CLIENT_SECRET", "")
+
+    with TestClient(main_module.app) as client:
+        r = client.get("/")
+
+    assert r.status_code == 200
+    assert r.text.count("Database unavailable") == 1
+    assert r.text.count("Panel unavailable") == 0
+
+
 def test_unknown_indicator_renders_grey_dash_not_a_value(tmp_path, monkeypatch):
     # An empty, never-swept, never-budgeted database - every
     # unknown-capable indicator is genuinely unevaluable here, so this

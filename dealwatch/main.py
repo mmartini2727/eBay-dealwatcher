@@ -130,10 +130,10 @@ def dashboard(request: Request) -> HTMLResponse:
     # model, never hardcoded.
     #
     # profile.scoring is a loose dict (normalize/schema.py) - min_samples
-    # falls back to 12 with the exact same default scripts/
-    # baseline_report.py already uses, so the dashboard's baseline queue
-    # can't silently disagree with that script about what "qualifies"
-    # means.
+    # and fast_lifespan_hours fall back to the exact same defaults (12,
+    # 24) scripts/recompute_baselines.py and scripts/baseline_report.py
+    # already use, so the dashboard's baseline queue can't silently
+    # disagree with either script about what "qualifies" or "fast" means.
     payload = get_payload(
         live_settings.db_path,
         profile_id=profile.id,
@@ -144,6 +144,7 @@ def dashboard(request: Request) -> HTMLResponse:
         daily_call_limit=live_settings.daily_call_limit,
         daily_reserve_calls=live_settings.daily_reserve_calls,
         min_samples=profile.scoring.get("min_samples", 12),
+        fast_lifespan_hours=profile.scoring.get("fast_lifespan_hours", 24),
     )
 
     return templates.TemplateResponse(request, "dashboard.html", {"payload": payload})

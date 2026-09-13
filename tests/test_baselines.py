@@ -14,6 +14,7 @@ from dealwatch.engine.baselines import (
     compute_baselines,
     derive_candidate_pool_stats,
     derive_candidates,
+    group_fast_candidates_by_bucket,
     nearest_rank_percentile,
 )
 from dealwatch.normalize.engine import SpecResult
@@ -248,7 +249,13 @@ def test_both_prices_null_is_dropped(tmp_path):
     assert derive_candidates(conn) == []
 
 
-def test_negative_lifespan_is_dropped_and_logged(tmp_path, caplog):
+def test_negative_lifespan_is_dropped_and_logged_at_debug_with_an_info_aggregate(tmp_path, caplog):
+    # V0.11b Part B1: build_payload() now calls into this module on every
+    # dashboard render, and a per-item WARNING for the same handful of
+    # items every 30s is exactly the log-volume problem CLAUDE.md's
+    # reporting/ discipline (no printing, no logging at page-refresh
+    # volume) exists to prevent. Demoted to DEBUG; a single INFO-level
+    # aggregate line replaces it for anyone not running at DEBUG.
     import logging
 
     conn = make_conn(tmp_path)
@@ -257,14 +264,55 @@ def test_negative_lifespan_is_dropped_and_logged(tmp_path, caplog):
     set_spec(conn, "item-1", BUCKET)
     mark_gone(conn, "item-1", t0 - 3600)  # gone_at BEFORE the observation
 
-    with caplog.at_level(logging.WARNING):
+    with caplog.at_level(logging.DEBUG):
         candidates = derive_candidates(conn)
 
     assert candidates == []
-    assert any(
-        record.levelname == "WARNING" and "item-1" in record.message
-        for record in caplog.records
-    )
+    debug_records = [
+        r for r in caplog.records if r.levelname == "DEBUG" and "item-1" in r.message
+    ]
+    assert len(debug_records) == 1
+    info_records = [r for r in caplog.records if r.levelname == "INFO"]
+    assert any("dropped 1 candidates: negative lifespan" in r.message for r in info_records)
+
+
+def test_negative_lifespan_no_longer_emits_at_warning_level(tmp_path, caplog):
+    # Sabotage-adjacent regression: at the level a container actually
+    # runs at by default (WARNING, no basicConfig), the per-item message
+    # must be silent - only the DEBUG line and the INFO aggregate exist
+    # now. Failing this means the demotion didn't happen.
+    import logging
+
+    conn = make_conn(tmp_path)
+    t0 = 1_000_000
+    sight(conn, "item-1", t0, price_cents=50000)
+    set_spec(conn, "item-1", BUCKET)
+    mark_gone(conn, "item-1", t0 - 3600)
+
+    with caplog.at_level(logging.WARNING):
+        derive_candidates(conn)
+
+    assert not any(r.levelname == "WARNING" for r in caplog.records)
+
+
+def test_negative_lifespan_aggregate_counts_all_dropped_items_in_one_line(tmp_path, caplog):
+    import logging
+
+    conn = make_conn(tmp_path)
+    t0 = 1_000_000
+    for i in range(3):
+        item_id = f"item-{i}"
+        sight(conn, item_id, t0, price_cents=50000)
+        set_spec(conn, item_id, BUCKET)
+        mark_gone(conn, item_id, t0 - 3600)
+
+    with caplog.at_level(logging.DEBUG):
+        candidates = derive_candidates(conn)
+
+    assert candidates == []
+    info_records = [r for r in caplog.records if r.levelname == "INFO"]
+    assert len(info_records) == 1  # ONE aggregate line, not one per item
+    assert "dropped 3 candidates: negative lifespan" in info_records[0].message
 
 
 def test_candidate_pool_stats_breakdown_matches_final_candidate_count(tmp_path):
@@ -322,6 +370,30 @@ def test_nearest_rank_percentile_matches_hand_computed_values():
 def test_nearest_rank_percentile_single_value_never_indexes_out_of_range():
     assert nearest_rank_percentile([42], 10) == 42
     assert nearest_rank_percentile([42], 99) == 42
+
+
+# ---------------------------------------------------------------------------
+# group_fast_candidates_by_bucket() - shared by compute_baselines() and
+# reporting/panels.py's baseline_queue() (V0.11b Part A)
+# ---------------------------------------------------------------------------
+
+
+def test_group_fast_candidates_by_bucket_excludes_slow_ones(tmp_path):
+    conn = make_conn(tmp_path)
+    t0 = 1_000_000
+    sight(conn, "fast-1", t0, price_cents=10000)
+    set_spec(conn, "fast-1", BUCKET)
+    mark_gone(conn, "fast-1", t0 + 3600)  # 1h - fast at a 24h threshold
+
+    sight(conn, "slow-1", t0, price_cents=20000)
+    set_spec(conn, "slow-1", BUCKET)
+    mark_gone(conn, "slow-1", t0 + 100 * 3600)  # 100h - slow
+
+    candidates = derive_candidates(conn)
+    by_bucket = group_fast_candidates_by_bucket(candidates, fast_lifespan_hours=24)
+
+    assert list(by_bucket.keys()) == [BUCKET]
+    assert [c.item_id for c in by_bucket[BUCKET]] == ["fast-1"]
 
 
 # ---------------------------------------------------------------------------

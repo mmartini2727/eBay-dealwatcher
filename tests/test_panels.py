@@ -371,32 +371,37 @@ def test_computed_baselines_is_profile_scoped(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def _seed_candidate(conn, item_id, bucket_key, *, first_seen, price_cents=20000):
+def _seed_candidate(conn, item_id, bucket_key, *, first_seen, price_cents=20000, lifespan_seconds=600):
     """A listing shaped exactly like one derive_candidates() would accept:
     dead, sweep-confirmed (first_seen != last_seen), spec_status='ok', no
-    variation_id, a complete bucket_key, and a priced observation."""
+    variation_id, a complete bucket_key, and a priced observation.
+    lifespan_seconds defaults to 600 (10 min) - fast under any realistic
+    fast_lifespan_hours threshold; pass a much larger value to seed a
+    SLOW candidate (V0.11b Part A's ranking fix needs both shapes)."""
     seed_listing(
         conn, item_id, bucket_key=bucket_key, first_seen=first_seen,
-        last_seen=first_seen + 500, gone_at=first_seen + 600,
+        last_seen=first_seen + lifespan_seconds // 2, gone_at=first_seen + lifespan_seconds,
     )
-    seed_observation(conn, item_id, first_seen + 400, price_cents=price_cents)
+    seed_observation(
+        conn, item_id, first_seen + lifespan_seconds // 2, price_cents=price_cents
+    )
 
 
-def test_baseline_queue_excludes_computed_buckets_and_orders_by_candidate_count(tmp_path):
+def test_baseline_queue_excludes_computed_buckets_and_orders_by_fast_candidate_count(tmp_path):
     conn = make_conn(tmp_path)
     conn.row_factory = None  # mirrors connect_readonly()'s actual default
 
-    # bucket-with-baseline: 5 real candidates, but already has a computed
-    # baseline row - must not appear in the queue at all.
+    # bucket-with-baseline: 5 real fast candidates, but already has a
+    # computed baseline row - must not appear in the queue at all.
     for i in range(5):
         _seed_candidate(conn, f"has-baseline-{i}", "1|intel-10th|16", first_seen=1000 + i)
     seed_baseline(conn, bucket_key="1|intel-10th|16")
 
-    # 3 candidates, no baseline yet.
+    # 3 fast candidates, no baseline yet.
     for i in range(3):
         _seed_candidate(conn, f"bucket-b-{i}", "2|intel-11th|16", first_seen=2000 + i)
 
-    # 7 candidates, no baseline yet - should rank ABOVE bucket-b.
+    # 7 fast candidates, no baseline yet - should rank ABOVE bucket-b.
     for i in range(7):
         _seed_candidate(conn, f"bucket-a-{i}", "3|intel-12th|16", first_seen=3000 + i)
 
@@ -415,7 +420,7 @@ def test_baseline_queue_excludes_computed_buckets_and_orders_by_candidate_count(
     )
     seed_observation(conn, "incomplete", 5400, price_cents=19000)
 
-    queue = panels.baseline_queue(conn, PROFILE, min_samples=12, limit=10)
+    queue = panels.baseline_queue(conn, PROFILE, min_samples=12, fast_lifespan_hours=24, limit=10)
 
     bucket_keys = [q["bucket_key"] for q in queue]
     assert "1|intel-10th|16" not in bucket_keys  # already has a baseline
@@ -423,11 +428,58 @@ def test_baseline_queue_excludes_computed_buckets_and_orders_by_candidate_count(
     assert "4|?|16" not in bucket_keys  # incomplete bucket_key
 
     assert [q["bucket_key"] for q in queue] == ["3|intel-12th|16", "2|intel-11th|16"]
-    assert queue[0]["candidates"] == 7
-    assert queue[1]["candidates"] == 3
+    assert queue[0]["fast_candidates"] == 7
+    assert queue[1]["fast_candidates"] == 3
     assert queue[0]["min_samples"] == 12
 
     assert conn.row_factory is None  # restored, not left flipped
+
+
+def test_baseline_queue_ranks_by_fast_count_not_total_dead_count(tmp_path):
+    # V0.11b Part A: the exact live-data shape that motivated this fix -
+    # "1|intel-10th|8" has more TOTAL dead listings (21) than
+    # "1|amd-ryzen-4000|16" (15), but far fewer FAST ones (6 vs 11).
+    # Ranking by total count puts the wrong bucket on top - the second
+    # is one fast candidate away from a computed baseline (min_samples
+    # 12), and the panel exists to point at exactly that bucket. A
+    # fixture where both orderings agree would prove nothing; this one
+    # is built so the two orders genuinely disagree.
+    conn = make_conn(tmp_path)
+    conn.row_factory = None
+
+    MORE_DEAD_FEWER_FAST = "1|intel-10th|8"
+    FEWER_DEAD_MORE_FAST = "1|amd-ryzen-4000|16"
+
+    for i in range(6):
+        _seed_candidate(
+            conn, f"a-fast-{i}", MORE_DEAD_FEWER_FAST, first_seen=1000 + i, lifespan_seconds=600
+        )
+    for i in range(15):
+        _seed_candidate(
+            conn, f"a-slow-{i}", MORE_DEAD_FEWER_FAST, first_seen=2000 + i,
+            lifespan_seconds=100 * 3600,  # 100h - slow at a 24h threshold
+        )
+    # 21 total dead in this bucket, only 6 fast.
+
+    for i in range(11):
+        _seed_candidate(
+            conn, f"b-fast-{i}", FEWER_DEAD_MORE_FAST, first_seen=3000 + i, lifespan_seconds=600
+        )
+    for i in range(4):
+        _seed_candidate(
+            conn, f"b-slow-{i}", FEWER_DEAD_MORE_FAST, first_seen=4000 + i,
+            lifespan_seconds=100 * 3600,
+        )
+    # 15 total dead in this bucket, 11 fast.
+
+    queue = panels.baseline_queue(conn, PROFILE, min_samples=12, fast_lifespan_hours=24, limit=10)
+
+    # Total-dead ordering would put MORE_DEAD_FEWER_FAST (21) first.
+    # Fast-count ordering (the fix) puts FEWER_DEAD_MORE_FAST (11) first.
+    assert [q["bucket_key"] for q in queue] == [FEWER_DEAD_MORE_FAST, MORE_DEAD_FEWER_FAST]
+    by_bucket = {q["bucket_key"]: q["fast_candidates"] for q in queue}
+    assert by_bucket[FEWER_DEAD_MORE_FAST] == 11
+    assert by_bucket[MORE_DEAD_FEWER_FAST] == 6
 
 
 def test_baseline_queue_respects_limit(tmp_path):
@@ -436,7 +488,7 @@ def test_baseline_queue_respects_limit(tmp_path):
     for b in range(15):
         _seed_candidate(conn, f"item-{b}", f"bucket-{b}", first_seen=1000 + b)
 
-    queue = panels.baseline_queue(conn, PROFILE, min_samples=12, limit=5)
+    queue = panels.baseline_queue(conn, PROFILE, min_samples=12, fast_lifespan_hours=24, limit=5)
 
     assert len(queue) == 5
 
@@ -451,6 +503,6 @@ def test_baseline_queue_restores_row_factory_when_derive_raises(tmp_path, monkey
     monkeypatch.setattr(panels, "derive_candidates", _boom)
 
     with pytest.raises(RuntimeError):
-        panels.baseline_queue(conn, PROFILE, min_samples=12)
+        panels.baseline_queue(conn, PROFILE, min_samples=12, fast_lifespan_hours=24)
 
     assert conn.row_factory is None  # restored even on the raising path

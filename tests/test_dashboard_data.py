@@ -26,6 +26,7 @@ def _kwargs(**overrides):
         daily_call_limit=5000,
         daily_reserve_calls=250,
         min_samples=12,
+        fast_lifespan_hours=24,
     )
     base.update(overrides)
     return base
@@ -178,17 +179,39 @@ def test_get_payload_survives_a_database_that_does_not_exist_yet(tmp_path):
     assert payload["budget_ceiling_display"] == "4750 usable (5000 − 250 reserved)"
 
 
+def test_database_unavailable_logs_one_warning_line_with_no_traceback(tmp_path, caplog):
+    # V0.11b Part B2: this is a handled, expected condition whose message
+    # is already in the payload and rendered on the page - a full
+    # traceback here would repeat every _DATABASE_ERROR_TTL_SECONDS, per
+    # open tab, for as long as the database stays unavailable. Must be
+    # logger.warning(), not logger.exception() - caplog records carry
+    # exc_info only for the latter.
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="dealwatch.reporting.dashboard_data"):
+        dashboard_data.get_payload(
+            tmp_path / "never-created.db", ttl_seconds=30, now=1_000_000, **_kwargs()
+        )
+
+    warning_records = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warning_records) == 1
+    assert warning_records[0].exc_info is None
+
+
 def test_database_error_is_none_on_a_healthy_payload(tmp_path):
     conn = make_conn(tmp_path)
     payload = dashboard_data.build_payload(conn, now=1_000_000, **_kwargs())
     assert payload["database_error"] is None
 
 
-def test_only_operational_error_is_treated_as_database_unavailable(tmp_path, monkeypatch):
+def test_only_database_error_is_treated_as_database_unavailable(tmp_path, monkeypatch):
     # The except in get_payload() must be narrow - a blanket `except
-    # Exception` around connect_readonly() would mislabel an unrelated
-    # bug (a real TypeError, say) as "database unavailable" instead of
-    # letting it surface as the actual error it is.
+    # Exception` around connect_readonly()/build_payload() would mislabel
+    # an unrelated bug (a real TypeError, say) as "database unavailable"
+    # instead of letting it surface as the actual error it is. Widened to
+    # sqlite3.DatabaseError in V0.11b (OperationalError's own parent class,
+    # a strict superset of the old catch) - TypeError is neither, so this
+    # must still propagate uncaught either way.
     def _boom(*args, **kwargs):
         raise TypeError("not a database problem at all")
 
@@ -200,6 +223,30 @@ def test_only_operational_error_is_treated_as_database_unavailable(tmp_path, mon
         assert "not a database problem at all" in str(exc)
     else:
         raise AssertionError("expected the unrelated TypeError to propagate, not be swallowed")
+
+
+def test_a_corrupted_database_file_renders_the_banner_not_a_crash(tmp_path):
+    # V0.11b Part C: the realistic version of "database unavailable" - a
+    # botched snapshot restore (README's documented procedure) leaves a
+    # truncated or wrong file at the db path. connect_readonly() itself
+    # succeeds (a mode=ro connection is lazy - it doesn't read the file
+    # header until the first real query), so the old
+    # sqlite3.OperationalError-only catch around JUST connect_readonly()
+    # missed this case entirely: the failure surfaced deep inside
+    # build_payload()'s first _safe()-wrapped query instead, which used
+    # to swallow it into a per-section {"error": ...} - six identical
+    # "Panel unavailable" boxes, not the one banner Part D wants for a
+    # whole-database problem. get_payload() must render the single banner
+    # and return a payload, not propagate sqlite3.DatabaseError.
+    db_path = tmp_path / "corrupted.db"
+    db_path.write_bytes(b"not a sqlite database at all, just garbage bytes 1234567890")
+
+    payload = dashboard_data.get_payload(db_path, ttl_seconds=30, now=1_000_000, **_kwargs())
+
+    assert payload["database_error"] is not None
+    assert "not a database" in payload["database_error"]
+    for key in _ALL_SECTIONS:
+        assert payload[key] is None, key
 
 
 def test_database_unavailable_state_is_not_cached_for_the_full_page_ttl(tmp_path, monkeypatch):

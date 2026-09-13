@@ -109,6 +109,8 @@ def _derive(conn) -> tuple[list[LifespanCandidate], CandidatePoolStats]:
     has_usable_price = 0
     candidates: list[LifespanCandidate] = []
 
+    negative_lifespan_dropped = 0
+
     for row in rows:
         # V0.8b: a listing whose last_seen never advanced past first_seen
         # was never confirmed present by a single sweep - gone_at equals
@@ -146,10 +148,21 @@ def _derive(conn) -> tuple[list[LifespanCandidate], CandidatePoolStats]:
 
         lifespan_seconds = row["gone_at"] - last_obs["observed_at"]
         if lifespan_seconds < 0:
-            logger.warning(
+            # V0.11b: demoted from warning to debug - this module is now
+            # called from build_payload() on every dashboard render, and a
+            # handful of items produce this same line on every single
+            # call (reporting/ is specified as no printing, no logging at
+            # a volume that drowns a container log - CLAUDE.md). The
+            # aggregate below is what an operator without DEBUG enabled
+            # actually sees; scripts/recompute_baselines.py and
+            # scripts/baseline_report.py set their own log level to DEBUG
+            # so a maintainer running either directly still sees every
+            # one of these, item by item.
+            logger.debug(
                 "item %s has a negative lifespan (gone_at=%s < observed_at=%s) - dropping",
                 row["item_id"], row["gone_at"], last_obs["observed_at"],
             )
+            negative_lifespan_dropped += 1
             continue
 
         candidates.append(
@@ -161,6 +174,13 @@ def _derive(conn) -> tuple[list[LifespanCandidate], CandidatePoolStats]:
                 lifespan_seconds=lifespan_seconds,
             )
         )
+
+    if negative_lifespan_dropped:
+        # Single aggregate line, always exactly one call regardless of how
+        # many items this pass dropped - the count itself is the signal a
+        # maintainer glancing at the log actually needs; a run of three
+        # identical debug lines a moment ago is not.
+        logger.info("dropped %d candidates: negative lifespan", negative_lifespan_dropped)
 
     stats = CandidatePoolStats(
         total_dead_ok=total_dead_ok,
@@ -212,6 +232,29 @@ class Baseline:
     fast_hours: int
 
 
+def group_fast_candidates_by_bucket(
+    candidates: list[LifespanCandidate], fast_lifespan_hours: int
+) -> dict[str, list[LifespanCandidate]]:
+    """Candidates with lifespan_seconds < fast_lifespan_hours * 3600,
+    grouped by bucket_key. The one place this comparison is written
+    (V0.11b, design.md's dated entry) - compute_baselines() below and
+    reporting/panels.py's baseline_queue() both need the IDENTICAL
+    definition of "fast," since qualification for a baseline depends on
+    the fast population specifically, not the dead population. A second,
+    separately-written copy of `lifespan_seconds < hours * 3600` in the
+    dashboard's ranking query would be a fork waiting to happen the day
+    this threshold gains a tie-break or an inclusive/exclusive change -
+    the two readers would then silently disagree about which bucket is
+    closest to qualifying.
+    """
+    threshold_seconds = fast_lifespan_hours * 3600
+    by_bucket: dict[str, list[LifespanCandidate]] = {}
+    for candidate in candidates:
+        if candidate.lifespan_seconds < threshold_seconds:
+            by_bucket.setdefault(candidate.bucket_key, []).append(candidate)
+    return by_bucket
+
+
 def compute_baselines(
     candidates: list[LifespanCandidate],
     *,
@@ -223,11 +266,7 @@ def compute_baselines(
     population, not the dead population - a bucket can have 40 dead
     listings and 3 fast ones), then compute p10/p25/p50 over their prices.
     """
-    threshold_seconds = fast_lifespan_hours * 3600
-    by_bucket: dict[str, list[LifespanCandidate]] = {}
-    for candidate in candidates:
-        if candidate.lifespan_seconds < threshold_seconds:
-            by_bucket.setdefault(candidate.bucket_key, []).append(candidate)
+    by_bucket = group_fast_candidates_by_bucket(candidates, fast_lifespan_hours)
 
     baselines = []
     for bucket_key, fast in by_bucket.items():

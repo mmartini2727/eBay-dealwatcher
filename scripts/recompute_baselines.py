@@ -19,6 +19,7 @@ qualified/skipped counts here are surprising.
 """
 
 import argparse
+import logging
 from datetime import datetime, timezone
 
 from dealwatch.engine.baselines import compute_baselines, derive_candidates
@@ -53,6 +54,18 @@ def run_recompute(profile, conn) -> str:
 
 
 def main(argv: list[str] | None = None) -> None:
+    # V0.11b Part B1: engine/baselines.py demoted its per-item negative-
+    # lifespan message from WARNING to DEBUG (build_payload() now calls
+    # into it on every dashboard render, and a per-item WARNING at that
+    # frequency floods a container log for the same handful of items
+    # every time). This script has no dashboard-refresh frequency
+    # problem - it's a manual, one-shot run - so it configures DEBUG
+    # itself to see every one of those lines, not just the INFO-level
+    # aggregate. Set in main(), not at module import time: this module is
+    # imported directly by tests/test_recompute_baselines.py, which must
+    # not have logging.basicConfig() called as an import side effect.
+    logging.basicConfig(level=logging.DEBUG)
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--profile", required=True, help="path to a profiles/*.yaml file")
     parser.add_argument("--db", default="data/dealwatch.db")

@@ -220,6 +220,21 @@ def build_indicators(
             state, "Baselines age", f"{baselines_age_mins} min ago", "baseline"
         )
 
+    # V0.11b Part E: collect_status()'s dead_spec_ok_count (status.py) and
+    # engine.baselines._DEAD_OK_LISTINGS (the baseline_queue/
+    # computed_baselines candidate pool, and scripts/baseline_report.py's
+    # own count) answer DIFFERENT questions and will never agree - the
+    # former has no variation_id filter, the latter excludes variation
+    # rows per V0.8d. Both are correct; the label says so rather than
+    # leaving two nearby numbers looking like a bug. collect_status()'s
+    # own value is unchanged - this only adds a label for it here.
+    dead_spec_ok_listings = _indicator(
+        "info",
+        "Dead spec-ok listings (incl. variations)",
+        str(baseline["dead_spec_ok_count"]),
+        "baseline",
+    )
+
     # --- alerts -----------------------------------------------------
 
     mode = _indicator("warn" if dry_run else "ok", "Mode", "dry run" if dry_run else "live", "alerts")
@@ -270,6 +285,7 @@ def build_indicators(
         "budget": budget_indicator,
         "budget_period": budget_period,
         "baselines_age": baselines_age,
+        "dead_spec_ok_listings": dead_spec_ok_listings,
         "mode": mode,
         "notifiers": notifiers_indicator,
         "delivery_failures_today": delivery_failures,

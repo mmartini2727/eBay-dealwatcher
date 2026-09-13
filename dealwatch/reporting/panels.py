@@ -38,7 +38,11 @@ import sqlite3
 import time
 from datetime import datetime
 
-from dealwatch.engine.baselines import derive_candidates, select_price
+from dealwatch.engine.baselines import (
+    derive_candidates,
+    group_fast_candidates_by_bucket,
+    select_price,
+)
 from dealwatch.providers.ratelimit import PACIFIC, la_day_bounds
 from dealwatch.reporting.status import event_count
 
@@ -406,13 +410,30 @@ def computed_baselines(conn: sqlite3.Connection, profile_id: str) -> list[dict]:
 
 
 def baseline_queue(
-    conn: sqlite3.Connection, profile_id: str, *, min_samples: int, limit: int = 10
+    conn: sqlite3.Connection,
+    profile_id: str,
+    *,
+    min_samples: int,
+    fast_lifespan_hours: int,
+    limit: int = 10,
 ) -> list[dict]:
-    """Buckets that do NOT have a computed baseline yet, ranked by fast-
-    candidate count descending: {"bucket_key", "candidates", "min_samples"}
-    (V0.11a Part E). Converts the static coverage fraction into visible
-    progress - this is the panel that will eventually show, empirically,
-    whether a slow bucket is creeping toward min_samples or genuinely flat.
+    """Buckets that do NOT have a computed baseline yet, ranked by FAST-
+    candidate count descending: {"bucket_key", "fast_candidates",
+    "min_samples"} (V0.11a Part E; ranking fixed in V0.11b Part A - see
+    below).
+
+    Ranked by fast count, not total dead count. Qualification for a
+    baseline depends entirely on the FAST population reaching
+    min_samples (compute_baselines()'s own rule) - total dead candidates
+    play no part in it. Ranking on the total count can point at the
+    wrong bucket entirely: a bucket with 21 dead listings but only 6 fast
+    ones would outrank one with 15 dead but 11 fast, even though the
+    second is one candidate away from a computed baseline and the first
+    isn't close. Uses group_fast_candidates_by_bucket()
+    (engine/baselines.py) - the exact function compute_baselines() itself
+    calls - rather than a second, hand-rolled fast-lifespan comparison,
+    for the identical "one exclusion definition" reasoning E1 below
+    already applies to derive_candidates() itself.
 
     E1 (load-bearing): reuses engine.baselines.derive_candidates() rather
     than a hand-rolled COUNT(*). derive_candidates() and
@@ -437,6 +458,12 @@ def baseline_queue(
     connection, for the rest of this request, into a Row object nobody
     asked for.
 
+    `fast_lifespan_hours`, like `min_samples`, always comes from the
+    profile (`profile.scoring.get("fast_lifespan_hours", 24)`, main.py) -
+    never a constant here, so this panel can't silently disagree with
+    compute_baselines() and scripts/recompute_baselines.py about what
+    "fast" means for this profile.
+
     Not profile-scoped in the candidate-derivation step, because
     derive_candidates() itself isn't (engine/baselines.py's
     _DEAD_OK_LISTINGS has no profile_id filter - reporting/status.py's own
@@ -458,14 +485,12 @@ def baseline_queue(
     finally:
         conn.row_factory = previous_row_factory
 
-    counts: dict[str, int] = {}
-    for candidate in candidates:
-        counts[candidate.bucket_key] = counts.get(candidate.bucket_key, 0) + 1
+    fast_by_bucket = group_fast_candidates_by_bucket(candidates, fast_lifespan_hours)
 
     queue = [
-        {"bucket_key": bucket_key, "candidates": count, "min_samples": min_samples}
-        for bucket_key, count in counts.items()
+        {"bucket_key": bucket_key, "fast_candidates": len(fast), "min_samples": min_samples}
+        for bucket_key, fast in fast_by_bucket.items()
         if bucket_key not in computed
     ]
-    queue.sort(key=lambda entry: -entry["candidates"])
+    queue.sort(key=lambda entry: -entry["fast_candidates"])
     return queue[:limit]

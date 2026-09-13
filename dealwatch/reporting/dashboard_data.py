@@ -20,6 +20,16 @@ raising) is now ONE payload-level signal (`database_error`), not six
 per-section {"error": ...} boxes - see _database_unavailable_payload()'s
 own docstring. It also gets its own, much shorter cache TTL
 (_DATABASE_ERROR_TTL_SECONDS) than a normal payload - see get_payload().
+
+V0.11b addendum: that catch only covered connect_readonly() itself, and
+only sqlite3.OperationalError - missing the case where the file opens
+fine but is unreadable garbage (a botched snapshot restore), which
+surfaces on the first real query instead, deep inside one of
+build_payload()'s _safe()-wrapped sections, and degraded to six
+identical "Panel unavailable" boxes rather than one banner. Fixed by
+widening to sqlite3.DatabaseError and having _safe() let that one
+exception type escape instead of converting it - see both functions'
+own docstrings.
 """
 
 import logging
@@ -41,9 +51,21 @@ def _safe(name: str, fn):
     other sections must still build. Living here, in tested Python, rather
     than in the future template (prompt 2's job), is the point: a template
     is the wrong place to discover a query regressed.
+
+    sqlite3.DatabaseError is the one exception this does NOT convert to a
+    per-section error box (V0.11b Part C/D). A DatabaseError (a truncated
+    or corrupted file, a botched snapshot restore onto data/dealwatch.db -
+    the README's own documented restore procedure) is not one section's
+    bug; every other section is about to hit the identical failure on its
+    own first query. Re-raising it here lets it escape build_payload()
+    entirely so get_payload() can render ONE "database unavailable"
+    banner instead of six visually-identical {"error": ...} boxes that
+    hide the fact they all share one root cause.
     """
     try:
         return fn()
+    except sqlite3.DatabaseError:
+        raise
     except Exception as exc:
         logger.exception("dashboard section %r failed", name)
         return {"error": f"{type(exc).__name__}: {exc}"}
@@ -72,6 +94,7 @@ def build_payload(
     daily_call_limit: int | None = None,
     daily_reserve_calls: int | None = None,
     min_samples: int = 12,
+    fast_lifespan_hours: int = 24,
     now: int | None = None,
 ) -> dict:
     now = now if now is not None else int(time.time())
@@ -135,7 +158,9 @@ def build_payload(
         ),
         "baseline_queue": _safe(
             "baseline_queue",
-            lambda: panels.baseline_queue(conn, profile_id, min_samples=min_samples),
+            lambda: panels.baseline_queue(
+                conn, profile_id, min_samples=min_samples, fast_lifespan_hours=fast_lifespan_hours
+            ),
         ),
     }
 
@@ -210,15 +235,35 @@ def get_payload(db_path, *, ttl_seconds: int = 30, **kwargs) -> dict:
     one lock means one rebuild instead of a thundering herd of identical
     queries against the same database at the same moment.
 
-    Only `sqlite3.OperationalError` (V0.11a Part A) is treated as "the
-    database is unavailable" - the realistic shape of "no file yet,"
-    "database is locked," or similar, and exactly what connect_readonly()
-    was observed raising in live-Docker verification. A blanket `except
-    Exception` here would also catch a real bug in this function's own
-    code (a bad db_path type, an AttributeError from a future refactor)
-    and mislabel it as "database unavailable" - which would be actively
-    misleading in the one place on this page a maintainer most needs an
-    honest error.
+    `sqlite3.DatabaseError` (widened from `OperationalError` in V0.11b
+    Part C) is treated as "the database is unavailable" - the realistic
+    shape of "no file yet" and "database is locked" (both already
+    OperationalError, a subclass of DatabaseError, and what
+    connect_readonly() was observed raising in live-Docker verification),
+    plus "file is not a database" (raised as a plain DatabaseError, not
+    one of its subclasses - Python's sqlite3 hierarchy is Error ->
+    DatabaseError -> OperationalError/IntegrityError/etc., so catching
+    DatabaseError was already a strict superset of the old catch; the gap
+    was never about which exception class, only about where in the call
+    stack the catch sat). The narrower catch missed exactly the failure a
+    botched snapshot restore onto data/dealwatch.db (the README's own
+    documented procedure) produces: a truncated or wrong file that opens
+    fine (connect_readonly() itself is lazy - a mode=ro connection
+    doesn't read the file header until the first real query) and only
+    fails once build_payload() starts querying it, by which point every
+    section's own `_safe()` wrapper would otherwise catch it individually
+    and render six identical "Panel unavailable" boxes - the very failure
+    this widened catch, together with `_safe()`'s DatabaseError
+    passthrough above, exists to turn into one banner instead. This is
+    why the try below wraps build_payload() too, not just
+    connect_readonly().
+
+    A blanket `except Exception` here would also catch a real bug in this
+    function's own code (a bad db_path type, an AttributeError from a
+    future refactor) and mislabel it as "database unavailable" - which
+    would be actively misleading in the one place on this page a
+    maintainer most needs an honest error. TypeError, and anything else
+    that isn't a sqlite3.DatabaseError, still propagates uncaught.
     """
     key = str(db_path)
 
@@ -232,18 +277,23 @@ def get_payload(db_path, *, ttl_seconds: int = 30, **kwargs) -> dict:
 
         try:
             conn = connect_readonly(db_path)
-        except sqlite3.OperationalError as exc:
-            logger.exception("could not open %r for the dashboard", db_path)
+            try:
+                payload = build_payload(conn, **kwargs)
+            finally:
+                conn.close()
+        except sqlite3.DatabaseError as exc:
+            # warning, not exception (V0.11b Part B2): this is a handled,
+            # expected condition whose message is already in the payload
+            # and rendered on the page - a full traceback here just
+            # repeats, every _DATABASE_ERROR_TTL_SECONDS, for as long as
+            # the database stays unavailable, indefinitely, per open tab.
+            logger.warning("dashboard database unavailable at %r: %s", db_path, exc)
             now = kwargs.get("now")
             payload = _database_unavailable_payload(
                 now if now is not None else int(time.time()), exc, kwargs
             )
             effective_ttl = _DATABASE_ERROR_TTL_SECONDS
         else:
-            try:
-                payload = build_payload(conn, **kwargs)
-            finally:
-                conn.close()
             effective_ttl = ttl_seconds
 
         _cache[key] = (now_mono, kwargs, payload, effective_ttl)

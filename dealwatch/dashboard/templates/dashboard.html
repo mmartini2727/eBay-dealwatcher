@@ -543,7 +543,7 @@
     {% elif payload.baseline_queue %}
       <ul class="queue-list">
         {% for q in payload.baseline_queue %}
-        <li>{{ q.bucket_key }} &mdash; {{ q.candidates }} / {{ q.min_samples }} candidates</li>
+        <li>{{ q.bucket_key }} &mdash; {{ q.fast_candidates }} / {{ q.min_samples }} fast candidates</li>
         {% endfor %}
       </ul>
     {% else %}

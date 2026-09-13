@@ -24,6 +24,7 @@ Answers four questions, in order:
 """
 
 import argparse
+import logging
 import sqlite3
 
 from dealwatch.engine.baselines import (
@@ -133,6 +134,14 @@ def run_report(profile, conn) -> str:
 
 
 def main(argv: list[str] | None = None) -> None:
+    # V0.11b Part B1: see scripts/recompute_baselines.py's main() for why
+    # this is set here (DEBUG, so the per-item negative-lifespan lines
+    # engine/baselines.py now logs at debug are visible to an operator
+    # running this report directly) and why it's in main(), not at module
+    # import time (this module is imported directly by
+    # tests/test_baseline_report.py).
+    logging.basicConfig(level=logging.DEBUG)
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--profile", required=True, help="path to a profiles/*.yaml file")
     parser.add_argument("--db", default="data/dealwatch.db")
