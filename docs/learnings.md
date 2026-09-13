@@ -184,6 +184,13 @@ Payload verification is not visual verification. Every dashboard
 milestone gets an explicit browser step whose result is reported back,
 not assumed.
 
+A sabotage value must be chosen to diverge from the fixture's expected
+result, not merely to differ from correct code. Hardcoding "seed" as a
+sabotage passed because the fixture's true answer was also "seed" — the
+check ran, went green, and proved nothing. Same class as a DST fixture
+anchored on the transition day. Verify the sabotage goes red before
+trusting that it can.
+
 ## L9 — a compound class selector silently never matches the legend swatch
 
 Found while wiring V0.12b's own legend: `.bar-segment.bar-live` and
