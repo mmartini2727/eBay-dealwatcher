@@ -9,7 +9,10 @@ First target: eBay / Lenovo ThinkPad T14. The architecture is profile-driven
 and provider-driven so the second target costs a YAML file, not a rewrite.
 
 Read `docs/design.md` before changing anything structural. It is authoritative
-and the decisions in it were made deliberately.
+and the decisions in it were made deliberately. `docs/learnings.md` supplements
+it with point-in-time findings from live sessions — query-count discrepancies,
+log-volume fixes, rendering defects — that only ever existed in a chat
+transcript otherwise.
 
 ## Two things to know up front
 
@@ -146,8 +149,8 @@ be recovered.
 | V0.9b | `?`-bucket alert gate + honest `lifespan_mins` NULLs | done |
 | V0.10 | Status module + CLI health script (design.md §12) | done |
 | V0.11 | LAN dashboard, server-rendered, read-only (design.md §13) | done |
-| V0.12 | LAN dashboard enhancements | next |
-| V1.0 | MCP server (streamable HTTP, LAN only) | |
+| V0.12 | LAN dashboard enhancements (baseline progress/seed values, alert summary stats, best-ratio-per-day chart) | done |
+| V1.0 | MCP server (streamable HTTP, LAN only) | next |
 
 Ship V0.6 even though the normalizer is a stub. Raw titles and prices are
 useful history, and persisting `raw_json` means the engine can be re-run over
@@ -234,18 +237,40 @@ and `-shm`: they belong to the database you just replaced.
   otherwise go unnoticed for days.
 - Container runs as a non-root user; `data/` is chowned to it.
 - `profiles/` mounts read-only, `data/` read-write.
-- **Updating `scripts/*.py` on the LXC: use the trailing-`/.`/trailing-`/`
-  form, not the bare one.** `scripts/` (the maintenance/report scripts —
-  `baseline_report.py`, `recompute_baselines.py`, `score_active.py`, etc.)
-  isn't baked into the image or mounted by `compose.yaml`; it has to be
-  copied into the running container by hand before any of them can be run
-  there. `docker cp scripts dealwatch:/app/scripts` only overwrites cleanly
+- **Three deploy modes — match the mode to what actually changed.**
+  `profiles/` mounts into the container, so a YAML edit is visible on disk
+  immediately, but the running process read it once at startup and keeps
+  scoring against the old values until the container restarts. The failure
+  mode is silent either way: `docker exec ... cat`/`grep` on the profile
+  shows your edit is there, giving false confidence it's live, while the
+  process is still running on whatever it loaded at boot.
+  - `docker compose restart` — profile-only changes (`profiles/*.yaml`).
+    Cheapest, and the *required* minimum for a profile edit — not skippable
+    just because `up -d --build` would also work.
+  - `docker compose up -d` — `compose.yaml` or `.env` changes (a new env
+    var, a port, a volume, a TZ setting). No image rebuild, but this
+    **recreates** the container, not merely restarts it.
+  - `docker compose up -d --build` — `dealwatch/` Python itself changed.
+    Also a recreate, plus a fresh image build.
+- **`scripts/*.py` (the maintenance/report scripts — `baseline_report.py`,
+  `recompute_baselines.py`, `score_active.py`, etc.) are baked into the
+  image as of V0.9a** (`Dockerfile`'s `COPY scripts ./scripts`) — any of
+  the three deploy modes above that recreates the container (`up -d` or
+  `up -d --build`) carries the current `scripts/` contents in automatically.
+  A plain `docker compose restart` does **not** rebuild the image, so it
+  will not pick up a scripts-only edit — use `up -d --build` (or, for an
+  unpublished mid-session edit with no other changes, the manual copy
+  below) instead.
+
+  **Iterating on a script mid-session without a full rebuild: use the
+  trailing-`/.`/trailing-`/` form, not the bare one.**
+  `docker cp scripts dealwatch:/app/scripts` only overwrites cleanly
   the *first* time. Once `/app/scripts/` already exists inside the
   container, Docker's `cp` copies the *directory* `scripts` into it rather
   than merging its contents — a second invocation silently nests it as
   `/app/scripts/scripts/*.py`, and the container keeps running whatever was
   already at `/app/scripts/*.py`. This is the same class of failure as the
-  profile-restart bug above: the copy command reports success either way.
+  profile-restart case above: the copy command reports success either way.
 
   ```bash
   docker cp scripts/. dealwatch:/app/scripts/

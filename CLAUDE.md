@@ -1,7 +1,10 @@
 # CLAUDE.md — working notes for DealWatch
 
 Read `docs/design.md` first. It is authoritative. This file is the short version
-plus the traps.
+plus the traps. `docs/learnings.md` is a third doc worth checking — point-in-time
+findings from live sessions (dashboard query gaps, log-volume fixes, CSS defects)
+that don't belong in design.md's architecture narrative or this file's traps, but
+would otherwise exist nowhere but a chat transcript.
 
 ## What this project is
 
@@ -76,8 +79,8 @@ dealwatch/
 │ └── sqlite.py connection + WAL + forward-only migrations + connect_readonly() (V0.11)
 ├── reporting/
 │ ├── status.py (V0.10) collect_status(conn) -> dict — one query set, several renderers (CLI, /health, V0.11 dashboard, V1.0 MCP tool)
-│ ├── panels.py (V0.11) bounded list/histogram queries — alerts_per_day, recent_alerts, recent_listings, baseline_coverage
-│ ├── indicators.py (V0.11) pure function: collect_status() payload -> flat {state,label,value,group} dict, no I/O
+│ ├── panels.py (V0.11) bounded list/histogram queries — alerts_per_day, recent_alerts, recent_listings, baseline_coverage, computed_baselines, baseline_queue (V0.11a/b/V0.12), best_ratio_window, best_ratio_per_day (V0.12/V0.12b)
+│ ├── indicators.py (V0.11) pure functions over already-fetched payloads, no I/O — build_indicators (flat {state,label,value,group} dict), build_budget_pacing, build_alerts_summary, build_best_ratio_chart (V0.11a/V0.12/V0.12b)
 │ └── dashboard_data.py (V0.11) build_payload() (per-section isolated) + get_payload() (TTL-cached, connect_readonly())
 └── mcp_server/
 └── server.py (V1.0) streamable HTTP, LAN only
@@ -248,6 +251,8 @@ templates/dashboard.html has no test coverage by design. Every visual
 change requires loading the page in a browser and confirming the
 result. Two V0.11/V0.12 defects were invisible to the full suite.
 
+- **V0.12b complete — best-ratio-per-day chart.** `panels.best_ratio_per_day()` is the per-day companion to V0.12's `best_ratio_window()`: one `MIN(ratio_to_p25)` indexed range scan per LA calendar day, walking via a newly-extracted `_walk_back_days()` helper shared with `alerts_per_day()` (one DST-safe walk, not two). `baseline_layer` comes back as a bare column alongside the `MIN()` aggregate, relying on SQLite's documented single-aggregate bare-column behavior (verified empirically against a fixture before trusting it, not just the docs) rather than a second correlated subquery — chosen to match the one-query-per-day shape `best_ratio_24h`/`best_ratio_window()` already use. No `dry_run` filter, matching `best_ratio_24h` exactly (neither ever had one) — a deliberate parity decision, commented as such. `indicators.build_best_ratio_chart()` turns the raw per-day array into bar heights: length is `1 - ratio` (distance below p25, clamped at zero) scaled to the largest discount in the 14-day window, with the real unscaled ratio always printed alongside so the relative scaling can't misrepresent the actual number. A no-alert day gets `bar_pct: None` (a gap, never a zero-height bar); an all-`None` window renders one explanatory line instead of an empty chart frame. New full-width panel (`grid-column: 1 / -1`) reusing the alerts chart's own `.chart`/`.bar-col`/`.bar-segment` classes verbatim so the two charts' day-columns land in the same positions. Bars colored by `baseline_layer` (seed vs. computed) with a legend. Sabotage-verified: empty-day zero instead of None, DST walk-back reverted to fixed `-86400`, a hardcoded `baseline_layer` string, and an inverted bar-length formula all went red and were reverted — the hardcoded-layer sabotage's first attempt used a value that happened to match the fixture's real answer by coincidence and produced a false pass, caught and corrected before relying on it (same class of self-correction as V0.9a's dated entry). **Found and fixed in passing:** `.bar-segment.bar-live`/`.bar-segment.bar-dry` are compound selectors that never matched the Live/Dry-run legend swatches (`class="legend-swatch bar-live"`, no `.bar-segment`) — that legend has shown no color since the alerts chart was built, a different mechanism from V0.11b's L7 defect (this one had correct geometry, just no fill) but the same root cause shape: a rule that assumes a second class is always present. Fixed by unscoping the color rules for both the pre-existing legend and this milestone's new one; recorded as `docs/learnings.md` L9. **No browser tool was available to verify the render** — the actual `GET /` output was generated against a realistic 14-day fixture (gap days, mixed layers, varying discount depth), checked structurally (bar-height ordering, column-label parity with the alerts chart, absence of any bar-segment div on gap days), and handed to the user directly for the real visual confirmation rather than claiming one that wasn't done.
+
 - **Seed chart edits, 2026-09-07 — profile-only, no rebuild, `dry_run: true` held throughout.** (1) `2|intel-11th|16` re-anchored 230/250 → 215.00/244.90, matching the post-backfill computed baseline (n=24) exactly — this is the chart's only ground-truth anchor and the reference point the rest of the chart is judged against. Note the computed `baselines` table already wins this exact bucket in live scoring (layer 1 beats layer 2), so this re-anchor is about consistency/fallback continuity, not a live scoring change today. (2) Added a "generation-only" bridge (`match: {generation: "N"}` for N=1–6, one per generation, priced as the plain average of that generation's two coarse family entries) between the family-level overrides and the flat `{}` catch-all — fixes the over-broad-catch-all finding from the same audit: a listing with a known generation but an unrecognized bare cpu_family (the ~166-partial class above) used to fall all the way to a flat 200/250 regardless of whether it was really a $200 Gen 1 or an $800 Gen 6 machine. `resolve_seed_baseline`'s most-matched-keys rule means a listing with a real cpu_family is unaffected. (3) RAM-tier "8" and "48" gaps found but deliberately left open — see the open item below.
 
 ### Open items
@@ -269,13 +274,17 @@ result. Two V0.11/V0.12 defects were invisible to the full suite.
   `gone_at` ends up set from a `last_seen` that predates the poll's
   observation — a genuinely negative lifespan, not just the understated-
   by-up-to-an-hour case this was previously filed as. `baselines.py`'s
-  negative-lifespan guard drops these safely (logged at WARNING, not
-  silently discarded) rather than corrupting a baseline with a negative
-  number — but the guard treating it as "shouldn't happen" is optimistic:
-  observed once in the V0.8c 190-candidate measurement, and the
-  interleaving is structural, not a fluke, so it will recur. Not yet
-  designed; candidates are the same two floated in design.md §4.2 for the
-  related understatement gap.
+  negative-lifespan guard drops these safely (logged per-item at DEBUG
+  with a single INFO-level aggregate count per call as of V0.11b — was
+  WARNING per item before that, demoted once `build_payload()` started
+  calling into this on every dashboard render — not silently discarded)
+  rather than corrupting a baseline with a negative number — but the
+  guard treating it as "shouldn't happen" is optimistic: observed once in
+  the V0.8c 190-candidate measurement, then confirmed as three items with
+  a partial explanation in `docs/learnings.md` L3, and the interleaving
+  is structural, not a fluke, so it will recur. Not yet designed;
+  candidates are the same two floated in design.md §4.2 for the related
+  understatement gap.
 - **`test_concurrent_first_connect_against_a_fresh_file_does_not_crash_or_hang`
   is flaky under 20-way contention.** One run failed with
   `sqlite3.OperationalError: database is locked`; passed on immediate
@@ -291,5 +300,4 @@ result. Two V0.11/V0.12 defects were invisible to the full suite.
   correctness bug.
 - **`Ryzen PRO 8540U` pattern gap** — no digit between "Ryzen" and "PRO".
 - Delete `reserve(n)`'s unused `n` parameter.
-- README operations section: snapshot command, host-vs-container tooling, restart vs rebuild.
 
