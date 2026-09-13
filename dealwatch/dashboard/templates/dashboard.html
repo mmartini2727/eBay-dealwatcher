@@ -39,6 +39,15 @@
     font-size: 0.82rem;
     margin-bottom: 16px;
   }
+  .db-banner {
+    background: var(--error-bg);
+    border: 1px solid var(--error-border);
+    color: var(--error-text);
+    padding: 14px 16px;
+    border-radius: 6px;
+    font-size: 0.95rem;
+    max-width: 1200px;
+  }
   .grid {
     display: grid;
     grid-template-columns: 1fr;
@@ -61,6 +70,26 @@
     text-transform: uppercase;
     letter-spacing: 0.03em;
     color: var(--muted);
+  }
+  .panel h3 {
+    font-size: 0.82rem;
+    margin: 14px 0 6px;
+    color: var(--muted);
+    font-weight: 600;
+  }
+  .group-heading {
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: var(--muted);
+    margin: 12px 0 2px;
+    border-top: 1px solid #eee;
+    padding-top: 8px;
+  }
+  .group-heading:first-child {
+    margin-top: 0;
+    border-top: none;
+    padding-top: 0;
   }
   .error-box {
     background: var(--error-bg);
@@ -97,6 +126,39 @@
   .indicator-value { font-weight: 600; text-align: right; }
   .indicator-value.unknown { color: var(--unknown); font-weight: 400; }
   .indicator-value.warn { color: var(--warn); }
+  .budget-ceiling-note {
+    color: var(--muted);
+    font-size: 0.82rem;
+    margin: 0 0 10px;
+  }
+  .pacing { margin-top: 14px; }
+  .pacing-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+  }
+  .pacing-label {
+    flex: 0 0 150px;
+    font-size: 0.78rem;
+    color: var(--muted);
+  }
+  .pacing-track {
+    flex: 1;
+    height: 10px;
+    background: #eee;
+    border-radius: 5px;
+    overflow: hidden;
+  }
+  .pacing-fill { height: 100%; }
+  .pacing-fill.pacing-budget { background: #1a5fb4; }
+  .pacing-fill.pacing-day { background: #a7c3e6; }
+  .pacing-value {
+    flex: 0 0 44px;
+    text-align: right;
+    font-size: 0.78rem;
+    color: var(--muted);
+  }
   table {
     width: 100%;
     border-collapse: collapse;
@@ -112,7 +174,22 @@
   .table-scroll { overflow-x: auto; }
   a { color: var(--link); text-decoration: none; }
   a:hover { text-decoration: underline; }
-  .empty-note { color: var(--muted); font-size: 0.85rem; }
+  .empty-note, .panel-note {
+    color: var(--muted);
+    font-size: 0.8rem;
+  }
+  .panel-note { margin: 0 0 10px; }
+  .queue-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    font-size: 0.85rem;
+  }
+  .queue-list li {
+    padding: 3px 0;
+    border-bottom: 1px solid #f2f2f2;
+  }
+  .queue-list li:last-child { border-bottom: none; }
   .chart {
     display: flex;
     align-items: flex-end;
@@ -189,27 +266,47 @@
     }
     th { color: var(--muted); }
     .bar-segment.bar-dry { background: #3a5580; }
+    .pacing-track { background: #333; }
+    .group-heading { border-top-color: #3a3a3c; }
+    .queue-list li { border-bottom-color: #333; }
   }
 </style>
 </head>
 <body>
 
-<h1>DealWatch</h1>
+<h1>DealWatch &mdash; {{ payload.profile_id }}</h1>
 <div class="updated" data-generated-at="{{ payload.generated_at }}" id="updated-label">Updated just now</div>
 
+{% if payload.database_error %}
+  {# ---------------------------------------------------------------
+     V0.11a Part A: connect_readonly() itself failed - one root cause,
+     one banner. Every data panel is suppressed rather than each
+     carrying its own identical "Panel unavailable" box.
+     --------------------------------------------------------------- #}
+  <div class="db-banner">
+    <strong>Database unavailable:</strong> {{ payload.database_error }}
+  </div>
+{% else %}
 <div class="grid">
 
   {# ---------------------------------------------------------------
      Status block - every indicator except the two budget ones,
-     which get their own panel below (C1's panel order).
+     which get their own panel below (C1's panel order). Grouped by
+     the payload's own "group" tag (V0.11a's B2 amendment) so health,
+     baseline, and alerts indicators read as three runs, not one.
      --------------------------------------------------------------- #}
   <div class="panel">
     <h2>Status</h2>
     {% if 'error' in payload.indicators %}
       <div class="error-box">Panel unavailable: {{ payload.indicators.error }}</div>
     {% else %}
+      {% set ns = namespace(prev_group=None) %}
       {% for key, ind in payload.indicators.items() %}
         {% if key not in ["budget", "budget_period"] %}
+          {% if ind.group != ns.prev_group %}
+            <div class="group-heading">{{ ind.group|capitalize }}</div>
+            {% set ns.prev_group = ind.group %}
+          {% endif %}
           <div class="indicator-row">
             <span class="indicator-label">
               {% if ind.state != "info" %}<span class="dot {{ ind.state }}"></span>{% endif %}
@@ -227,13 +324,16 @@
   {# ---------------------------------------------------------------
      Budget - split out from the status block so the one number with
      a hard operational ceiling (the eBay call budget) isn't buried
-     among the other fourteen rows.
+     among the other rows. V0.11a adds the explicit reserve (C1) and
+     two pacing bars (C2); the period date is already folded into the
+     "Budget period" indicator's own value (C3).
      --------------------------------------------------------------- #}
   <div class="panel">
     <h2>Budget</h2>
     {% if 'error' in payload.indicators %}
       <div class="error-box">Panel unavailable: {{ payload.indicators.error }}</div>
     {% else %}
+      <p class="budget-ceiling-note">{{ payload.budget_ceiling_display or "ceiling unknown" }}</p>
       {% for key, ind in payload.indicators.items() %}
         {% if key in ["budget", "budget_period"] %}
           <div class="indicator-row">
@@ -247,6 +347,23 @@
           </div>
         {% endif %}
       {% endfor %}
+
+      {% if 'error' in payload.budget_pacing %}
+        <div class="error-box">Pacing unavailable: {{ payload.budget_pacing.error }}</div>
+      {% else %}
+        <div class="pacing">
+          <div class="pacing-row">
+            <span class="pacing-label">Budget consumed (today, PT)</span>
+            <span class="pacing-track"><span class="pacing-fill pacing-budget" style="width: {{ payload.budget_pacing.budget_pct if payload.budget_pacing.budget_pct is not none else 0 }}%;"></span></span>
+            <span class="pacing-value">{{ payload.budget_pacing.budget_pct_display }}</span>
+          </div>
+          <div class="pacing-row">
+            <span class="pacing-label">PT day elapsed</span>
+            <span class="pacing-track"><span class="pacing-fill pacing-day" style="width: {{ payload.budget_pacing.day_pct }}%;"></span></span>
+            <span class="pacing-value">{{ payload.budget_pacing.day_pct_display }}</span>
+          </div>
+        </div>
+      {% endif %}
     {% endif %}
   </div>
 
@@ -328,10 +445,17 @@
   </div>
 
   {# ---------------------------------------------------------------
-     Recent listings.
+     Recent listings. V0.11a Part F: rejected/not_target listings are
+     kept in this feed on purpose, not filtered - see the note below.
      --------------------------------------------------------------- #}
   <div class="panel">
     <h2>Recent listings</h2>
+    <p class="panel-note">
+      Includes rejected and non-target listings on purpose - about 40% of
+      this feed is normally correctly-rejected variants, which is the
+      normalizer visibly working. A feed of only spec_status='ok' rows
+      would hide a reject rule quietly starting to over-match.
+    </p>
     {% if 'error' in payload.recent_listings %}
       <div class="error-box">Panel unavailable: {{ payload.recent_listings.error }}</div>
     {% elif payload.recent_listings %}
@@ -370,7 +494,9 @@
      Baseline coverage - labeled deliberately (design.md §13's C6):
      "coverage" alone reads as a health score. It's a maturity
      fraction over a denominator that moves with market inventory,
-     not a percentage that should trend toward 100%.
+     not a percentage that should trend toward 100%. V0.11a adds the
+     actual computed baselines (Part D) and the queue of buckets still
+     waiting on one (Part E) underneath the same ratio - no new panel.
      --------------------------------------------------------------- #}
   <div class="panel">
     <h2>Complete buckets with computed baselines</h2>
@@ -387,9 +513,46 @@
         number with no change in baseline progress.
       </p>
     {% endif %}
+
+    <h3>Computed baselines</h3>
+    {% if 'error' in payload.computed_baselines %}
+      <div class="error-box">Panel unavailable: {{ payload.computed_baselines.error }}</div>
+    {% elif payload.computed_baselines %}
+      <div class="table-scroll">
+      <table>
+        <thead><tr><th>Bucket</th><th>p25</th><th>p50</th><th>n</th></tr></thead>
+        <tbody>
+          {% for b in payload.computed_baselines %}
+          <tr>
+            <td>{{ b.bucket_key }}</td>
+            <td>{{ b.p25_display }}</td>
+            <td>{{ b.p50_display }}</td>
+            <td>{{ b.n }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      </div>
+    {% else %}
+      <p class="empty-note">No computed baselines yet.</p>
+    {% endif %}
+
+    <h3>Waiting on a baseline</h3>
+    {% if 'error' in payload.baseline_queue %}
+      <div class="error-box">Panel unavailable: {{ payload.baseline_queue.error }}</div>
+    {% elif payload.baseline_queue %}
+      <ul class="queue-list">
+        {% for q in payload.baseline_queue %}
+        <li>{{ q.bucket_key }} &mdash; {{ q.candidates }} / {{ q.min_samples }} candidates</li>
+        {% endfor %}
+      </ul>
+    {% else %}
+      <p class="empty-note">No buckets waiting on a baseline right now.</p>
+    {% endif %}
   </div>
 
 </div>
+{% endif %}
 
 <script>
 (function () {

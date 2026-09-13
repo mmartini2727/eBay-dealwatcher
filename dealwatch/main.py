@@ -128,6 +128,12 @@ def dashboard(request: Request) -> HTMLResponse:
     # Profile is extra="ignore" (normalize/schema.py), so a typo'd path
     # here would fail silently rather than at startup. Read through the
     # model, never hardcoded.
+    #
+    # profile.scoring is a loose dict (normalize/schema.py) - min_samples
+    # falls back to 12 with the exact same default scripts/
+    # baseline_report.py already uses, so the dashboard's baseline queue
+    # can't silently disagree with that script about what "qualifies"
+    # means.
     payload = get_payload(
         live_settings.db_path,
         profile_id=profile.id,
@@ -135,6 +141,9 @@ def dashboard(request: Request) -> HTMLResponse:
         dry_run=dry_run,
         notifiers=notifiers,
         ceiling=live_settings.daily_call_limit - live_settings.daily_reserve_calls,
+        daily_call_limit=live_settings.daily_call_limit,
+        daily_reserve_calls=live_settings.daily_reserve_calls,
+        min_samples=profile.scoring.get("min_samples", 12),
     )
 
     return templates.TemplateResponse(request, "dashboard.html", {"payload": payload})

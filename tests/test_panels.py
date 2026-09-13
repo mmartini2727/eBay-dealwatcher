@@ -9,6 +9,8 @@ it.
 
 from datetime import datetime
 
+import pytest
+
 from dealwatch.providers.ratelimit import PACIFIC
 from dealwatch.reporting import panels
 from dealwatch.storage.sqlite import connect
@@ -316,3 +318,139 @@ def test_baseline_coverage_excludes_dead_listings(tmp_path):
     assert coverage["buckets_observed"] == 0
     assert coverage["coverage_fraction"] is None  # not a ZeroDivisionError, not 0.0
     assert coverage["coverage_display"] == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# computed_baselines (V0.11a Part D)
+# ---------------------------------------------------------------------------
+
+
+def test_computed_baselines_returns_display_strings_and_n_ordered_by_bucket_key(tmp_path):
+    conn = make_conn(tmp_path)
+    seed_baseline(conn, bucket_key="2|intel-11th|16", computed_at=2000)
+    conn.execute(
+        "UPDATE baselines SET n = 24, n_price_only = 3, fast_hours = 24 "
+        "WHERE bucket_key = '2|intel-11th|16'"
+    )
+    conn.execute(
+        "INSERT INTO baselines (profile_id, bucket_key, n, n_price_only, p10_cents, "
+        "p25_cents, p50_cents, fast_hours, computed_at) VALUES (?, '1|intel-10th|16', "
+        "14, 1, 16000, 16499, 19550, 24, ?)",
+        (PROFILE, 1000),
+    )
+
+    results = panels.computed_baselines(conn, PROFILE)
+
+    assert [r["bucket_key"] for r in results] == ["1|intel-10th|16", "2|intel-11th|16"]
+
+    first = results[0]
+    assert first["n"] == 14
+    assert first["n_price_only"] == 1
+    assert first["fast_hours"] == 24
+    assert first["p10_display"] == "$160.00"
+    assert first["p25_display"] == "$164.99"
+    assert first["p50_display"] == "$195.50"
+    assert first["computed_at_display"] != "unknown"
+
+    second = results[1]
+    assert second["n"] == 24
+    assert second["p25_display"] == "$100.00"  # seed_baseline()'s own default p25_cents=10000
+
+
+def test_computed_baselines_is_profile_scoped(tmp_path):
+    conn = make_conn(tmp_path)
+    seed_baseline(conn, profile_id="other-profile", bucket_key="1|intel-10th|16")
+
+    results = panels.computed_baselines(conn, PROFILE)
+
+    assert results == []
+
+
+# ---------------------------------------------------------------------------
+# baseline_queue (V0.11a Part E)
+# ---------------------------------------------------------------------------
+
+
+def _seed_candidate(conn, item_id, bucket_key, *, first_seen, price_cents=20000):
+    """A listing shaped exactly like one derive_candidates() would accept:
+    dead, sweep-confirmed (first_seen != last_seen), spec_status='ok', no
+    variation_id, a complete bucket_key, and a priced observation."""
+    seed_listing(
+        conn, item_id, bucket_key=bucket_key, first_seen=first_seen,
+        last_seen=first_seen + 500, gone_at=first_seen + 600,
+    )
+    seed_observation(conn, item_id, first_seen + 400, price_cents=price_cents)
+
+
+def test_baseline_queue_excludes_computed_buckets_and_orders_by_candidate_count(tmp_path):
+    conn = make_conn(tmp_path)
+    conn.row_factory = None  # mirrors connect_readonly()'s actual default
+
+    # bucket-with-baseline: 5 real candidates, but already has a computed
+    # baseline row - must not appear in the queue at all.
+    for i in range(5):
+        _seed_candidate(conn, f"has-baseline-{i}", "1|intel-10th|16", first_seen=1000 + i)
+    seed_baseline(conn, bucket_key="1|intel-10th|16")
+
+    # 3 candidates, no baseline yet.
+    for i in range(3):
+        _seed_candidate(conn, f"bucket-b-{i}", "2|intel-11th|16", first_seen=2000 + i)
+
+    # 7 candidates, no baseline yet - should rank ABOVE bucket-b.
+    for i in range(7):
+        _seed_candidate(conn, f"bucket-a-{i}", "3|intel-12th|16", first_seen=3000 + i)
+
+    # Poisoned rows a naive `SELECT bucket_key, COUNT(*) ... GROUP BY
+    # bucket_key` would wrongly count, but derive_candidates() correctly
+    # excludes: never-swept (first_seen == last_seen) and an incomplete
+    # ('?') bucket_key.
+    seed_listing(
+        conn, "never-swept", bucket_key="4|intel-12th|16",
+        first_seen=4000, last_seen=4000, gone_at=4100,
+    )
+    seed_observation(conn, "never-swept", 4000, price_cents=19000)
+    seed_listing(
+        conn, "incomplete", bucket_key="4|?|16",
+        first_seen=5000, last_seen=5500, gone_at=5600,
+    )
+    seed_observation(conn, "incomplete", 5400, price_cents=19000)
+
+    queue = panels.baseline_queue(conn, PROFILE, min_samples=12, limit=10)
+
+    bucket_keys = [q["bucket_key"] for q in queue]
+    assert "1|intel-10th|16" not in bucket_keys  # already has a baseline
+    assert "4|intel-12th|16" not in bucket_keys  # never confirmed by a sweep
+    assert "4|?|16" not in bucket_keys  # incomplete bucket_key
+
+    assert [q["bucket_key"] for q in queue] == ["3|intel-12th|16", "2|intel-11th|16"]
+    assert queue[0]["candidates"] == 7
+    assert queue[1]["candidates"] == 3
+    assert queue[0]["min_samples"] == 12
+
+    assert conn.row_factory is None  # restored, not left flipped
+
+
+def test_baseline_queue_respects_limit(tmp_path):
+    conn = make_conn(tmp_path)
+    conn.row_factory = None
+    for b in range(15):
+        _seed_candidate(conn, f"item-{b}", f"bucket-{b}", first_seen=1000 + b)
+
+    queue = panels.baseline_queue(conn, PROFILE, min_samples=12, limit=5)
+
+    assert len(queue) == 5
+
+
+def test_baseline_queue_restores_row_factory_when_derive_raises(tmp_path, monkeypatch):
+    conn = make_conn(tmp_path)
+    conn.row_factory = None
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("simulated derive failure")
+
+    monkeypatch.setattr(panels, "derive_candidates", _boom)
+
+    with pytest.raises(RuntimeError):
+        panels.baseline_queue(conn, PROFILE, min_samples=12)
+
+    assert conn.row_factory is None  # restored even on the raising path

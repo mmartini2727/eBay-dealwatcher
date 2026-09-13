@@ -10,6 +10,13 @@ of:
   - "unknown" - not evaluable, distinct from unhealthy
   - "info"    - no health judgment; display the value only
 
+build_budget_pacing() (V0.11a Part C) is a second, separate pure function
+in this module - it doesn't produce an indicator (no ok/warn/unknown
+state; it's a pair of comparable 0..1 fractions for two stacked bars, not
+a health check) but has the exact same "pure function over collect_
+status()'s payload, no I/O" shape as build_indicators() itself, so it
+lives here rather than starting a third module for one function.
+
 and group is one of "health" | "alerts" | "baseline" - which panel section
 the template renders the indicator under. build_indicators() returns one
 flat dict, not the health/alerts split an earlier draft had: a nested
@@ -33,6 +40,8 @@ resolve to "unknown", never "ok" or "warn" - tests/test_indicators.py checks
 this explicitly, branch by branch, because a healthy live system will never
 exercise these paths on its own to prove it.
 """
+
+from dealwatch.providers.ratelimit import la_day_bounds
 
 # Multiplier on the profile's own sweep_interval_minutes, not a fixed
 # minute count - profiles/thinkpad-t14.yaml's poll.sweep_interval_minutes
@@ -189,11 +198,15 @@ def build_indicators(
     if period_is_today is None:
         budget_period = _indicator("unknown", "Budget period", None, "health")
     else:
+        # The date, not just the word (V0.11a's C3 amendment) - "current"
+        # means nothing on its own; period_is_today is only ever non-None
+        # when `period` itself is too (status.py's own budget_row is-None
+        # branch sets both together), so no separate None-guard is needed
+        # for `period` here.
+        period = budget["period"]
+        value = f"current ({period})" if period_is_today else f"stale ({period})"
         budget_period = _indicator(
-            "ok" if period_is_today else "warn",
-            "Budget period",
-            "current" if period_is_today else "stale",
-            "health",
+            "ok" if period_is_today else "warn", "Budget period", value, "health"
         )
 
     # --- baseline -------------------------------------------------------
@@ -264,4 +277,49 @@ def build_indicators(
         "alerts_7d": alerts_7d,
         "distinct_items_alerted_7d": distinct_items_7d,
         "best_ratio_24h": best_ratio_24h,
+    }
+
+
+def build_budget_pacing(status: dict, now: int) -> dict:
+    """Two comparable 0..1 fractions for the budget-pacing bars (V0.11a
+    Part C2): how much of today's eBay call budget is used, and how much
+    of today's LA calendar day has already elapsed. Day-elapsed comes from
+    la_day_bounds(now), never a UTC hour - providers/ratelimit.py's
+    la_day_bounds() exists specifically because that mismatch is a real,
+    previously-hit bug class in this project, not a hypothetical one.
+
+    Both come back pre-scaled to percent and pre-formatted, not just the
+    raw fraction: the template's only job is to print `*_pct` as a CSS
+    width and `*_pct_display` as text, with no arithmetic of its own -
+    same discipline as every `*_display` field elsewhere in this module
+    and in reporting/panels.py.
+
+    No projected end-of-day total, deliberately: a linear extrapolation
+    from, say, 00:20 PT is noise, and a number that's garbage every
+    morning is a number that gets learned to ignore, taking the rest of
+    the panel with it. "Is the budget bar shorter than the day bar" is
+    the entire question these two fractions answer.
+    """
+    budget = status["alive"]["budget"]
+    ceiling, used = budget["ceiling"], budget["used"]
+    if ceiling is None or used is None or ceiling == 0:
+        budget_fraction = None
+    else:
+        # Clamped at 1.0 - `used` can exceed `ceiling` (the reserve exists
+        # precisely so `ceiling` is not the hard stop; providers/
+        # ratelimit.py's real budget enforcement is against
+        # daily_call_limit, not this dashboard-only ceiling), and a bar
+        # wider than its own track is a rendering bug, not information.
+        budget_fraction = min(used / ceiling, 1.0)
+
+    day_start, day_end = la_day_bounds(now)
+    day_fraction = (now - day_start) / (day_end - day_start)
+
+    return {
+        "budget_pct": None if budget_fraction is None else round(budget_fraction * 100, 1),
+        "budget_pct_display": (
+            "unknown" if budget_fraction is None else f"{budget_fraction * 100:.0f}%"
+        ),
+        "day_pct": round(day_fraction * 100, 1),
+        "day_pct_display": f"{day_fraction * 100:.0f}%",
     }

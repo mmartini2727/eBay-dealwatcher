@@ -19,13 +19,26 @@ one profile's worth of `alerts`/`listings` on every dashboard render (design
 md §13's "Bound every query" decision); an unbounded scan here is exactly
 the cost that turns "fine on a laptop" into "fine until the LXC has been
 running a year."
+
+`computed_baselines()` (V0.11a Part D) is the one exception that's cheap
+anyway - a point read against `baselines`' own primary key. `baseline_queue()`
+(V0.11a Part E) is the one exception that ISN'T bounded: it calls
+engine.baselines.derive_candidates(), which scans every dead spec_status=
+'ok' listing and does one point query per candidate against `observations` -
+orders of magnitude more work than anything else on this page, and it grows
+with total history, not with the active set. Measured (design.md §13's
+V0.11a addendum) at low single-digit milliseconds against a database sized
+to today's real listing count, staying comfortably under 50ms even at 10x
+that scale - cheap enough today to sit in the same 30s cache as everything
+else, but the one function in this module that could stop being cheap
+without a code change, purely from history accumulating.
 """
 
 import sqlite3
 import time
 from datetime import datetime
 
-from dealwatch.engine.baselines import select_price
+from dealwatch.engine.baselines import derive_candidates, select_price
 from dealwatch.providers.ratelimit import PACIFIC, la_day_bounds
 from dealwatch.reporting.status import event_count
 
@@ -351,3 +364,108 @@ def baseline_coverage(conn: sqlite3.Connection, profile_id: str, *, now: int | N
         "coverage_fraction": coverage_fraction,
         "coverage_display": coverage_display,
     }
+
+
+def computed_baselines(conn: sqlite3.Connection, profile_id: str) -> list[dict]:
+    """One entry per row in `baselines` for this profile, ordered by
+    bucket_key (V0.11a Part D).
+
+    A point read against `baselines`' own primary key (profile_id,
+    bucket_key) - returns 2 rows today, free. This is the most decision-
+    relevant content on the dashboard: it's what alerts are actually
+    scored against, and baseline_coverage() (above) only ever showed the
+    *count* of these rows, never the numbers themselves.
+    """
+    rows = conn.execute(
+        "SELECT bucket_key, n, n_price_only, p10_cents, p25_cents, p50_cents, "
+        "fast_hours, computed_at FROM baselines WHERE profile_id = ? "
+        "ORDER BY bucket_key",
+        (profile_id,),
+    ).fetchall()
+
+    results = []
+    for row in rows:
+        (
+            bucket_key, n, n_price_only, p10_cents, p25_cents, p50_cents,
+            fast_hours, computed_at,
+        ) = row
+        results.append(
+            {
+                "bucket_key": bucket_key,
+                "n": n,
+                "n_price_only": n_price_only,
+                "fast_hours": fast_hours,
+                "computed_at": computed_at,
+                "computed_at_display": _datetime_display(computed_at),
+                "p10_display": _price_display(p10_cents),
+                "p25_display": _price_display(p25_cents),
+                "p50_display": _price_display(p50_cents),
+            }
+        )
+    return results
+
+
+def baseline_queue(
+    conn: sqlite3.Connection, profile_id: str, *, min_samples: int, limit: int = 10
+) -> list[dict]:
+    """Buckets that do NOT have a computed baseline yet, ranked by fast-
+    candidate count descending: {"bucket_key", "candidates", "min_samples"}
+    (V0.11a Part E). Converts the static coverage fraction into visible
+    progress - this is the panel that will eventually show, empirically,
+    whether a slow bucket is creeping toward min_samples or genuinely flat.
+
+    E1 (load-bearing): reuses engine.baselines.derive_candidates() rather
+    than a hand-rolled COUNT(*). derive_candidates() and
+    derive_candidate_pool_stats() share one _derive() implementation on
+    purpose - that module's own docstring is explicit that the exclusion
+    order (sweep-confirmed, has a bucket_key, no '?', has a usable price)
+    must never drift between "how many candidates exist" and "how many
+    does this other reader count." A second, differently-shaped COUNT(*)
+    here would fork that silently: the number would still look plausible
+    and be wrong - exactly the failure mode design.md's baseline-poisoning
+    trap already warns about for a different query.
+
+    E2 (load-bearing): derive_candidates()/_derive() read rows by column
+    name (row["first_seen"], etc.) - written against the shape
+    storage.sqlite.connect() always provides (row_factory = sqlite3.Row).
+    connect_readonly() (the dashboard's own connection) deliberately does
+    NOT set row_factory, and every other function in this module reads
+    positionally. row_factory is flipped to sqlite3.Row for the exact
+    duration of the derive_candidates() call only, in a try/finally that
+    restores whatever it was before - never left flipped globally, which
+    would silently turn every OTHER positional read on this same
+    connection, for the rest of this request, into a Row object nobody
+    asked for.
+
+    Not profile-scoped in the candidate-derivation step, because
+    derive_candidates() itself isn't (engine/baselines.py's
+    _DEAD_OK_LISTINGS has no profile_id filter - reporting/status.py's own
+    dead_spec_ok_count comment already flags this same gap for a
+    different reader). Correct while one profile exists; will need a real
+    fix the day a second one does, same as that.
+    """
+    computed = {
+        row[0]
+        for row in conn.execute(
+            "SELECT bucket_key FROM baselines WHERE profile_id = ?", (profile_id,)
+        ).fetchall()
+    }
+
+    previous_row_factory = conn.row_factory
+    conn.row_factory = sqlite3.Row
+    try:
+        candidates = derive_candidates(conn)
+    finally:
+        conn.row_factory = previous_row_factory
+
+    counts: dict[str, int] = {}
+    for candidate in candidates:
+        counts[candidate.bucket_key] = counts.get(candidate.bucket_key, 0) + 1
+
+    queue = [
+        {"bucket_key": bucket_key, "candidates": count, "min_samples": min_samples}
+        for bucket_key, count in counts.items()
+        if bucket_key not in computed
+    ]
+    queue.sort(key=lambda entry: -entry["candidates"])
+    return queue[:limit]

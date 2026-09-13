@@ -17,12 +17,17 @@ indicator, health/alerts/baseline alike, is a top-level key tagged with a
 result["alerts"]["mode"]).
 """
 
+from datetime import datetime, timezone
+
+import pytest
+
 from dealwatch.reporting.indicators import (
     BASELINE_STALE_WARN_MINS,
     BUDGET_WARN_PCT,
     COVERAGE_WARN_PCT,
     PENDING_WARN,
     SWEEP_AGE_WARN_MULTIPLIER,
+    build_budget_pacing,
     build_indicators,
 )
 
@@ -35,6 +40,7 @@ def _status(**overrides):
             "last_sweep_started_age_mins": 5,
             "sweep_bookkeeping_consistent": True,
             "budget": {
+                "period": "2026-09-12",
                 "used": 100,
                 "period_is_today": True,
                 "ceiling": 4750,
@@ -351,3 +357,69 @@ def test_alerts_today_is_info_with_live_and_dry_split():
     )
     assert result["alerts_today"]["state"] == "info"
     assert result["alerts_today"]["value"] == "4 live / 2 dry"
+
+
+def test_budget_period_value_includes_the_date():
+    # V0.11a's C3 amendment - "current" alone means nothing; the date is
+    # what makes it mean something.
+    result = _build(_status())
+    assert result["budget_period"]["value"] == "current (2026-09-12)"
+
+
+def test_budget_period_stale_value_includes_the_date_too():
+    status = _status()
+    status["alive"]["budget"]["period"] = "2026-09-10"
+    status["alive"]["budget"]["period_is_today"] = False
+    result = _build(status)
+    assert result["budget_period"]["value"] == "stale (2026-09-10)"
+
+
+# ---------------------------------------------------------------------------
+# build_budget_pacing (V0.11a Part C2)
+# ---------------------------------------------------------------------------
+
+
+def test_budget_pacing_consumed_fraction():
+    status = _status()
+    status["alive"]["budget"]["used"] = 950
+    status["alive"]["budget"]["ceiling"] = 4750
+
+    pacing = build_budget_pacing(status, now=1_000_000)
+
+    assert pacing["budget_pct"] == 20.0
+    assert pacing["budget_pct_display"] == "20%"
+
+
+def test_budget_pacing_consumed_is_unknown_when_ceiling_is_none():
+    status = _status()
+    status["alive"]["budget"]["ceiling"] = None
+
+    pacing = build_budget_pacing(status, now=1_000_000)
+
+    assert pacing["budget_pct"] is None
+    assert pacing["budget_pct_display"] == "unknown"
+
+
+def test_budget_pacing_consumed_is_clamped_at_100_when_used_exceeds_ceiling():
+    status = _status()
+    status["alive"]["budget"]["used"] = 6000
+    status["alive"]["budget"]["ceiling"] = 4750
+
+    pacing = build_budget_pacing(status, now=1_000_000)
+
+    assert pacing["budget_pct"] == 100.0
+
+
+def test_budget_pacing_day_fraction_reflects_pt_not_utc():
+    # 2026-09-13 02:00 UTC = 2026-09-12 19:00 PDT - UTC and PT are on
+    # DIFFERENT calendar dates here. Correctly computed from
+    # la_day_bounds() (PT midnight to PT midnight), 19 of 24 PT hours
+    # have elapsed: ~79%. Computed from a UTC midnight boundary instead,
+    # only 2 of 24 UTC hours have elapsed: ~8% - a completely different,
+    # easily distinguishable number.
+    now = int(datetime(2026, 9, 13, 2, 0, tzinfo=timezone.utc).timestamp())
+    status = _status()
+
+    pacing = build_budget_pacing(status, now)
+
+    assert pacing["day_pct"] == pytest.approx(79.2, abs=0.1)

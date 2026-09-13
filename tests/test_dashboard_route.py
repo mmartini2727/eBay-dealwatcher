@@ -84,6 +84,17 @@ def test_dashboard_returns_200_with_recognizable_panel_content(tmp_path, monkeyp
     assert "Test listing" in r.text
 
 
+def test_header_includes_profile_id(tmp_path, monkeypatch):
+    # B1: the page is currently ambiguous about what it reports on - one
+    # header line, no profile switcher, no multi-profile UI (out of
+    # scope, per design.md §13's V0.11a addendum).
+    with _make_client(tmp_path, monkeypatch) as client:
+        r = client.get("/")
+
+    assert r.status_code == 200
+    assert "DealWatch &mdash; thinkpad-t14" in r.text
+
+
 def test_health_endpoint_unchanged(tmp_path, monkeypatch):
     with _make_client(tmp_path, monkeypatch) as client:
         r = client.get("/health")
@@ -148,14 +159,16 @@ def test_dashboard_renders_when_the_database_has_never_been_created(tmp_path, mo
     # credentials never starts the collector, and if nothing else has
     # ever created data/dealwatch.db (no /health hit, no prior collector
     # run), connect_readonly() itself fails before build_payload() gets a
-    # chance to isolate anything. The route must still return 200 with
-    # every panel showing "unavailable," not a raw 500.
+    # chance to isolate anything. The route must still return 200 - and
+    # since V0.11a's Part A, this renders ONE database-unavailable
+    # banner, not six per-panel "Panel unavailable" boxes.
     with _make_client(tmp_path, monkeypatch, create_db=False) as client:
         r = client.get("/")
 
     assert r.status_code == 200
     assert "DealWatch" in r.text
-    assert "Panel unavailable" in r.text
+    assert r.text.count("Database unavailable") == 1  # rendered once, not per panel
+    assert r.text.count("Panel unavailable") == 0
 
 
 def test_unknown_indicator_renders_grey_dash_not_a_value(tmp_path, monkeypatch):
