@@ -412,3 +412,81 @@ def test_sweep_bookkeeping_consistent_true_when_they_agree(tmp_path):
     status = collect_status(conn, PROFILE, now=_NOON)
 
     assert status["alive"]["sweep_bookkeeping_consistent"] is True
+
+
+# ---------------------------------------------------------------------------
+# V0.13 Part A - the corrected bookkeeping invariant (design.md §14)
+# ---------------------------------------------------------------------------
+
+
+def test_a_listing_inserted_after_the_sweep_stamp_does_not_falsely_break_consistency(tmp_path):
+    # This is the false positive V0.13 fixes: record_sighting()'s insert
+    # branch writes last_seen once, for a brand-new listing, which is not
+    # the same thing as the sweep advancing an existing row's last_seen.
+    # An old listing the sweep DID properly stamp (first_seen before the
+    # sweep, last_seen == the stamp) coexists with a new listing inserted
+    # afterward (first_seen == last_seen, both after the stamp) - the new
+    # row must not count against the old row's agreement.
+    conn = make_conn(tmp_path)
+    swept_at = _TODAY_START + 100
+    seed_listing(conn, "old-item", first_seen=_TODAY_START, last_seen=swept_at)
+    seed_listing(
+        conn, "new-item",
+        first_seen=swept_at + 50, last_seen=swept_at + 50,
+    )
+    seed_sweep(conn, swept_at=swept_at, distinct_count=1)
+
+    status = collect_status(conn, PROFILE, now=_NOON)
+
+    assert status["alive"]["sweep_bookkeeping_consistent"] is True
+    assert status["alive"]["listings_ahead_of_last_sweep"] == 0
+
+
+def test_an_old_listing_whose_last_seen_exceeds_the_sweep_stamp_is_a_real_mismatch(tmp_path):
+    # An old listing (existed before the sweep ran) whose last_seen is
+    # somehow past the sweep's own stamp is the real anomaly this check
+    # exists to catch - unlike the case above, this listing WAS eligible
+    # to have been stamped by the sweep, so its own last_seen disagreeing
+    # with the stamp is a genuine inconsistency.
+    conn = make_conn(tmp_path)
+    swept_at = _TODAY_START + 100
+    seed_listing(conn, "properly-stamped", first_seen=_TODAY_START, last_seen=swept_at)
+    seed_listing(conn, "ahead-of-stamp", first_seen=_TODAY_START, last_seen=swept_at + 100)
+    seed_sweep(conn, swept_at=swept_at, distinct_count=1)
+
+    status = collect_status(conn, PROFILE, now=_NOON)
+
+    assert status["alive"]["sweep_bookkeeping_consistent"] is False
+    assert status["alive"]["listings_ahead_of_last_sweep"] == 1
+
+
+def test_a_recorded_sweep_with_no_pre_sweep_row_carrying_the_stamp_is_the_behind_case(tmp_path):
+    # distinct_count > 0 says the sweep saw items, but if no eligible row
+    # (first_seen <= the stamp) actually carries last_seen == the stamp,
+    # something is behind, not ahead - the count must read 0 even though
+    # consistency is False.
+    conn = make_conn(tmp_path)
+    swept_at = _TODAY_START + 100
+    seed_listing(conn, "stale-item", first_seen=_TODAY_START, last_seen=swept_at - 500)
+    seed_sweep(conn, swept_at=swept_at, distinct_count=1)
+
+    status = collect_status(conn, PROFILE, now=_NOON)
+
+    assert status["alive"]["sweep_bookkeeping_consistent"] is False
+    assert status["alive"]["listings_ahead_of_last_sweep"] == 0
+
+
+def test_no_listing_predates_the_sweep_is_unevaluable_not_false(tmp_path):
+    # A fresh deployment's first sweep, before any listing with
+    # first_seen <= the stamp exists at all - unevaluable, same "None,
+    # never False" discipline as the no-recorded-sweep and
+    # zero-distinct-count cases above.
+    conn = make_conn(tmp_path)
+    swept_at = _TODAY_START + 100
+    seed_listing(conn, "too-new", first_seen=swept_at + 10, last_seen=swept_at + 10)
+    seed_sweep(conn, swept_at=swept_at, distinct_count=1)
+
+    status = collect_status(conn, PROFILE, now=_NOON)
+
+    assert status["alive"]["sweep_bookkeeping_consistent"] is None
+    assert status["alive"]["listings_ahead_of_last_sweep"] is None

@@ -661,14 +661,15 @@
     <h3>Waiting on a baseline</h3>
     {% if 'error' in payload.baseline_queue %}
       <div class="error-box">Panel unavailable: {{ payload.baseline_queue.error }}</div>
-    {% elif payload.baseline_queue %}
+    {% else %}
+      {% if payload.baseline_queue.queue %}
       <p class="panel-note">
         Seeds match on generation and CPU family only - buckets differing
         only in RAM tier show the same seed values on purpose, not by
         mistake.
       </p>
       <ul class="queue-list">
-        {% for q in payload.baseline_queue %}
+        {% for q in payload.baseline_queue.queue %}
         <li class="queue-item">
           <div class="queue-item-label">{{ q.bucket_key }}</div>
           <div class="pacing-row">
@@ -679,8 +680,16 @@
         </li>
         {% endfor %}
       </ul>
-    {% else %}
+      {% else %}
       <p class="empty-note">No buckets waiting on a baseline right now.</p>
+      {% endif %}
+      {% if payload.baseline_queue.negative_lifespan_dropped %}
+      <p class="empty-note">
+        {{ payload.baseline_queue.negative_lifespan_dropped }}
+        candidate{{ "s" if payload.baseline_queue.negative_lifespan_dropped != 1 else "" }}
+        dropped: negative lifespan (docs/learnings.md L3)
+      </p>
+      {% endif %}
     {% endif %}
   </div>
 

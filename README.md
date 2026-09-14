@@ -150,6 +150,7 @@ be recovered.
 | V0.10 | Status module + CLI health script (design.md §12) | done |
 | V0.11 | LAN dashboard, server-rendered, read-only (design.md §13) | done |
 | V0.12 | LAN dashboard enhancements (baseline progress/seed values, alert summary stats, best-ratio-per-day chart) | done |
+| V0.13 | Sweep bookkeeping invariant correction + reporting-path log volume (design.md §14) | done |
 | V1.0 | MCP server (streamable HTTP, LAN only) | next |
 
 Ship V0.6 even though the normalizer is a stub. Raw titles and prices are

@@ -217,3 +217,87 @@ second class being present needs that dependency checked against every
 element the class is used on, not just the one the rule was written
 for - a template's `<span>`/`<div>` choice was L7's version of this,
 a legend reusing a bar's class name is this one's.
+
+## L10 - an invariant documented confidently in three modules, held in every test, falsified by ordinary operation
+
+`sweep_bookkeeping_consistent` (`reporting/status.py`) compared the
+UNFILTERED `MAX(listings.last_seen)` against `last_sweep_started_at`, on
+the premise that only `record_sweep()` ever advances `last_seen`. That
+premise was false the whole time: `record_sighting()`'s insert branch
+writes `last_seen` once, for every brand-new listing (a new row needs a
+value). At the live rate (~31 new listings/day against hourly sweeps),
+an ordinary poll discovering a new listing pushed the unfiltered max
+ahead of the last sweep stamp close to half the time - the indicator sat
+amber on a collector that was completely healthy. Confirmed live: one
+newly-inserted listing, `sweep_bookkeeping_consistent = False`, no other
+symptom (V0.13, design.md §14).
+
+Every test written against this check passed, because they were all
+written from the SAME false premise the check itself encoded - a test
+built on a wrong assumption confirms the assumption, it doesn't catch it.
+Nothing here was a testing failure; the premise itself was wrong, and no
+amount of testing against a wrong premise finds that out.
+
+The false claim had propagated by citation, not by copy-paste:
+`docs/design.md` §4.2 stated it first ("Only the sweep writes
+`last_seen`"), `reporting/status.py` and `storage/sqlite.py` each cited
+§4.2 in their own docstrings, and the dashboard's health check cited
+`status.py`. Fixing only the check (`reporting/status.py`) would have
+left the claim alive and citable in three other places, ready to be read
+and trusted again the next time someone builds something on top of it.
+Correcting a wrong invariant means finding every place it was stated,
+not just the one place it broke something.
+
+## L11 - two measurement errors in one ten-minute window, diagnosing L10's own log line
+
+While confirming V0.13 Part B's log-volume premise before writing it into
+a milestone justification, two independent mistakes turned up in the same
+short check:
+
+1. `docker logs dealwatch | grep "negative lifespan"` reported 0 matches
+   while the matching lines were visibly scrolling past unfiltered in the
+   same terminal. Python's `logging` module writes to stderr by default;
+   `docker logs` preserves the stdout/stderr stream split, and a bare pipe
+   only carries stdout. The fix is `docker logs dealwatch 2>&1 | grep ...`
+   - trivial once seen, and silently wrong (a confident, plausible "0")
+   until then.
+2. Two different *rate* estimates for the same line - a by-eye read of a
+   scrollback burst (~10/min) and a count of what visibly passed through
+   the broken, stdout-only pipe above (2 per 10 min) - were both wrong.
+   The real, correctly-piped count was 11 per 10 minutes with a dashboard
+   tab open.
+
+Neither error would have been caught by rerunning the same check the same
+way - both looked like real measurements. A rate claim about a running
+system needs a counted number from a command that is itself verified
+correct (here: confirm the pipe actually carries what you think it
+carries), or it doesn't belong in a milestone's justification section.
+
+## L12 - the dropped-count line was nested inside the branch that disappears exactly when it matters most
+
+V0.13 Part B put `dashboard.html`'s "N candidates dropped: negative
+lifespan" line inside `{% elif payload.baseline_queue.queue %}` - the same
+branch as the queue list itself. That means the line only ever rendered
+alongside a non-empty queue. The moment every bucket reaches a computed
+baseline (`queue` becomes `[]`), the template falls to `{% else %}` and
+shows only "No buckets waiting on a baseline right now" - silently
+dropping the count. That is exactly the state this project is working
+toward, and exactly the state where a nonzero drop count is most worth
+surfacing: nothing else on the page would tell a maintainer that data is
+still being silently excluded.
+
+Caught by review before deploy, not by the test suite - `dashboard.html`
+has no test coverage by design (L8), so a fixture with `queue: []` and a
+nonzero `negative_lifespan_dropped` was never exercised by anything
+automated. Fixed by making the drop-count line a sibling of the
+queue-or-empty-message branch, not a child of it, so it renders whenever
+`baseline_queue` isn't an error, independent of whether the queue itself
+is empty.
+
+Same shape as L7/L9's lesson, one level up: those were rules that assumed
+a second class or property always co-occurred with a first; this was a
+branch that assumed a value's relevance was conditional on ITS SIBLING's
+value, when the two were actually independent facts that happened to be
+computed by the same function. Any V0.11a Part A message and any nonzero
+count from a different section of the same payload dict should be
+checked for this same nesting mistake before being added.

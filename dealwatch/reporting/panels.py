@@ -23,7 +23,8 @@ running a year."
 `computed_baselines()` (V0.11a Part D) is the one exception that's cheap
 anyway - a point read against `baselines`' own primary key. `baseline_queue()`
 (V0.11a Part E) is the one exception that ISN'T bounded: it calls
-engine.baselines.derive_candidates(), which scans every dead spec_status=
+engine.baselines.derive_candidates_with_stats() (V0.13; plain
+derive_candidates() before that), which scans every dead spec_status=
 'ok' listing and does one point query per candidate against `observations` -
 orders of magnitude more work than anything else on this page, and it grows
 with total history, not with the active set. Measured (design.md §13's
@@ -52,7 +53,7 @@ import time
 from datetime import datetime
 
 from dealwatch.engine.baselines import (
-    derive_candidates,
+    derive_candidates_with_stats,
     group_fast_candidates_by_bucket,
     select_price,
 )
@@ -562,12 +563,26 @@ def baseline_queue(
     fast_lifespan_hours: int,
     compiled_seeds: list[CompiledSeedBaseline],
     limit: int = 10,
-) -> list[dict]:
-    """Buckets that do NOT have a computed baseline yet, ranked by FAST-
-    candidate count descending: {"bucket_key", "fast_candidates",
-    "min_samples", "progress_pct", "seed_p25_display", "seed_p50_display"}
-    (V0.11a Part E; ranking fixed in V0.11b Part A; progress bar and seed
-    values added in V0.12 Parts A/B - see below).
+) -> dict:
+    """{"queue": [...], "negative_lifespan_dropped": int} (V0.13 changed
+    the return shape from a bare list to this dict - see Part B below).
+    Each queue entry is a bucket that does NOT have a computed baseline
+    yet, ranked by FAST-candidate count descending: {"bucket_key",
+    "fast_candidates", "min_samples", "progress_pct", "seed_p25_display",
+    "seed_p50_display"} (V0.11a Part E; ranking fixed in V0.11b Part A;
+    progress bar and seed values added in V0.12 Parts A/B - see below).
+
+    V0.13 Part B: `negative_lifespan_dropped` is
+    derive_candidates_with_stats()'s own CandidatePoolStats field, read
+    off this SAME derive call rather than a second one - the candidate
+    pool this function already computes for ranking is the identical pool
+    the count is about, so there is no reason to call into
+    engine.baselines twice per render. Previously this number only ever
+    reached a maintainer as a log line (engine/baselines.py's own INFO
+    aggregate, demoted to DEBUG as of this milestone) - it is a fact
+    about the data (docs/learnings.md L3), not an operational event, and
+    belongs next to the queue it affects. dashboard.html renders one line
+    under the queue when this is nonzero, nothing when it's zero.
 
     V0.12 Part A: `progress_pct` is `fast_candidates / min_samples`
     clamped to 100 for the bar's CSS width - but `fast_candidates` itself
@@ -642,28 +657,36 @@ def baseline_queue(
     for the identical "one exclusion definition" reasoning E1 below
     already applies to derive_candidates() itself.
 
-    E1 (load-bearing): reuses engine.baselines.derive_candidates() rather
-    than a hand-rolled COUNT(*). derive_candidates() and
-    derive_candidate_pool_stats() share one _derive() implementation on
-    purpose - that module's own docstring is explicit that the exclusion
-    order (sweep-confirmed, has a bucket_key, no '?', has a usable price)
-    must never drift between "how many candidates exist" and "how many
-    does this other reader count." A second, differently-shaped COUNT(*)
-    here would fork that silently: the number would still look plausible
-    and be wrong - exactly the failure mode design.md's baseline-poisoning
-    trap already warns about for a different query.
+    E1 (load-bearing): reuses engine.baselines.derive_candidates_with_stats()
+    (V0.13; previously plain derive_candidates()) rather than a hand-rolled
+    COUNT(*). derive_candidates(), derive_candidate_pool_stats(), and
+    derive_candidates_with_stats() all share one _derive() implementation
+    on purpose - that module's own docstring is explicit that the
+    exclusion order (sweep-confirmed, has a bucket_key, no '?', has a
+    usable price, no negative lifespan) must never drift between "how many
+    candidates exist" and "how many does this other reader count." A
+    second, differently-shaped COUNT(*) here would fork that silently: the
+    number would still look plausible and be wrong - exactly the failure
+    mode design.md's baseline-poisoning trap already warns about for a
+    different query. Switching to the `_with_stats` variant (rather than
+    calling derive_candidates() and derive_candidate_pool_stats()
+    separately) is the same reasoning one level up: this function needs
+    both the candidates AND stats.negative_lifespan_dropped, and calling
+    _derive() twice per render for the two halves of one already-computed
+    pass would itself be exactly the kind of avoidable fork this rule
+    exists to prevent.
 
-    E2 (load-bearing): derive_candidates()/_derive() read rows by column
-    name (row["first_seen"], etc.) - written against the shape
+    E2 (load-bearing): derive_candidates_with_stats()/_derive() read rows
+    by column name (row["first_seen"], etc.) - written against the shape
     storage.sqlite.connect() always provides (row_factory = sqlite3.Row).
     connect_readonly() (the dashboard's own connection) deliberately does
     NOT set row_factory, and every other function in this module reads
     positionally. row_factory is flipped to sqlite3.Row for the exact
-    duration of the derive_candidates() call only, in a try/finally that
-    restores whatever it was before - never left flipped globally, which
-    would silently turn every OTHER positional read on this same
-    connection, for the rest of this request, into a Row object nobody
-    asked for.
+    duration of the derive_candidates_with_stats() call only, in a
+    try/finally that restores whatever it was before - never left flipped
+    globally, which would silently turn every OTHER positional read on
+    this same connection, for the rest of this request, into a Row object
+    nobody asked for.
 
     `fast_lifespan_hours`, like `min_samples`, always comes from the
     profile (`profile.scoring.get("fast_lifespan_hours", 24)`, main.py) -
@@ -672,7 +695,7 @@ def baseline_queue(
     "fast" means for this profile.
 
     Not profile-scoped in the candidate-derivation step, because
-    derive_candidates() itself isn't (engine/baselines.py's
+    derive_candidates_with_stats() itself isn't (engine/baselines.py's
     _DEAD_OK_LISTINGS has no profile_id filter - reporting/status.py's own
     dead_spec_ok_count comment already flags this same gap for a
     different reader). Correct while one profile exists; will need a real
@@ -688,7 +711,7 @@ def baseline_queue(
     previous_row_factory = conn.row_factory
     conn.row_factory = sqlite3.Row
     try:
-        candidates = derive_candidates(conn)
+        candidates, stats = derive_candidates_with_stats(conn)
     finally:
         conn.row_factory = previous_row_factory
 
@@ -708,8 +731,8 @@ def baseline_queue(
         # One representative candidate's own spec_json - not every
         # candidate's, and not derived from bucket_key. min() by item_id,
         # not fast[0]: _DEAD_OK_LISTINGS (engine/baselines.py) has no
-        # ORDER BY, so "first in derive_candidates()'s result" is
-        # whatever order SQLite happens to scan the table in (empirically,
+        # ORDER BY, so "first in derive_candidates_with_stats()'s result"
+        # is whatever order SQLite happens to scan the table in (empirically,
         # insertion order today) - an implementation artifact, not a
         # documented guarantee, and not safe to build a deterministic
         # panel on. min(item_id) is itself still an ARBITRARY choice of
@@ -749,4 +772,4 @@ def baseline_queue(
                 "seed_p50_display": _price_display(seed.p50_cents) if seed is not None else "unresolved",
             }
         )
-    return queue
+    return {"queue": queue, "negative_lifespan_dropped": stats.negative_lifespan_dropped}

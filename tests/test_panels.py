@@ -449,7 +449,7 @@ def test_baseline_queue_excludes_computed_buckets_and_orders_by_fast_candidate_c
 
     queue = panels.baseline_queue(
         conn, PROFILE, min_samples=12, fast_lifespan_hours=24, compiled_seeds=[], limit=10
-    )
+    )["queue"]
 
     bucket_keys = [q["bucket_key"] for q in queue]
     assert "1|intel-10th|16" not in bucket_keys  # already has a baseline
@@ -503,7 +503,7 @@ def test_baseline_queue_ranks_by_fast_count_not_total_dead_count(tmp_path):
 
     queue = panels.baseline_queue(
         conn, PROFILE, min_samples=12, fast_lifespan_hours=24, compiled_seeds=[], limit=10
-    )
+    )["queue"]
 
     # Total-dead ordering would put MORE_DEAD_FEWER_FAST (21) first.
     # Fast-count ordering (the fix) puts FEWER_DEAD_MORE_FAST (11) first.
@@ -521,7 +521,7 @@ def test_baseline_queue_respects_limit(tmp_path):
 
     queue = panels.baseline_queue(
         conn, PROFILE, min_samples=12, fast_lifespan_hours=24, compiled_seeds=[], limit=5
-    )
+    )["queue"]
 
     assert len(queue) == 5
 
@@ -533,7 +533,7 @@ def test_baseline_queue_restores_row_factory_when_derive_raises(tmp_path, monkey
     def _boom(*args, **kwargs):
         raise RuntimeError("simulated derive failure")
 
-    monkeypatch.setattr(panels, "derive_candidates", _boom)
+    monkeypatch.setattr(panels, "derive_candidates_with_stats", _boom)
 
     with pytest.raises(RuntimeError):
         panels.baseline_queue(
@@ -541,6 +541,47 @@ def test_baseline_queue_restores_row_factory_when_derive_raises(tmp_path, monkey
         )
 
     assert conn.row_factory is None  # restored even on the raising path
+
+
+def test_baseline_queue_reports_negative_lifespan_dropped_count(tmp_path):
+    # V0.13 Part B2: negative_lifespan_dropped comes off the SAME derive
+    # call baseline_queue() already makes for ranking - a fact about the
+    # data that used to only ever reach a maintainer via a log line
+    # (engine/baselines.py's own INFO aggregate, now demoted to DEBUG).
+    conn = make_conn(tmp_path)
+    conn.row_factory = None
+    for i in range(3):
+        _seed_candidate(conn, f"item-{i}", "1|intel-10th|16", first_seen=1000 + i)
+
+    # Sweep-confirmed, complete bucket_key, usable price - would otherwise
+    # be a candidate, except its last observation's observed_at is AFTER
+    # gone_at, so engine.baselines._derive()'s negative-lifespan guard
+    # drops it rather than corrupting a baseline with a negative number.
+    seed_listing(
+        conn, "negative-item", bucket_key="1|intel-10th|16",
+        first_seen=5000, last_seen=5050, gone_at=5000,
+    )
+    seed_observation(conn, "negative-item", 5060, price_cents=20000)
+
+    result = panels.baseline_queue(
+        conn, PROFILE, min_samples=12, fast_lifespan_hours=24, compiled_seeds=[]
+    )
+
+    assert result["negative_lifespan_dropped"] == 1
+    assert result["queue"][0]["fast_candidates"] == 3  # the dropped row isn't counted
+
+
+def test_baseline_queue_negative_lifespan_dropped_is_zero_when_none_dropped(tmp_path):
+    conn = make_conn(tmp_path)
+    conn.row_factory = None
+    for i in range(3):
+        _seed_candidate(conn, f"item-{i}", "1|intel-10th|16", first_seen=1000 + i)
+
+    result = panels.baseline_queue(
+        conn, PROFILE, min_samples=12, fast_lifespan_hours=24, compiled_seeds=[]
+    )
+
+    assert result["negative_lifespan_dropped"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -561,7 +602,7 @@ def test_baseline_queue_progress_pct_is_clamped_but_fast_candidates_is_not(tmp_p
 
     queue = panels.baseline_queue(
         conn, PROFILE, min_samples=12, fast_lifespan_hours=24, compiled_seeds=[]
-    )
+    )["queue"]
 
     assert len(queue) == 1
     assert queue[0]["fast_candidates"] == 13  # the true count, never clamped
@@ -576,7 +617,7 @@ def test_baseline_queue_progress_pct_below_threshold_is_not_clamped(tmp_path):
 
     queue = panels.baseline_queue(
         conn, PROFILE, min_samples=12, fast_lifespan_hours=24, compiled_seeds=[]
-    )
+    )["queue"]
 
     assert queue[0]["fast_candidates"] == 3
     assert queue[0]["progress_pct"] == pytest.approx(25.0)  # 3/12, no clamping needed
@@ -602,7 +643,7 @@ def test_baseline_queue_resolves_the_best_matching_seed_not_the_fallback(tmp_pat
 
     queue = panels.baseline_queue(
         conn, PROFILE, min_samples=12, fast_lifespan_hours=24, compiled_seeds=seeds
-    )
+    )["queue"]
 
     assert queue[0]["seed_p25_display"] == "$525.00"
     assert queue[0]["seed_p50_display"] == "$625.00"
@@ -636,7 +677,7 @@ def test_baseline_queue_seed_resolution_uses_best_match_not_first_generation_mat
 
     queue = panels.baseline_queue(
         conn, PROFILE, min_samples=12, fast_lifespan_hours=24, compiled_seeds=seeds
-    )
+    )["queue"]
 
     assert queue[0]["seed_p25_display"] == "$525.00"
     assert queue[0]["seed_p50_display"] == "$625.00"
@@ -661,7 +702,7 @@ def test_baseline_queue_ram_agnostic_buckets_share_the_same_seed(tmp_path):
 
     queue = panels.baseline_queue(
         conn, PROFILE, min_samples=12, fast_lifespan_hours=24, compiled_seeds=seeds
-    )
+    )["queue"]
 
     by_bucket = {q["bucket_key"]: q for q in queue}
     assert by_bucket["1|intel-10th|8"]["seed_p25_display"] == "$165.00"
@@ -706,7 +747,7 @@ def test_baseline_queue_picks_the_representative_listing_deterministically(tmp_p
 
     queue = panels.baseline_queue(
         conn, PROFILE, min_samples=12, fast_lifespan_hours=24, compiled_seeds=seeds
-    )
+    )["queue"]
 
     # "aaa-item" (min item_id) must drive resolution, regardless of the
     # fact that "zzz-item" was inserted - and therefore returned by
@@ -733,7 +774,7 @@ def test_baseline_queue_renders_explicit_unresolved_state_with_no_fallback(tmp_p
 
     queue = panels.baseline_queue(
         conn, PROFILE, min_samples=12, fast_lifespan_hours=24, compiled_seeds=seeds
-    )
+    )["queue"]
 
     assert queue[0]["seed_p25_display"] == "unresolved"
     assert queue[0]["seed_p50_display"] == "unresolved"

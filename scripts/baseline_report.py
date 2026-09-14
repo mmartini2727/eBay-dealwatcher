@@ -68,6 +68,9 @@ def run_report(profile, conn) -> str:
     lines.append(f"  {pool_stats.has_bucket_key} have a bucket_key at all")
     lines.append(f"  {pool_stats.bucket_key_has_no_question_mark} of those have no '?' component")
     lines.append(f"  {pool_stats.has_usable_price} of those have a usable price")
+    lines.append(
+        f"  {pool_stats.negative_lifespan_dropped} of those dropped for a negative lifespan"
+    )
     lines.append(f"  -> {len(candidates)} final candidates")
 
     lines.append("")

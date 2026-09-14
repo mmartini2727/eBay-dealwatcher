@@ -149,13 +149,23 @@ def build_indicators(
     consistent = alive["sweep_bookkeeping_consistent"]
     if consistent is None:
         bookkeeping = _indicator("unknown", "Bookkeeping", None, "health")
+    elif consistent:
+        bookkeeping = _indicator("ok", "Bookkeeping", "consistent", "health")
     else:
-        bookkeeping = _indicator(
-            "ok" if consistent else "warn",
-            "Bookkeeping",
-            "consistent" if consistent else "mismatch",
-            "health",
-        )
+        # V0.13 (design.md §14): the bare "mismatch" string used to be the
+        # only signal here. Now that status.py reports HOW many listings
+        # are ahead of the last sweep stamp, say so - a real 0-vs-nonzero
+        # distinction, not just "something's wrong." n == 0 here means the
+        # stamp itself was never carried forward by anything (the "behind"
+        # direction) rather than a listing outrunning it (the "ahead"
+        # direction, which status.py's own comment notes is structurally
+        # unreachable through record_sighting() alone after its filter).
+        n = alive["listings_ahead_of_last_sweep"]
+        if n:
+            value = f"{n} listing ahead of last sweep" if n == 1 else f"{n} listings ahead of last sweep"
+        else:
+            value = "no listing carries the last sweep stamp"
+        bookkeeping = _indicator("warn", "Bookkeeping", value, "health")
 
     # Rollup over exactly these three - "unknown" outranks "ok" but not
     # "warn": a component that can't be evaluated is not the same as a

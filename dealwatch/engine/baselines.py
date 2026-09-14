@@ -68,15 +68,21 @@ class LifespanCandidate:
 @dataclass
 class CandidatePoolStats:
     """The exclusion pipeline's stage-by-stage survivor counts - what
-    scripts/baseline_report.py's candidate-pool section prints. Each field
-    counts listings surviving up to and including that stage; the last one
-    equals len(derive_candidates(conn))."""
+    scripts/baseline_report.py's candidate-pool section prints. Each of the
+    first five fields counts listings surviving up to and including that
+    stage; has_usable_price is not the last stage though - a row can still
+    be dropped afterward for a negative lifespan (V0.11's negative-lifespan
+    guard, below). negative_lifespan_dropped (V0.13) counts THOSE drops -
+    it is a count of exclusions at the final stage, not a survivor count,
+    so has_usable_price - negative_lifespan_dropped is what actually equals
+    len(derive_candidates(conn)), not has_usable_price alone."""
 
     total_dead_ok: int
     sweep_confirmed: int
     has_bucket_key: int
     bucket_key_has_no_question_mark: int
     has_usable_price: int
+    negative_lifespan_dropped: int
 
 
 def select_price(total_cents: int | None, price_cents: int | None) -> tuple[int, bool] | None:
@@ -176,11 +182,21 @@ def _derive(conn) -> tuple[list[LifespanCandidate], CandidatePoolStats]:
         )
 
     if negative_lifespan_dropped:
-        # Single aggregate line, always exactly one call regardless of how
-        # many items this pass dropped - the count itself is the signal a
-        # maintainer glancing at the log actually needs; a run of three
-        # identical debug lines a moment ago is not.
-        logger.info("dropped %d candidates: negative lifespan", negative_lifespan_dropped)
+        # V0.13 (design.md's dated entry): demoted from INFO to DEBUG. Not
+        # a log-volume fix - measured on the live LXC at 11 lines in 10
+        # minutes with a dashboard tab open, ~0 with none, bounded above by
+        # the 30s payload TTL at 2/min - nowhere near drowning the
+        # container log. The real reason is that this count is a fact
+        # about the DATA (docs/learnings.md L3), not an operational event,
+        # and it belongs next to the baseline queue it affects
+        # (reporting/panels.py's baseline_queue(), via
+        # derive_candidates_with_stats() below) rather than in a log a
+        # maintainer has to go looking for. Once it's on the page, this
+        # line has no reader left - which is why it drops to DEBUG rather
+        # than being removed outright: scripts/recompute_baselines.py and
+        # scripts/baseline_report.py both set their own level to DEBUG in
+        # main(), so a maintainer running either directly still sees it.
+        logger.debug("dropped %d candidates: negative lifespan", negative_lifespan_dropped)
 
     stats = CandidatePoolStats(
         total_dead_ok=total_dead_ok,
@@ -188,6 +204,7 @@ def _derive(conn) -> tuple[list[LifespanCandidate], CandidatePoolStats]:
         has_bucket_key=has_bucket_key,
         bucket_key_has_no_question_mark=no_question_mark,
         has_usable_price=has_usable_price,
+        negative_lifespan_dropped=negative_lifespan_dropped,
     )
     return candidates, stats
 
@@ -209,6 +226,22 @@ def derive_candidate_pool_stats(conn) -> CandidatePoolStats:
     stage - scripts/baseline_report.py section (a)."""
     _, stats = _derive(conn)
     return stats
+
+
+def derive_candidates_with_stats(conn) -> tuple[list[LifespanCandidate], CandidatePoolStats]:
+    """Both derive_candidates() and derive_candidate_pool_stats() in one
+    pass (V0.13) - for a caller (reporting/panels.py's baseline_queue())
+    that needs both the candidates themselves and
+    stats.negative_lifespan_dropped, and would otherwise have to call
+    _derive() twice per render to get them. This is just _derive() with no
+    wrapping - derive_candidates() and derive_candidate_pool_stats() are
+    unchanged and still each call _derive() themselves, so the "one
+    exclusion definition" rule this module's own docstring states stays
+    true for all three: there remains exactly one place the exclusion
+    order is encoded, never a second, differently-shaped implementation
+    fork for this one caller's convenience.
+    """
+    return _derive(conn)
 
 
 def nearest_rank_percentile(sorted_values: list[int], pct: float) -> int:

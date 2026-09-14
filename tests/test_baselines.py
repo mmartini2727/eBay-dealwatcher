@@ -14,6 +14,7 @@ from dealwatch.engine.baselines import (
     compute_baselines,
     derive_candidate_pool_stats,
     derive_candidates,
+    derive_candidates_with_stats,
     group_fast_candidates_by_bucket,
     nearest_rank_percentile,
 )
@@ -249,13 +250,13 @@ def test_both_prices_null_is_dropped(tmp_path):
     assert derive_candidates(conn) == []
 
 
-def test_negative_lifespan_is_dropped_and_logged_at_debug_with_an_info_aggregate(tmp_path, caplog):
-    # V0.11b Part B1: build_payload() now calls into this module on every
-    # dashboard render, and a per-item WARNING for the same handful of
-    # items every 30s is exactly the log-volume problem CLAUDE.md's
-    # reporting/ discipline (no printing, no logging at page-refresh
-    # volume) exists to prevent. Demoted to DEBUG; a single INFO-level
-    # aggregate line replaces it for anyone not running at DEBUG.
+def test_negative_lifespan_is_dropped_and_logged_entirely_at_debug(tmp_path, caplog):
+    # V0.13 (design.md's dated entry): the aggregate line itself is now
+    # demoted from INFO to DEBUG, alongside the per-item line (V0.11b).
+    # Not a volume fix - the count now lives on the dashboard
+    # (reporting/panels.py's baseline_queue(), via
+    # derive_candidates_with_stats() below) instead of the log, so there
+    # is no reader left at INFO for this line at all.
     import logging
 
     conn = make_conn(tmp_path)
@@ -272,8 +273,13 @@ def test_negative_lifespan_is_dropped_and_logged_at_debug_with_an_info_aggregate
         r for r in caplog.records if r.levelname == "DEBUG" and "item-1" in r.message
     ]
     assert len(debug_records) == 1
-    info_records = [r for r in caplog.records if r.levelname == "INFO"]
-    assert any("dropped 1 candidates: negative lifespan" in r.message for r in info_records)
+    aggregate_records = [
+        r for r in caplog.records
+        if "dropped 1 candidates: negative lifespan" in r.message
+    ]
+    assert len(aggregate_records) == 1
+    assert aggregate_records[0].levelname == "DEBUG"
+    assert not any(r.levelname == "INFO" for r in caplog.records)
 
 
 def test_negative_lifespan_no_longer_emits_at_warning_level(tmp_path, caplog):
@@ -310,9 +316,11 @@ def test_negative_lifespan_aggregate_counts_all_dropped_items_in_one_line(tmp_pa
         candidates = derive_candidates(conn)
 
     assert candidates == []
-    info_records = [r for r in caplog.records if r.levelname == "INFO"]
-    assert len(info_records) == 1  # ONE aggregate line, not one per item
-    assert "dropped 3 candidates: negative lifespan" in info_records[0].message
+    aggregate_records = [
+        r for r in caplog.records if "dropped 3 candidates: negative lifespan" in r.message
+    ]
+    assert len(aggregate_records) == 1  # ONE aggregate line, not one per item
+    assert aggregate_records[0].levelname == "DEBUG"
 
 
 def test_candidate_pool_stats_breakdown_matches_final_candidate_count(tmp_path):
@@ -347,7 +355,57 @@ def test_candidate_pool_stats_breakdown_matches_final_candidate_count(tmp_path):
     assert stats.has_bucket_key == 3  # excludes nobucket
     assert stats.bucket_key_has_no_question_mark == 2  # excludes questionmark too
     assert stats.has_usable_price == 1  # excludes noprice too
+    assert stats.negative_lifespan_dropped == 0  # no negative-lifespan row in this fixture
+    assert stats.has_usable_price - stats.negative_lifespan_dropped == len(candidates)
+
+
+def test_negative_lifespan_dropped_count_is_excluded_from_the_final_candidates(tmp_path):
+    # has_usable_price alone no longer equals len(candidates) once a
+    # negative-lifespan row exists - negative_lifespan_dropped is the gap
+    # between them (CandidatePoolStats's own docstring).
+    conn = make_conn(tmp_path)
+    t0 = 1_000_000
+
+    sight(conn, "ok1", t0, price_cents=50000)
+    set_spec(conn, "ok1", BUCKET)
+    mark_gone(conn, "ok1", t0 + 3600)
+
+    sight(conn, "negative", t0, price_cents=50000)
+    set_spec(conn, "negative", BUCKET)
+    mark_gone(conn, "negative", t0 - 3600)  # gone_at BEFORE the observation
+
+    stats = derive_candidate_pool_stats(conn)
+    candidates = derive_candidates(conn)
+
+    assert stats.has_usable_price == 2
+    assert stats.negative_lifespan_dropped == 1
     assert len(candidates) == 1
+    assert stats.has_usable_price - stats.negative_lifespan_dropped == len(candidates)
+
+
+def test_derive_candidates_with_stats_matches_the_two_separate_calls(tmp_path):
+    # V0.13: derive_candidates_with_stats() must be exactly what calling
+    # derive_candidates() and derive_candidate_pool_stats() separately
+    # already returns - it is _derive() itself, not a second
+    # implementation of the exclusion pipeline.
+    conn = make_conn(tmp_path)
+    t0 = 1_000_000
+
+    sight(conn, "ok1", t0, price_cents=50000)
+    set_spec(conn, "ok1", BUCKET)
+    mark_gone(conn, "ok1", t0 + 3600)
+
+    sight(conn, "negative", t0, price_cents=50000)
+    set_spec(conn, "negative", BUCKET)
+    mark_gone(conn, "negative", t0 - 3600)
+
+    candidates_separate = derive_candidates(conn)
+    stats_separate = derive_candidate_pool_stats(conn)
+
+    candidates_combined, stats_combined = derive_candidates_with_stats(conn)
+
+    assert candidates_combined == candidates_separate
+    assert stats_combined == stats_separate
 
 
 # ---------------------------------------------------------------------------

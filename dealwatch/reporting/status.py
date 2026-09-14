@@ -56,22 +56,48 @@ will hard-code, so changing one is a breaking change to all of them:
           # attempts, so this can be newer than last_sweep_started_at.
       last_price_change_at, last_price_change_age_mins,
           # Newest observations row for this profile. NOT a liveness
-          # signal on its own: record_sighting() never writes last_seen,
-          # and a fast poll against a quiet market (no price/shipping/
-          # buying_options change) writes no observations row at all -
-          # this answers "has any price moved recently," nothing more.
+          # signal on its own: only record_sweep() advances last_seen on
+          # an existing row (record_sighting() writes it once, at insert,
+          # and never again after that), and a fast poll against a quiet
+          # market (no price/shipping/buying_options change) writes no
+          # observations row at all - this answers "has any price moved
+          # recently," nothing more.
       sweeps_today_total, sweeps_today_recorded, sweeps_today_truncated,
       listings_last_seen_max,
-          # max(listings.last_seen) for this profile.
-      sweep_bookkeeping_consistent,
-          # listings_last_seen_max == last_sweep_started_at - only
-          # record_sweep() ever advances last_seen, so these should
-          # agree. None (not False) when there is no recorded sweep yet,
-          # or when the latest recorded sweep's distinct_count is 0: a
-          # sweep that returned zero items advances no listing's
-          # last_seen, so the invariant is unevaluable, not violated -
-          # same "unevaluable is not the same as false" discipline as
-          # last_sweep_coverage_pct below.
+          # max(listings.last_seen) for this profile, UNFILTERED - the
+          # honest answer to "when was anything last seen at all." Kept
+          # exactly as it is (V0.13); do not redefine this key to the
+          # filtered value below just because sweep_bookkeeping_consistent
+          # no longer uses the unfiltered one directly.
+      sweep_bookkeeping_consistent, listings_ahead_of_last_sweep,
+          # V0.13 correction (design.md §14): this used to compare the
+          # UNFILTERED listings_last_seen_max above against
+          # last_sweep_started_at, on the premise that only
+          # record_sweep() ever advances last_seen. That premise is false
+          # - record_sighting()'s insert branch writes last_seen once, for
+          # every brand-new listing - so an ordinary 5-minute poll that
+          # discovers a new listing pushed the unfiltered max ahead of the
+          # last sweep stamp and read as broken bookkeeping on a perfectly
+          # healthy collector. Fixed by excluding rows that did not exist
+          # when the sweep ran: a listing first seen after
+          # last_sweep_started_at cannot have been stamped by that sweep,
+          # so it must not count against it either way.
+          # sweep_bookkeeping_consistent now compares MAX(last_seen) WHERE
+          # first_seen <= last_sweep_started_at against
+          # last_sweep_started_at; listings_ahead_of_last_sweep (new) is
+          # the COUNT of rows in that same first_seen-filtered set whose
+          # last_seen exceeds the stamp - after the filter, this is
+          # structurally unreachable via record_sighting() alone (its
+          # resurrection branch doesn't touch last_seen either), so a
+          # nonzero count means a THIRD writer of last_seen exists, which
+          # is exactly what this check is now for.
+          # Both fields are None (not False, not 0) in three cases: no
+          # recorded sweep yet; the latest recorded sweep's distinct_count
+          # is 0 (it advanced no listing's last_seen, so there's nothing
+          # to compare); or no listing at all predates the sweep (a fresh
+          # deployment - unevaluable, not violated). Same "unevaluable is
+          # not the same as false" discipline as last_sweep_coverage_pct
+          # below.
       budget: {period, used, period_is_today, ceiling, remaining},
           # Read from the `budget` table directly - NEVER via
           # DailyBudget.status(), which opens its own connection, runs
@@ -233,8 +259,30 @@ def _alive(
 
     if latest_recorded is None or latest_recorded[1] == 0:
         sweep_bookkeeping_consistent = None
+        listings_ahead_of_last_sweep = None
     else:
-        sweep_bookkeeping_consistent = listings_last_seen_max == last_sweep_started_at
+        # Only rows that existed when the sweep ran can have been stamped
+        # by it - a listing record_sighting() inserted afterward has a
+        # real last_seen from its own insert, not from this sweep, and
+        # comparing it against last_sweep_started_at is exactly the false
+        # premise V0.13 (design.md §14) corrected.
+        filtered_max = conn.execute(
+            "SELECT MAX(last_seen) FROM listings "
+            "WHERE profile_id = ? AND first_seen <= ?",
+            (profile_id, last_sweep_started_at),
+        ).fetchone()[0]
+        if filtered_max is None:
+            # No listing predates the sweep at all - a fresh deployment.
+            # Unevaluable, not violated.
+            sweep_bookkeeping_consistent = None
+            listings_ahead_of_last_sweep = None
+        else:
+            sweep_bookkeeping_consistent = filtered_max == last_sweep_started_at
+            listings_ahead_of_last_sweep = conn.execute(
+                "SELECT COUNT(*) FROM listings "
+                "WHERE profile_id = ? AND first_seen <= ? AND last_seen > ?",
+                (profile_id, last_sweep_started_at, last_sweep_started_at),
+            ).fetchone()[0]
 
     last_sweep_attempt_at = conn.execute(
         "SELECT MAX(swept_at) FROM sweeps WHERE profile_id = ?",
@@ -311,6 +359,7 @@ def _alive(
         "sweeps_today_truncated": sweeps_today_truncated,
         "listings_last_seen_max": listings_last_seen_max,
         "sweep_bookkeeping_consistent": sweep_bookkeeping_consistent,
+        "listings_ahead_of_last_sweep": listings_ahead_of_last_sweep,
         "budget": {
             "period": period,
             "used": used,

@@ -173,6 +173,49 @@ def test_bookkeeping_is_unknown_not_warn_when_none():
     assert result["bookkeeping"]["state"] == "unknown"
 
 
+# ---------------------------------------------------------------------------
+# V0.13 Part A3 - bookkeeping's mismatch value distinguishes ahead vs behind
+# ---------------------------------------------------------------------------
+
+
+def test_bookkeeping_mismatch_reports_the_ahead_count():
+    result = _build(
+        _status(
+            alive={
+                "sweep_bookkeeping_consistent": False,
+                "listings_ahead_of_last_sweep": 3,
+            }
+        )
+    )
+    assert result["bookkeeping"]["state"] == "warn"
+    assert result["bookkeeping"]["value"] == "3 listings ahead of last sweep"
+
+
+def test_bookkeeping_mismatch_singular_count_is_not_pluralized():
+    result = _build(
+        _status(
+            alive={
+                "sweep_bookkeeping_consistent": False,
+                "listings_ahead_of_last_sweep": 1,
+            }
+        )
+    )
+    assert result["bookkeeping"]["value"] == "1 listing ahead of last sweep"
+
+
+def test_bookkeeping_mismatch_with_zero_ahead_reports_the_behind_case():
+    result = _build(
+        _status(
+            alive={
+                "sweep_bookkeeping_consistent": False,
+                "listings_ahead_of_last_sweep": 0,
+            }
+        )
+    )
+    assert result["bookkeeping"]["state"] == "warn"
+    assert result["bookkeeping"]["value"] == "no listing carries the last sweep stamp"
+
+
 def test_budget_is_unknown_when_ceiling_is_none():
     status = _status()
     status["alive"]["budget"]["ceiling"] = None

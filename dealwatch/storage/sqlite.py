@@ -500,9 +500,14 @@ def record_sighting(
     current_bid_cents, bid_count (all int|None), buying_options (list[str]),
     raw_json (str).
 
-    seen_at is a Unix second, UTC. This function never writes last_seen -
-    design.md §4.2 is explicit that only the sweep does, since a fast poll's
-    absence proves nothing about a listing it didn't return.
+    seen_at is a Unix second, UTC. This function writes last_seen once, at
+    insert - a new row needs a value, so seen_at goes into both first_seen
+    and last_seen - but never advances it again on an existing row.
+    design.md §4.2 is explicit that only record_sweep() does that, since a
+    fast poll's absence proves nothing about a listing it didn't return.
+    (V0.13, design.md's dated entry: this docstring previously claimed
+    last_seen was never written here at all, which was false and fed a
+    now-corrected dashboard bookkeeping check - see reporting/status.py.)
     """
     conn.execute("BEGIN IMMEDIATE")
     try:

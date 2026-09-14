@@ -269,7 +269,7 @@ listings(
   reject_rule_id TEXT,
   bucket_key    TEXT,
   first_seen    INTEGER NOT NULL,
-  last_seen     INTEGER NOT NULL,       -- heartbeat; SWEEP ONLY
+  last_seen     INTEGER NOT NULL,       -- heartbeat; written once at insert, then sweep-only
   miss_count    INTEGER NOT NULL DEFAULT 0,
   gone_at       INTEGER,                -- = last_seen, not detection time
   lifespan_mins INTEGER
@@ -349,14 +349,20 @@ Indexes: `observations(item_id, observed_at)`, `listings(bucket_key, gone_at)`.
 
 These are load-bearing. Getting them wrong produces a database that looks correct and is not.
 
-- **Only the sweep writes `last_seen`.** The 5-minute poll uses
-  `sort=newlyListed` alone (V0.8e; no `itemStartDate` filter — see below) and
-  returns a fixed-size page of the current newest listings, not "only what's
-  new since the last poll." A listing absent from that page has told you
-  *nothing* — it's a small, constantly-shifting slice of the active set, not
-  the full one. If the collector treats fast-poll absence as absence, it will
-  mark every existing listing gone within five minutes of starting — and the
-  rows will still land and the lifespans will still compute.
+- **Only `record_sweep()` advances `last_seen` on an existing row.**
+  `record_sighting()` writes `last_seen` once, at insert — a new row needs a
+  value, so `seen_at` goes into both `first_seen` and `last_seen` — but never
+  touches the column again after that. This was stated as an unqualified
+  "only the sweep writes `last_seen`" until V0.13 (dated entry below), which
+  is false: it's true for an existing row, false for the insert. The 5-minute
+  poll uses `sort=newlyListed` alone (V0.8e; no `itemStartDate` filter — see
+  below) and returns a fixed-size page of the current newest listings, not
+  "only what's new since the last poll." A listing absent from that page has
+  told you *nothing* — it's a small, constantly-shifting slice of the active
+  set, not the full one. If the collector treats fast-poll absence as
+  absence, it will mark every existing listing gone within five minutes of
+  starting — and the rows will still land and the lifespans will still
+  compute.
 - **`itemStartDate` filtering was designed and deliberately not built.** The
   original polling design here and in §7 called for `sort=newlyListed`
   combined with an `itemStartDate:[<last poll>..now]` filter, so each poll
@@ -1773,3 +1779,53 @@ section originally called for** - the local Docker run used a
 freshly-created empty-then-single-listing database, not the production
 one, and never exercised the actual sweep/alert history the panels are
 meant to summarize.
+
+## 14. V0.13 — sweep bookkeeping invariant correction (2026-09-13)
+
+`reporting/status.py`'s `sweep_bookkeeping_consistent` compared the
+unfiltered `MAX(listings.last_seen)` for a profile against
+`last_sweep_started_at`, on the premise (§4.2, above, before this
+correction) that only a sweep ever writes `last_seen`. That premise was
+false: `record_sighting()`'s insert branch writes `last_seen` once, for
+every brand-new listing. At the live rate (~31 new listings/day against
+hourly sweeps), the unfiltered max sits ahead of the last sweep stamp close
+to half the time, and the indicator read amber on a collector that was
+otherwise completely healthy — confirmed live: one newly-inserted listing,
+`sweep_bookkeeping_consistent = False`, no other symptom.
+
+The corrected form excludes rows that did not exist when the sweep ran — a
+listing first seen after `last_sweep_started_at` cannot have been stamped
+by that sweep, so it must not count against it either way:
+
+```sql
+-- consistency check
+SELECT MAX(last_seen) FROM listings
+WHERE profile_id = ? AND first_seen <= ?      -- last_sweep_started_at
+
+-- listings_ahead_of_last_sweep (new field)
+SELECT COUNT(*) FROM listings
+WHERE profile_id = ?
+  AND first_seen <= ?                          -- last_sweep_started_at
+  AND last_seen  >  ?                          -- last_sweep_started_at
+```
+
+`listings_last_seen_max` (the unfiltered value) is unchanged in the
+payload — it is still the honest answer to "when was anything last seen,"
+just no longer the input to this particular check. Both fields go to
+`None`, never `False`/`0`, in three cases: no recorded sweep yet; the
+latest recorded sweep's `distinct_count` is 0 (it advanced no listing's
+`last_seen`, so there's nothing to compare); or no listing at all predates
+the sweep (a fresh deployment — unevaluable, not violated).
+
+After the `first_seen` filter, the "ahead" direction is structurally
+unreachable through `record_sighting()` alone — its resurrection branch
+doesn't touch `last_seen` either. If `listings_ahead_of_last_sweep` is ever
+nonzero in production, a third writer of `last_seen` has been added
+somewhere; that is exactly the condition this check now exists to catch.
+
+The false premise had propagated by citation, not by copy-paste: this
+section asserted it, `reporting/status.py` and `storage/sqlite.py` both
+cited this section in their own docstrings, and the dashboard's health
+check cited `status.py`. Correcting only the check would have left the
+claim alive in three other places to be read and trusted again later — see
+`docs/learnings.md` L10.
