@@ -69,6 +69,19 @@ aggregate as of V0.11b Part B1, previously WARNING per item).
   sweep/death race above - that shape predicts a gap of at most one poll
   interval, not five minutes. Left as an open, unexplained anomaly.
 
+**Correction, V0.13:** the 291-second item is very plausibly explained
+after all - by a SECOND, distinct mechanism (CLAUDE.md's Open items,
+"`last_seen` can predate `first_seen`"), not the first. `record_sweep`
+stamps `last_seen = swept_at`, the sweep's START time, and a sweep takes
+minutes to run; a listing inserted by a poll while a sweep is in flight,
+and captured by that same sweep's seen-set, gets a `last_seen` from
+before its own insert - by roughly however long the sweep took, which is
+the right order of magnitude for a multi-minute gap, unlike the ~2-second
+sweep/death race above. Not proven - no direct evidence ties this
+specific item to a sweep that was actually in flight at the moment of its
+insert - but the original "gap too large to be the poll/sweep race"
+reasoning assumed only one mechanism existed, and it no longer does.
+
 Recorded as an anomaly, not an open bug to fix - the guard already
 handles it correctly by dropping the candidate rather than corrupting a
 baseline with a negative number.
@@ -301,3 +314,32 @@ value, when the two were actually independent facts that happened to be
 computed by the same function. Any V0.11a Part A message and any nonzero
 count from a different section of the same payload dict should be
 checked for this same nesting mistake before being added.
+
+## L13 - an ad-hoc check that doesn't copy the module's own predicate isn't checking the module
+
+Second time in the same session a live/ad-hoc check diverged from what it
+was meant to verify without raising any error - L11's `docker logs | grep`
+(checking the wrong stream, silently) and, separately, the reasoning that
+almost filed `last_seen` predating `first_seen` as impossible before the
+V0.13 open item on that exact shape turned it up. The common failure: a
+check built from a paraphrase of a module's logic - "these two columns
+should be ordered," "the log line went to this stream" - rather than the
+module's own predicate, copied character for character.
+
+Concretely here: `_derive()`'s guard is `first_seen != last_seen`, and
+V0.9b's fix is `CASE WHEN last_seen > first_seen`. Neither says "assume
+last_seen >= first_seen" anywhere, and both happen to handle
+`last_seen < first_seen` correctly - but only because `!=` and `>` are
+exactly the operators that don't need that assumption, not because
+anyone verified it holds. An ad-hoc check written as "confirm
+`last_seen >= first_seen` for every row" would have reported a violation
+and looked like a new bug, when the real code was already fine and the
+paraphrase was the thing that was wrong. `!=` versus `>` on two columns
+you assume are ordered is exactly the size of mistake that survives
+review - it doesn't fail loudly, it just quietly checks something
+adjacent to the real question.
+
+The rule: when a live check exists to verify a module's assumption, its
+SQL predicate must be the module's own predicate, not a restatement of
+what the predicate is "supposed to mean." If copying it exactly feels
+redundant, that redundancy is the point.
