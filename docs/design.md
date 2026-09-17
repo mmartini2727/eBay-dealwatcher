@@ -1829,3 +1829,435 @@ cited this section in their own docstrings, and the dashboard's health
 check cited `status.py`. Correcting only the check would have left the
 claim alive in three other places to be read and trusted again later — see
 `docs/learnings.md` L10.
+## 15. V1.0 — MCP server (designed 2026-09-15, not yet built)
+
+§8 fixed three things: streamable HTTP, LAN/WireGuard as the auth answer,
+and "read-and-query interface, not on the alerting path." Everything below
+is what §8 left open. Decided in a design session before any code; the
+build addendum goes at the end of this section when it exists.
+
+### What it is
+
+A second process, run from the same image as the collector, that answers
+questions about data the collector already gathered. It has no eBay
+credentials, no notifier credentials, and no write path to the database.
+Nothing about collection, scoring, or alerting changes in this milestone.
+
+### Decisions
+
+**D1. Separate compose service, same repo, same image.** `dealwatch-mcp`
+runs `uvicorn dealwatch.mcp_server.server:app` on its own port (8088 host,
+8000 in-container). Same repo because the server is almost entirely
+imports — `reporting/`, `normalize/`, `engine/scoring.py`,
+`engine/baselines.py`, `storage/sqlite.py` — and a vendored copy drifts the
+first time a query or a reject rule changes. Separate process because tool
+descriptions will be iterated many times, and in-process every iteration
+is a rebuild that bounces the collector mid-poll; a misbehaving MCP client
+also can't compete with the collector for its process.
+
+**D2. `server.py` never imports `dealwatch.main`.** The collector starts in
+`main.py`'s `lifespan()`. Importing or mounting onto that app from the MCP
+container starts a second collector: double budget spend against the
+shared persisted counter, a second alert cycle racing the first, possibly
+duplicate notifications. None of that raises an error. The MCP server is
+its own ASGI app with its own lifespan.
+
+**D3. The MCP container gets no `.env`.** It needs no eBay, Discord, or
+Pushover secrets. A process that has no webhook in its environment cannot
+send an alert no matter what bug it has — that is a control, not a
+convention. `main.py` already treats eBay credentials as optional, but
+`dealwatch/config.py` must be checked for any required field before this
+holds; if one exists, the fix is making the MCP server need `Settings`
+only for paths, not handing it secrets.
+
+**D4. Read-only is enforced by `connect_readonly()`, not the mount.**
+`data/` mounts read-write on both containers. A `mode=ro` WAL reader still
+writes the `-shm` file; a `:ro` volume fails on first query. One connection
+per tool call, opened inside the call, closed in `finally` — the same
+reasoning as `DailyBudget`: tool calls run on worker threads and a
+`sqlite3` connection can't be shared across them.
+
+**D5. The collector owns the schema.** `connect()` migrates;
+`connect_readonly()` never does. Deploy-order rule: **a change that adds a
+migration deploys the collector first**, or the MCP server queries a column
+that doesn't exist yet. `baseline_history` (deferred, below) will be the
+first real exercise of this rule.
+
+**D6. SDK is `mcp>=2.2,<3`.** In 2.x `FastMCP` is gone —
+`from mcp.server.fastmcp import FastMCP` raises `ModuleNotFoundError`. The
+server is `mcp.server.mcpserver.MCPServer`. Training data for most coding
+agents predates 2.x; the build prompt names the import explicitly.
+
+**D7. Every tool is a plain `def`, never `async def`.** Verified in the
+2.2.0 source (`func_metadata.py`): a sync tool runs via
+`anyio.to_thread.run_sync`, an async tool runs on the event loop. Every
+tool does blocking SQLite I/O. Separate process means an `async` tool can
+no longer stall the collector, but it would still serialize every
+concurrent tool call and the `/health` endpoint behind one slow query.
+Pinned by a test, same shape and same reason as
+`test_route_handler_is_sync_not_async`.
+
+**D8. Transport security: explicit allowed hosts.** The SDK enables
+DNS-rebinding protection by default for `127.0.0.1` and allows only
+`localhost` Host headers. Behind a Docker port map, a request to
+`192.168.99.204:8088` is rejected. Allowed hosts come from an env var in
+`compose.yaml` (not `.env` — it isn't a secret), defaulting to the LXC's
+LAN IP with port, `127.0.0.1:*`, `localhost:*`. WireGuard clients route to
+the LAN IP, so no extra entry is needed today. If this ever sits behind
+the reverse proxy under a hostname, that hostname must be added or every
+request returns 421. This is a live-verification item — no mocked test
+sends a real LAN Host header.
+
+**D9. `GET /health` on the MCP app.** `/mcp` expects JSON-RPC over POST; an
+Uptime Kuma GET gets 405/406 and says nothing useful. `/health` opens
+`connect_readonly()`, runs one query, reports schema version. "Up" means
+"can read the database," not "uvicorn is listening."
+
+**D10. Client and trust model.** Primary client is Claude Code on the Mac
+(`claude mcp add --transport http dealwatch http://<lxc>:8088/mcp`),
+including via Remote Control from the phone. The model never connects to
+the server; the client does, from inside the LAN. Consequences recorded on
+purpose:
+
+- **Tool results leave the network** as conversation content sent to the
+  model provider. For eBay listing data this is accepted.
+- **claude.ai/mobile connectors are out.** They connect from the provider's
+  cloud and need an internet-reachable endpoint, which §3.1 rules out. No
+  Cloudflare tunnel for this service.
+- **Open WebUI** is a supported secondary client. With local models
+  nothing leaves the LAN, but small models are measurably worse at
+  multi-step tool use; not a verification target for V1.0.
+- **Prompt injection lives on the client side, not here.** Listing titles
+  and seller names are attacker-controlled text. The server can't be made
+  to do anything harmful by them — no tool takes a path, URL, or SQL, and
+  none writes or makes network calls. The exposure is a client with shell
+  access (Claude Code's Bash, Hermes) reading a crafted title and proposing
+  an action. Mitigation is the client's permission prompt: no auto-accept
+  or `--dangerously-skip-permissions` in sessions with this server
+  attached, and no attaching it to an agent that acts without a human
+  approving. Tool descriptions state that returned text is marketplace data,
+  never instructions — that lowers the odds, it is not a control.
+- No `docker.sock` mount, non-root uid 10001, same as the collector.
+
+**D11. Tools are shaped around questions, not tables.** A table-shaped tool
+hands the model raw rows and lets it re-derive every trap in CLAUDE.md
+(NULL lifespans, dry-run alert rows, `?` buckets, auction prices, rejected
+listings poisoning a minimum). A question-shaped tool encodes the
+exclusions once and states them in its description. The set is capped at
+eight for V1.0; a question that fits none of them is evidence a tool is
+shaped wrong, not automatically a ninth tool.
+
+**D12. Curated tools only; no SQL tool.** `mode=ro` stops writes, not a
+runaway query — a long read blocks WAL checkpointing and holds a worker
+thread, and a raw SQL tool bypasses every exclusion D11 exists to encode.
+Revisit if the curated set keeps hitting walls.
+
+**D13. `profile_id` is not a tool argument.** One profile exists; the
+server loads it at startup the same way the collector does, and a profile
+edit needs both containers restarted (`docker compose restart dealwatch
+dealwatch-mcp`) or they disagree. Multi-profile is a later milestone and
+has known prerequisites (`docs/learnings.md` L2).
+
+### Conventions shared by every tool
+
+- **Money:** both `*_cents` (int) and `*_display` (`"$215.00"`), computed
+  in Python. The model never divides by 100.
+- **Time:** epoch int plus an LA-local display string plus an age
+  (`"3h 12m ago"`). "Today" means the LA calendar day via
+  `la_day_bounds()`, never UTC — a UTC day flips visibly at 5pm local.
+- **Every response** carries `as_of` and `profile_id`, so a pasted result
+  is self-dating.
+- **Bounded output.** Every list has a `limit` with a hard server-side
+  ceiling, and every truncated list says so (`"showing 20 of 143"`). An
+  unbounded result is a context-window problem for the client and a
+  silent truncation risk.
+- **Price selection** goes through `engine.baselines.select_price()` — the
+  one rule already shared by baselines and scoring. No tool reimplements
+  total-vs-price.
+- **Scoring** goes through `engine.scoring.score_listing()` with the same
+  latest-observation input `evaluate()` uses. No tool reimplements the
+  ladder.
+- **Descriptions carry caveats, not just purpose.** The description is the
+  only documentation the model reads. A caveat that lives in design.md but
+  not in the description does not exist from the model's point of view.
+- **Not found is data, not an exception** (`{"found": false, "item_id":
+  ...}`), so the model can say "no such listing" instead of reporting a
+  tool failure.
+
+### Tool contracts
+
+Arguments marked `?` are optional. Return shapes are the intent; field
+names may move during the build but the content may not shrink without an
+addendum here.
+
+---
+
+**1. `get_system_health()`**
+
+*Answers:* Is DealWatch working? When was the last sweep? When's the next
+one? How much budget is left?
+
+*Returns:* `collect_status()`'s payload reduced to verdicts plus the
+numbers behind them: collector rollup (`healthy`/`degraded`/`unknown`,
+reusing `indicators.py`'s rollup — never re-derived), last poll and last
+recorded sweep with ages, next sweep **estimate**, budget used/ceiling/
+pacing, baselines age, sweep coverage and bookkeeping consistency.
+
+*Caveats in description:*
+- Next sweep is `last_sweep_started_at + sweep_interval_minutes`,
+  estimated from outside the collector. It is not the collector's schedule.
+  Once the estimate is in the past, the field reads "overdue by N min"
+  and the rollup is authoritative for whether the collector is alive.
+- Sweep timestamps are cycle start, not completion.
+- Baselines are recomputed manually; a stale age is a to-do, not a fault.
+
+---
+
+**2. `query_listings(period?, seen_since?, seen_before?, generation?,
+cpu_family?, ram_tier?, title_contains?, state?, spec_status?,
+max_price?, group_by?, limit?)`**
+
+*Answers:* How many listings appeared today? How many were Gen X? How many
+titles contain "X"? How many times has config X been listed? Lowest price
+config X has been listed at? How many are ok/partial/rejected/not_target?
+
+*Arguments:* `period` is `today|7d|30d|all` (default `all`), mutually
+exclusive with explicit `seen_since`/`seen_before`. `state` is
+`active|gone|any` (default `any`). `spec_status` defaults to **all
+statuses**. `group_by` is one of `generation | cpu_family | ram_tier |
+bucket_key | spec_status | day`. `title_contains` is a parameterized
+case-insensitive substring match, never interpolated.
+
+*Returns:* total count, a `spec_status` breakdown always (regardless of
+`group_by`), grouped counts if requested, min and median price across
+matching listings' observations, and up to `limit` example rows (item_id,
+title, spec_status, bucket_key, current price, first seen, link).
+
+*Caveats in description:*
+- "Appeared" means **first seen by DealWatch** (`first_seen`), not eBay's
+  listing date. With 5-minute `newlyListed` polling these agree within
+  minutes for genuinely new listings. Listings that existed before the
+  collector started all share its start date.
+- Default includes rejected and not_target rows. Counting "Gen 2 laptops"
+  with defaults includes rejected T14s/barebones/lots — the always-present
+  `spec_status` breakdown exists so this is visible.
+- Min/median price **exclude** rejected and not_target rows regardless of
+  the `spec_status` filter — a barebones board is always the "lowest
+  ever" otherwise. Price via `select_price()`; listings with no usable
+  price are excluded from price stats and counted.
+- `title_contains` is substring matching: "i5" also matches "ci5" and
+  "i5-1135G7". For normalized CPU counts use `cpu_family`.
+- **A relisted machine gets a new item_id and cannot be linked to its
+  earlier listing.** This counts listings, not machines.
+- Generation/cpu/ram filters match normalized fields; partial listings may
+  lack the field and won't match.
+
+---
+
+**3. `find_deals(generation?, cpu_family?, ram_tier?, max_price?,
+limit?)`**
+
+*Answers:* What's worth buying right now? Which active listings have the
+largest discount against their baseline?
+
+*Eligibility (own, documented, deliberately not "would alert"):* active;
+`spec_status` in ok/partial; complete `bucket_key` (no `?`); usable price.
+Scored with `score_listing()`, sorted by `ratio_to_p25` ascending.
+
+*Returns:* two separate lists. **`deals`**: ratio to p25 and p50, price,
+baseline layer (`computed`/`seed`), baseline `n`, bucket, age, link.
+**`sanity_flagged`**: listings under the sanity floor, returned apart from
+`deals` and never ranked with them.
+
+*Caveats in description:*
+- Sanity-flagged listings are almost always a missing reject rule, not a
+  deal. They are shown so a human can inspect them.
+- A discount against a **seed** baseline is a discount against an
+  estimate; against **computed** it's against `n` real sold-proxy prices.
+  Always report the layer and `n` alongside a ratio.
+- This is not "would alert": cooldown, re-alert-on-drop, buying ceiling,
+  variation handling, and the ratio trigger are not applied. (Gate-level
+  "why didn't this alert" is deferred — see `check_gates()` below.)
+- Baselines come from listings that vanished quickly, a proxy for sold —
+  not sold prices. No sold-price data exists (§2).
+
+*Cost note for the build:* scores every eligible active listing per call
+(~1,000 `score_listing()` calls, each a baselines point read). Measure
+during the build; if it's slow, cache per-call results with a short TTL the
+way `get_payload()` does rather than changing the scoring path.
+
+---
+
+**4. `explain_listing(item_id_or_url)`**
+
+*Answers:* Tell me about this listing. Why was it rejected? When did it
+first appear? How long has it been active? What's the lowest price it's
+listed at? Has it alerted?
+
+*Input:* an item_id (`v1|…|…`) or an eBay item URL; the server extracts the
+legacy item number and resolves it.
+
+*Returns:*
+- Identity: title, seller, condition, link, variation flag.
+- Normalization: stored `spec_status`, `reject_rule_id`, `bucket_key`,
+  spec fields — **and** a fresh `normalize_verbose()` run on the stored
+  title/raw fields against the current profile, with an explicit
+  `matches_stored: bool`.
+- Timeline: `first_seen`, eBay `itemCreationDate` (read from this one
+  listing's `raw_json`), `last_seen`, `gone_at`, active age or lifespan.
+- Price history: every observation (price, shipping, total, buying
+  options), plus lowest/highest/current.
+- Score (if active and scoreable): same fields as `find_deals`.
+- Alert history: every `alerts` row for the item, `dry_run` and notifier
+  shown per row.
+
+*Caveats in description:*
+- Stored rejection reflects the profile live at the row's last
+  normalization. `matches_stored: false` means the profile changed since
+  and a backfill hasn't run — report both, don't pick one.
+- `first_seen` is discovery; `itemCreationDate` is eBay's listing date.
+  For listings older than the collector, active age from `first_seen` is
+  an undercount.
+- `lifespan_mins` NULL means **the listing was never confirmed by a sweep,
+  so its duration was never measured** — not zero, not unknown-because-
+  missing. A 0 means it was swept and died within the minute.
+- `gone` means disappeared from search: sold, ended, or pulled. DealWatch
+  cannot distinguish them.
+- `dry_run` alert rows were never delivered.
+
+---
+
+**5. `trace_title(title)`**
+
+*Answers:* How would this title be parsed? Would this be rejected, and by
+which rule? (The reject-rule design loop.)
+
+*Returns:* `normalize_verbose()`'s result and trace: each reject/require
+rule and whether it fired, extracted fields, derived fields, tiers,
+`bucket_key`, final `spec_status`. No database access.
+
+*Caveats in description:* title-only input. The collector also feeds
+structured fields from the raw listing (`normalize_input_fields()`), so a
+title traced here can normalize differently from the same listing
+collected live. For a real listing use `explain_listing`.
+
+---
+
+**6. `get_market_price(generation, cpu_family, ram_tier)`**
+
+*Answers:* What's a fair price for X? Is there a real baseline for it or
+just a seed? How close is it to getting one?
+
+*Returns:* the `bucket_key` those fields form; which layer resolves
+(computed row, or which seed entry and why — most-matched-keys); p25/p50
+(and p10 when computed) with `n` and `computed_at`; fast-candidate count
+vs. `min_samples` when no computed baseline exists (via the same
+`group_fast_candidates_by_bucket()` `baseline_queue()` uses); and
+**p25 at alert time** — the `baseline_p25_cents`/`baseline_layer` stored
+on this bucket's `alerts` rows over the last 30 days.
+
+*Caveats in description:*
+- There is **no baseline history**. `baselines` is overwritten on each
+  manual recompute. The alert-time series shows what p25 actually was when
+  this bucket alerted — it has gaps wherever nothing alerted and is not a
+  continuous trend. Do not describe it as one.
+- Computed baselines are last-observation prices of listings that vanished
+  inside `fast_lifespan_hours` — a sold proxy, not sold prices.
+- Seed values are hand-authored estimates.
+
+---
+
+**7. `get_alert_activity(days?)`**
+
+*Answers:* What has DealWatch been alerting on? How often? What were the
+best ones?
+
+*Returns:* per-day live vs. dry-run counts (reusing `alerts_per_day()`),
+best ratio per day with layer (`best_ratio_per_day()`), and recent alert
+events — **one entry per alert event**, with notifiers and delivery
+statuses nested under it.
+
+*Caveats in description:*
+- Since V0.9a one alert event writes one row per notifier. Counting raw
+  rows overcounts events; the tool groups them.
+- Dry-run rows were not delivered, and some days' dry-run volume is
+  calibration traffic, not market activity.
+- The best-ratio series has no dry-run filter, matching the dashboard
+  (V0.12b parity decision).
+
+---
+
+**8. `get_review_queue(limit?)`**
+
+*Answers:* What needs my attention?
+
+*Returns:* active sanity-flagged listings (each is a probable missing
+reject rule), the most recent `partial` listings with which bucket field is
+missing, `pending` count (non-zero means normalization is stuck), buckets
+nearest to a computed baseline, baselines age, negative-lifespan drop count
+(`docs/learnings.md` L3).
+
+*Caveats in description:* each section is a to-do list for profile or
+baseline work, not a fault report. Anything that is a fault shows up in
+`get_system_health`.
+
+---
+
+### Deliberately deferred
+
+- **`check_gates()` extraction.** `evaluate()` short-circuits with
+  `continue` and returns survivors, not reasons, so "why didn't this
+  alert" can't be answered without changing the alerting path.
+  Reimplementing the gates inside the MCP server is rejected outright —
+  it's the two-triggers drift CLAUDE.md already records. The fix is a
+  per-item function that `evaluate()` itself calls, sabotage-verified
+  against the existing gate tests, in its own milestone.
+- **`baseline_history` table.** Needed before "how has p25 changed" has an
+  honest answer. Rejected alternative: reconstructing p25-as-of-date on
+  demand, which runs today's rules over past data and produces a line
+  that looks like history and isn't. Pairs naturally with scheduling the
+  recompute, which is its own open item. First exercise of D5's
+  deploy-order rule.
+- **Raw SQL tool** (D12).
+- **Internet-reachable access** (D10). Closed, not deferred.
+
+### Build plan
+
+**Prompt 1 — skeleton, proves the plumbing.** `compose.yaml` service,
+`pyproject.toml` pin, `server.py` with `/health`, D7's sync pin test, D8's
+allowed hosts, and three tools: `get_system_health`, `trace_title`,
+`explain_listing`. `trace_title` is DB-free and `explain_listing` touches
+every table, so together they prove transport, host headers, WAL access,
+and SDK wiring before any breadth.
+
+Live verification (mocks can't provide):
+1. `docker logs dealwatch-mcp` shows no poll or sweep lines, and `/health`
+   on the collector shows budget usage rate unchanged after deploy (D2).
+2. `docker exec dealwatch-mcp env` shows no eBay/Discord/Pushover
+   variables (D3).
+3. `curl http://192.168.99.204:8088/health` from the Mac returns 200 with
+   schema version (D8, D9).
+4. `claude mcp add` from the Mac; Claude Code lists all three tools and
+   `explain_listing` on a real item_id returns data matching a hand-run
+   query on the LXC host.
+5. Same over WireGuard off-LAN.
+6. `docker compose up -d --build dealwatch-mcp` while tailing
+   `docker logs dealwatch` — the collector is not recreated.
+
+**Prompt 2 — breadth.** The remaining five tools against the conventions
+above, each field that encodes an exclusion sabotage-checked (e.g. drop
+the rejected-row exclusion from `query_listings`' min price; drop the
+notifier grouping from `get_alert_activity`; merge `sanity_flagged` into
+`deals`) and confirmed red.
+
+Live verification: every question in this section asked in plain language
+through Claude Code, and at least one answer per tool checked against a
+hand-written query on the LXC host that **copies the tool's own predicate**
+(`docs/learnings.md` L13).
+
+### Before prompt 1
+
+- Read `dealwatch/config.py` for required `Settings` fields (D3).
+- Confirm the 2.2 `MCPServer` streamable-HTTP app API and how its session
+  manager lifespan is run when it's the top-level app (D1, D9 add a
+  `/health` route alongside it).
