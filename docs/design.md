@@ -2261,3 +2261,128 @@ hand-written query on the LXC host that **copies the tool's own predicate**
 - Confirm the 2.2 `MCPServer` streamable-HTTP app API and how its session
   manager lifespan is run when it's the top-level app (D1, D9 add a
   `/health` route alongside it).
+
+### Build addendum (prompt 1, 2026-09-16)
+
+`dealwatch/mcp_server/` (`server.py`, `item_lookup.py`, `formatting.py`),
+`compose.yaml`'s `dealwatch-mcp` service, `Settings.mcp_allowed_hosts`.
+Resolved `mcp` version: **2.2.0**. Every SDK fact the build prompt listed
+was independently confirmed against this installed version (a throwaway
+probe tool, a `grep` of the installed package for the session-termination
+log line, and a Starlette `TestClient` round trip) before writing
+`server.py`, not assumed from the prompt's own claims.
+
+**D3 checked, not just assumed.** `dealwatch/config.py`'s `Settings` has
+no required fields - every one has a default - so a `dealwatch-mcp`
+container with no `.env` starts cleanly. `daily_reserve_calls`'s comment
+corrected in the same pass: it was headroom for "manual/MCP queries," but
+V1.0 makes zero eBay calls and never touches `DailyBudget` - the reserve
+is for manual use only.
+
+**D14 - stateless + JSON responses, confirmed necessary, not just
+convenient.** A stateful session lives in the container's own memory, so
+every `docker compose up -d --build dealwatch-mcp` (an ordinary
+"iterated on a tool description" redeploy) would kill every connected
+client's session and error it until reinitialized. Read-only
+request/response tools need no session state and no server-push streams -
+`stateless_http=True, json_response=True` sidesteps that failure mode
+entirely rather than working around it after the fact.
+
+**A ninth SDK fact, found while writing tests/test_mcp_server.py, not in
+the build prompt's list of eight:** a `StreamableHTTPSessionManager`'s own
+`.run()` can only be entered once per instance - `with TestClient(app) as
+client:` calls that on startup, so the ONE module-level `app` a real
+deploy needs (uvicorn starts its lifespan exactly once) cannot be reused
+across more than one `with TestClient(...)` block in a test session.
+Confirmed by literally hitting `RuntimeError: StreamableHTTPSessionManager
+.run() can only be called once per instance` on the second such block in
+this test file. Fixed by extracting `_build_app()` - the exact
+`mcp.streamable_http_app(...)` call server.py's own top-level `app` uses -
+so any test needing the HTTP layer builds a fresh Starlette app backed by
+the same `mcp` tool registry instead of reusing the shared one. Not a
+production concern (uvicorn only ever calls this once), but the next
+prompt's tests will hit the identical wall without this.
+
+**A tenth SDK fact, also found while writing the same test file:** the
+`@mcp.tool()` decorator returns the original function object unchanged
+(confirmed via `id()`/identity check before relying on it) - every tool
+in this module is callable directly as a plain Python function
+(`mcp_server.explain_listing(item_id_or_url=...)`), which is what most of
+`tests/test_mcp_server.py` does instead of round-tripping through
+`TestClient` + JSON-RPC for every case. Only the one explicitly
+"end-to-end" test goes through the real HTTP/JSON-RPC layer.
+
+**Testability finding: Settings must be re-read per call, not captured at
+module import, for anything a test needs to vary.** `server.py`'s
+`profile`/`compiled_seeds`/`_allowed_hosts`/`app` are genuinely fixed at
+process start (D8, D13 - a real config change needs a restart either way)
+and are captured once, at import time, matching main.py's own
+`profile`/`templates` precedent. `db_path` and the budget ceiling
+inputs are different: `_readonly_conn()` and `get_system_health()` both
+call `get_settings()` FRESH internally rather than closing over a
+module-level `settings` variable - the same escape hatch main.py's own
+`dashboard()` route already uses (`live_settings = get_settings()` inside
+the handler body, despite `Settings` being `lru_cache`d) - so a test can
+monkeypatch `DB_PATH` + `get_settings.cache_clear()` and have the very
+next tool call see a different database, without reimporting this module
+or rebuilding `mcp`/`app`. Discovered by writing the tests, not
+anticipated up front - the first draft closed over a module-level
+`settings.db_path` and every test needing a different tmp_path database
+would have required a subprocess.
+
+**Env var name resolved, not the prompt's speculative one.**
+`dealwatch/config.py` has no `env_prefix` on `Settings`, so
+`mcp_allowed_hosts` maps directly to `MCP_ALLOWED_HOSTS` - not
+`DEALWATCH_MCP_ALLOWED_HOSTS` as D8's own build-prompt text guessed. Kept
+consistent with the existing `DB_PATH`/`PROFILE_PATH` naming.
+
+**Logger silenced:** `mcp.server.streamable_http` (found by grepping the
+installed package for the exact "Terminating session: %s" log call) -
+set to `WARNING` in `server.py`, independent of `main.py`'s own
+`logging.basicConfig()` (a separate process, a separate entrypoint,
+nothing to inherit from).
+
+**Tool contract deviation - `get_system_health`'s "last poll" field.**
+§15's tool contract lists "last poll and last recorded sweep with ages."
+`collect_status()` has no persisted "last poll" timestamp to read: a fast
+poll against a quiet market writes no row at all (`record_sighting()`'s
+own contract), and the only in-process poll-liveness counter
+(`CollectorStats.last_poll_at`) lives in the COLLECTOR's memory, reachable
+only through `dealwatch.main`'s `app.state` - which D2 forbids importing.
+Reported `last_price_change` instead (the newest observed price/shipping/
+buying-option change, `collect_status()`'s own `last_price_change_at`),
+labeled and caveated as what it actually is rather than mislabeled as a
+poll-liveness signal it cannot honestly be. This is a real content gap
+against the original sketch, not a renaming - flagging it here per this
+section's own rule that field names may move but content may not shrink
+without an addendum.
+
+**Score section scope, stated explicitly:** `explain_listing`'s score
+section skips scoring for exactly three reasons (not active, incomplete
+`bucket_key`, no usable price) - the conditions under which
+`score_listing()` itself cannot run at all. It does not re-check the
+alert-only gates (`spec_status`, variation handling, cooldown, buying
+ceiling) from `engine.alerting.evaluate()` - those decide whether
+something would ALERT, not whether it CAN be scored, and reimplementing
+them here would be exactly the "two triggers, one path" drift CLAUDE.md
+already warns about. `check_gates()` (deliberately deferred, above) is
+the real answer to "why didn't this alert."
+
+**Places this build did NOT touch**, confirming the out-of-scope list
+held: no change to `engine/`, `normalize/`, `storage/`, `reporting/`,
+`notify/`, `providers/`, `dashboard/`, `main.py`, or `scripts/`; no
+`Dockerfile` change (`compose.yaml` only, tagging the existing image and
+adding a second service that references it); no schema/migration change.
+
+**Not verified in this checkout:** no Docker daemon was available, so the
+real `docker build`/`docker run`/`docker compose config` end-to-end
+sequence V0.11's own build addendum used could not be repeated here.
+Checked instead: `python -m build --wheel` followed by inspecting the
+resulting wheel confirms `dealwatch/mcp_server/{__init__,server,
+item_lookup,formatting}.py` all ship under hatchling's existing
+`packages = ["dealwatch"]` config, same mechanism V0.11's own addendum
+already confirmed for `dashboard/templates/` - no new `pyproject.toml`
+packaging config was needed. `docker compose config` (docker itself WAS
+available, just not the daemon) resolved `compose.yaml` cleanly, confirmed
+`dealwatch-mcp` carries no eBay/Discord/Pushover environment keys while
+`dealwatch` does. Full live verification is Myke's, per the build plan.

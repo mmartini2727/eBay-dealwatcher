@@ -1,6 +1,11 @@
 services:
   dealwatch:
     build: .
+    # Tagged so dealwatch-mcp (below) can reference the SAME image by name
+    # instead of declaring its own `build: .` - one build, two containers
+    # running byte-identical code (design.md §15 D1). The only change made
+    # to this service for V1.0.
+    image: dealwatch:local
     container_name: dealwatch
     restart: unless-stopped
     env_file:
@@ -12,3 +17,32 @@ services:
       - ./profiles:/app/profiles:ro
     environment:
       - TZ=America/Los_Angeles
+
+  # V1.0 (design.md §15): read-only MCP server, same image as the
+  # collector above, separate process (D1/D2 - never imports
+  # dealwatch.main, so mounting this alongside the collector cannot start
+  # a second one). No `env_file` (D3) - this container gets no eBay,
+  # Discord, or Pushover secrets; Settings() here is used only for
+  # db_path, profile_path, and mcp_allowed_hosts.
+  dealwatch-mcp:
+    build: .
+    image: dealwatch:local
+    container_name: dealwatch-mcp
+    restart: unless-stopped
+    command: ["uvicorn", "dealwatch.mcp_server.server:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8088:8000"
+    volumes:
+      # Read-write (D4), not :ro - mode=ro is enforced at the sqlite
+      # connection level (connect_readonly()), not the mount: a mode=ro
+      # WAL reader still needs to write the -shm file, which a read-only
+      # bind mount would block on first query.
+      - ./data:/app/data
+      - ./profiles:/app/profiles:ro
+    environment:
+      - TZ=America/Los_Angeles
+      # D8: the real LAN value. Settings has no env_prefix
+      # (dealwatch/config.py), so the field `mcp_allowed_hosts` maps
+      # directly to MCP_ALLOWED_HOSTS - not a secret, so this lives here
+      # rather than in .env.
+      - MCP_ALLOWED_HOSTS=192.168.99.204:8088,127.0.0.1:*,localhost:*
