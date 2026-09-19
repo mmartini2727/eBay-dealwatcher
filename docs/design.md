@@ -2386,3 +2386,64 @@ packaging config was needed. `docker compose config` (docker itself WAS
 available, just not the daemon) resolved `compose.yaml` cleanly, confirmed
 `dealwatch-mcp` carries no eBay/Discord/Pushover environment keys while
 `dealwatch` does. Full live verification is Myke's, per the build plan.
+
+### Live verification (prompt 1, 2026-09-18)
+
+Run against the real LXC. Three things worth recording while they were
+fresh.
+
+**1. The `image:` tag change caused container drift - a `compose.yaml`
+edit is a shared-code-class deploy, even when it looks like it only
+touches one service's stanza.** Mid-session, `compose.yaml` gained an
+explicit `image: dealwatch:local` tag on both services (to make them
+provably share one build - see the earlier review exchange on this same
+file). The natural next step, an MCP-only code change, called for a
+TARGETED redeploy: `docker compose up -d --build dealwatch-mcp`. That
+left `dealwatch` (the collector) running under its OLD, pre-tag,
+auto-generated image reference for roughly a day - `up` only recreates
+the service(s) it's told to; it doesn't re-evaluate whether some OTHER,
+unnamed service's compose-file-level config changed. Caught with
+`docker ps -a --format '{{.Names}}\t{{.Image}}'`, which showed the two
+containers pointing at two DIFFERENT image references despite
+`compose.yaml` declaring one shared tag for both - no error, no log line,
+nothing but that one command surfacing the mismatch. Fixed with the
+unqualified `docker compose up -d --build` a `compose.yaml` edit already
+calls for (CLAUDE.md's deploy-modes rule for a shared-code change).
+Recorded in CLAUDE.md's deploy modes directly, not only here - this is a
+deploy-mode class of mistake (any `compose.yaml` edit is shared-code-
+class), not an MCP-specific one.
+
+**2. "Connected" is not "called."** The first attempt at build-plan step
+5 (`claude mcp add`, then asking Claude Code for system health and to
+explain a real listing) produced a confident, detailed, and ENTIRELY
+UNVERIFIED answer - apparently reconstructed from the dashboard already
+open on port 8087, not from an actual tool call. It included plausible
+fabrications this server does not and cannot produce: `n=12` (the real
+field is `baseline_n`, and nothing computed 12 for this listing) and
+"cleared every alert gate" (no tool here evaluates alert gates at all -
+that's `engine/alerting.py`'s `evaluate()`, explicitly out of scope for
+`explain_listing`). The only real evidence a tool call happened is the
+SERVER's own log, not the client's narration, however confident and
+domain-plausible it sounds. Same class of failure as a test passing for
+the wrong reason - recorded as `docs/learnings.md` L14. Step 5's
+verification method going forward: check `dealwatch-mcp`'s own log for
+the actual JSON-RPC exchange before trusting any client-reported answer,
+same "copy the real predicate, don't paraphrase it" discipline L13
+already states for ad-hoc SQL, applied here to ad-hoc tool verification.
+
+**3. Two open items surfaced by real production data - neither a V1.0
+defect, both now in CLAUDE.md's Open items:**
+  - Sweep coverage measured at 96.3% - just above `COVERAGE_WARN_PCT`
+    (95%) - with a NULL-`lifespan_mins` listing appearing in the very
+    first `explain_listing` sample checked by hand. Same shape as the
+    existing "Never-swept rate" open item (design.md §4.4/§4.7): a
+    listing never confirmed present by a sweep. Not investigated further
+    here - the follow-up is the unmeasured-vs-total-gone ratio; a high
+    ratio points at sweep pagination, not at anything this milestone
+    touched.
+  - Baselines last recomputed roughly 6 days ago - alerts are scoring
+    against stale percentiles right now. `scripts/recompute_baselines.py`
+    remains manual-only, exactly as documented; this is live evidence for
+    doing the "schedule the recompute" work this section's own
+    Deliberately Deferred list already pairs with `baseline_history`,
+    rather than a new problem to design around.

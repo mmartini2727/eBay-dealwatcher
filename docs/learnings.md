@@ -343,3 +343,33 @@ The rule: when a live check exists to verify a module's assumption, its
 SQL predicate must be the module's own predicate, not a restatement of
 what the predicate is "supposed to mean." If copying it exactly feels
 redundant, that redundancy is the point.
+
+## L14 - "connected" is not "called": a confident client narration is not evidence a tool ran
+
+V1.0 prompt 1's live verification (design.md §15, step 5: `claude mcp add`
++ ask Claude Code for system health and to explain a real listing) - the
+first attempt produced a confident, detailed, and ENTIRELY UNVERIFIED
+answer. It read like a real `explain_listing()` result, but at least two
+fields in it do not exist anywhere in this server's actual output shape:
+`n=12` (this server's score section calls it `baseline_n`, and nothing
+computed 12 for this listing) and "cleared every alert gate" (no tool in
+this server evaluates alert gates at all - that's `engine/alerting.py`'s
+`evaluate()`, explicitly out of scope for `explain_listing`, per its own
+docstring). The client had a dashboard open on port 8087 in the same
+session and, plausibly, answered from that instead of actually calling
+the tool - nothing about the ANSWER made this obvious; it was fluent,
+specific, and wrong in a way that read as right.
+
+The only evidence a tool call actually happened is the SERVER's own log
+(or an explicit trace of the JSON-RPC exchange) - never the client's
+narration of what it did, no matter how confident or detailed. A
+distinguishing detail is not the same as a real observation; "cleared
+every alert gate" sounds like something a real tool would say precisely
+because it's plausible domain language, not because anything checked it.
+
+Same class of failure as a test that passes for the wrong reason (L8's
+sabotage discipline, extended past testing into live use): a check that
+LOOKS like it exercised the thing being verified, without actually doing
+so. The fix is procedural, not technical - when verifying an MCP tool (or
+any tool-calling client) actually ran something, check the callee's own
+side, not the caller's summary of it.
