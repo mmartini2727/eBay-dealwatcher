@@ -2447,3 +2447,165 @@ defect, both now in CLAUDE.md's Open items:**
     doing the "schedule the recompute" work this section's own
     Deliberately Deferred list already pairs with `baseline_history`,
     rather than a new problem to design around.
+
+### Build addendum (prompt 2, 2026-09-19)
+
+The remaining five tools: `query_listings`, `find_deals`, `get_market_price`,
+`get_alert_activity`, `get_review_queue`. No change to `engine/`,
+`normalize/`, `storage/`, `reporting/`, `notify/`, `providers/`,
+`dashboard/`, `main.py`, `scripts/`, `Dockerfile`, or `compose.yaml`; no
+schema/migration change - confirmed by diff, not just intent.
+
+**`find_deals` timing.** No Docker daemon and an empty local
+`data/dealwatch.db` in this checkout (same limitation as prompt 1's build
+addendum), so the real production measurement the milestone asks for is
+Myke's to run (live-verification step 4, below). Measured instead against
+a synthetic fixture sized to the real deployment's rough order of
+magnitude - 1,200 active, eligible (ok/partial, complete `bucket_key`,
+usable price) listings spread across all six generations and four RAM
+tiers: **14ms**, 1,110 of the 1,200 scored as `deals` and 90 as
+`sanity_flagged`. Each eligible row costs one `score_listing()` call,
+which is one `baselines` point read (its primary key is `(profile_id,
+bucket_key)`) plus, on a cache miss, a linear scan of `compiled_seeds`
+(a dozen or so entries) - both cheap per row, and 1,200 rows did not
+change that. Well under the ~2s threshold the milestone sets, so **no
+cache was added** - the milestone's own instruction is explicit that a
+cache is the fallback for a slow call, not a default. If the real
+production number (larger active set, real disk I/O instead of an
+in-memory-adjacent tmp file) comes back materially different, the fix is
+still a `get_payload()`-shaped short-TTL cache, never a change to the
+scoring path itself.
+
+**Functions reused, with the signatures actually found in the source (not
+assumed from the build prompt's naming):**
+- `engine.baselines.select_price(total_cents, price_cents) -> tuple[int,
+  bool] | None` - every price resolution in all five tools.
+- `engine.baselines.nearest_rank_percentile(sorted_values, pct) -> int` -
+  reused for `query_listings`' median price stat rather than a second
+  "median" definition (`statistics.median` rounds differently on an
+  even-length list; this codebase already has one percentile
+  implementation and V0.8a's own module docstring treats it as the only
+  one).
+- `engine.baselines.derive_candidates(conn) -> list[LifespanCandidate]`
+  and `group_fast_candidates_by_bucket(candidates, fast_lifespan_hours) ->
+  dict[str, list[LifespanCandidate]]` - `get_market_price`'s
+  fast-candidate count, called only on a `baselines` miss (the same
+  short-circuit `reporting/panels.py`'s `baseline_queue()` uses to avoid
+  the derive pass when it isn't needed).
+- `engine.scoring.score_listing(conn, profile, compiled_seeds, *,
+  item_id, bucket_key, spec, price_cents, price_is_price_only,
+  item_web_url) -> ScoreResult` - `find_deals`, unchanged signature from
+  prompt 1's `explain_listing` usage.
+- `engine.scoring.resolve_seed_baseline(seeds, spec) ->
+  CompiledSeedBaseline | None` and the `BASELINE_LAYER_COMPUTED`/
+  `BASELINE_LAYER_SEED` constants - `get_market_price`'s ladder,
+  resolving the seed directly from the tool's own `generation`/
+  `cpu_family`/`ram_tier` arguments rather than a representative
+  listing's `spec_json` - see the deviation note below on why that's
+  sound here specifically.
+- `reporting.panels.baseline_queue(conn, profile_id, *, min_samples,
+  fast_lifespan_hours, compiled_seeds, limit) -> {"queue": [...],
+  "negative_lifespan_dropped": int}`, `alerts_per_day(conn, profile_id,
+  *, days, now) -> list[dict]`, `best_ratio_per_day(conn, profile_id, *,
+  days, now) -> list[dict]`, `recent_alerts(conn, profile_id, *, limit)
+  -> list[dict]` - `get_review_queue` and `get_alert_activity` call these
+  directly and return their output essentially unchanged, rather than
+  re-deriving any of the four.
+- `providers.ratelimit.la_day_bounds(now) -> tuple[int, int]` -
+  `query_listings`' `period="today"` filter, same LA-calendar-day
+  discipline as every other "today" in this codebase.
+
+**Contract deviation - `get_market_price`'s seed resolution skips the
+"representative candidate" step `baseline_queue()` needs.**
+`reporting/panels.py`'s `baseline_queue()` has to pick one dead listing's
+`spec_json` to build the spec dict `resolve_seed_baseline()` needs,
+because that function only knows a `bucket_key` and has no listing to ask
+for the field values a `bucket_key` was built from. `get_market_price`
+does not have this problem: its own arguments (`generation`, `cpu_family`,
+`ram_tier`) already ARE the field values, handed to it directly by the
+caller - `spec = {"generation": generation, "cpu_family": cpu_family,
+"ram_tier": ram_tier}` is a direct, correct construction, not a
+"which listing represents this bucket" guess. This is not a fork of
+`baseline_queue()`'s own reasoning; it is a different tool with a
+different input shape that happens not to need the step `baseline_queue()`
+needs for a different reason.
+
+**Two other small, deliberate deviations from the literal build-prompt
+text:**
+- `query_listings`' `spec_status` argument is `list[str] | None`, not
+  a single value - `None` means "every status" (the required behavior);
+  a caller narrowing to one or more specific statuses passes a list. The
+  build prompt's own signature sketch didn't specify the type.
+- `get_alert_activity` takes only `days` (no `limit`), matching §15's own
+  tool-6 signature exactly - `recent_events` uses `reporting/panels.py`'s
+  `recent_alerts()` at its own default `limit=20` rather than exposing a
+  second knob the contract doesn't ask for.
+
+**`get_review_queue`'s `partial_listings.missing_fields` reads
+`spec_json` directly, not `bucket_key`'s string positions - on purpose.**
+`reporting/panels.py`'s `baseline_queue()` docstring explicitly warns
+against reversing a `bucket_key` string's pipe-delimited positions back
+into field names, because that mapping is normally undocumented outside
+`normalize/engine.py`'s own `_build_bucket_key()`. This code doesn't do
+that: `profile.bucket_key` (a `Profile` field, not a guess) IS the
+ordered list `_build_bucket_key()` used to build the string in the first
+place, so `[f for f in profile.bucket_key if spec.get(f) is None]` is the
+authoritative mapping, not a rediscovered one. Noted here because it
+looks, at a glance, like the exact pattern that docstring cautions
+against - it isn't, but the distinction is worth writing down before
+someone "fixes" it into an actual violation of that rule.
+
+**Testing.** 18 new tests in `tests/test_mcp_server.py` (52 total for this
+file), full suite 607 passed. Every required test from the milestone's own
+list was sabotage-verified; ten went through a real manual edit-run-revert
+pass against `server.py` (not committed sabotage-test functions, matching
+prompt 1's precedent for the two hardest-to-monkeypatch checks) because
+the behavior lives in an inline query-construction or return-shape
+expression rather than behind an importable seam:
+- `query_listings` default `spec_status` (defaulting to `["ok",
+  "partial"]` dropped `total_count` from 4 to 2 and erased two statuses
+  from the breakdown).
+- `query_listings` price-stat exclusion (computing stats from `matched`
+  instead of `priceable` let a $1.00 rejected row win the minimum over a
+  real $200.00 listing).
+- `query_listings`' `title_contains` parameterization (f-string
+  interpolating the value raised `sqlite3.OperationalError: unrecognized
+  token` on a title containing a quote).
+- `find_deals`' sanity-flagged/deals split (ignoring
+  `result.sanity_flagged` put a $1.00 listing into `deals` instead of
+  `sanity_flagged`).
+- `find_deals`' bucket-key and gone-listing filters (dropped in turn; each
+  pulled exactly the excluded row - an incomplete-bucket listing, then a
+  gone one - into the eligible set).
+- `find_deals` rows carrying `baseline_layer`/`baseline_n` (omitting the
+  keys turned a real assertion into a `KeyError`).
+- `get_market_price`'s alert-time series gap discipline (a five-line
+  forward-fill turned 2 real data points into 5, the forward-filled shape
+  the milestone explicitly rules out).
+- `get_alert_activity`'s live/dry split (merging into one `count` field
+  removed `count_live`/`count_dry` entirely).
+- `get_review_queue`'s drop-count nesting (wrapping the return key in
+  `if queue_result["queue"]:` reproduced the exact V0.13 dashboard defect
+  shape - the key vanished from the response precisely when the queue was
+  empty).
+- The marketplace-caveat sentence check (stripping it from one tool's
+  description - `get_review_queue` - made the `endswith()` assertion fail
+  and name that exact tool).
+
+Every one of the ten went red with the sabotage in place and green again
+after the revert; `grep -n SABOTAGE dealwatch/mcp_server/server.py`
+returns nothing in the committed tree. The remaining required tests
+(`get_market_price`'s fast-candidate count against the real
+`group_fast_candidates_by_bucket()` output plus a naive `COUNT(*)` that
+provably diverges on the same fixture; `get_alert_activity`'s
+events-not-rows count; `get_review_queue`'s reuse of
+`panels.baseline_queue()`, verified two ways - equality against a direct
+call, and a monkeypatched stub the tool's own output is shown to follow)
+are committed, automated sabotage tests, since each targets an
+importable function this module calls rather than an inline expression.
+
+**What this cannot prove** (the milestone's own required disclosure): real
+client behavior, the actual `find_deals` timing against production data,
+and whether the tool descriptions are good enough that a model reaches
+the right conclusions from them. All three are the live-verification
+steps below, Myke's to run.

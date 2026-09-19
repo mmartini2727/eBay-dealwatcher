@@ -31,6 +31,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -133,17 +134,19 @@ def seed_observation(
 def seed_alert(
     conn, item_id, *, sent_at, dry_run=False, notifier="discord",
     delivery_status="sent", ratio_to_p25=0.9, baseline_layer="seed",
-    price_cents=9000, profile_id=PROFILE_ID,
+    price_cents=9000, profile_id=PROFILE_ID, bucket_key="1|intel-10th|16",
+    baseline_p25_cents=10000, baseline_p50_cents=15000,
 ):
     conn.execute(
         "INSERT INTO alerts (item_id, profile_id, sent_at, dry_run, price_cents, "
         "price_is_price_only, bucket_key, baseline_layer, baseline_match, baseline_n, "
         "baseline_p25_cents, baseline_p50_cents, ratio_to_p25, sanity_flagged, "
-        "delivery_status, notifier) VALUES (?, ?, ?, ?, ?, 0, '1|intel-10th|16', "
-        "?, '{}', NULL, 10000, 15000, ?, 0, ?, ?)",
+        "delivery_status, notifier) VALUES (?, ?, ?, ?, ?, 0, ?, "
+        "?, '{}', NULL, ?, ?, ?, 0, ?, ?)",
         (
             item_id, profile_id, sent_at, 1 if dry_run else 0, price_cents,
-            baseline_layer, ratio_to_p25, delivery_status, notifier,
+            bucket_key, baseline_layer, baseline_p25_cents, baseline_p50_cents,
+            ratio_to_p25, delivery_status, notifier,
         ),
     )
 
@@ -176,7 +179,10 @@ def test_every_registered_tool_is_a_sync_function():
     # a fresh subprocess, confirmed it failed, then reverted. See the
     # report for the red/green transcript.
     tools = mcp_server.mcp._tool_manager.list_tools()
-    assert {t.name for t in tools} == {"get_system_health", "trace_title", "explain_listing"}
+    assert {t.name for t in tools} == {
+        "get_system_health", "query_listings", "find_deals", "trace_title",
+        "explain_listing", "get_market_price", "get_alert_activity", "get_review_queue",
+    }
     for tool in tools:
         assert not tool.is_async, f"{tool.name} is registered as an async tool"
 
@@ -821,7 +827,10 @@ def test_end_to_end_tools_list_and_explain_listing_over_http(tmp_path, monkeypat
         )
         assert list_response.status_code == 200
         tool_names = {t["name"] for t in list_response.json()["result"]["tools"]}
-        assert tool_names == {"get_system_health", "trace_title", "explain_listing"}
+        assert tool_names == {
+            "get_system_health", "query_listings", "find_deals", "trace_title",
+            "explain_listing", "get_market_price", "get_alert_activity", "get_review_queue",
+        }
 
         found_response = _call_over_http(
             client, "explain_listing", {"item_id_or_url": "v1|1111|0"}, request_id=2
@@ -862,6 +871,56 @@ def test_end_to_end_tools_list_and_explain_listing_over_http(tmp_path, monkeypat
         trace_payload = json.loads(trace_result["content"][0]["text"])
         assert trace_payload["profile_id"] == PROFILE_ID
         assert "trace" in trace_payload
+
+        # V1.0 prompt 2 - the five new tools, same wire-serialization check:
+        # a tool can hand back a perfectly good Python dict that still
+        # fails at the JSON-RPC boundary, and every direct-call test
+        # elsewhere in this file would stay green while a real client got
+        # isError: true. Each is called once over the real HTTP/JSON-RPC
+        # layer, asserting isError: false and that the content parses.
+        query_response = _call_over_http(client, "query_listings", {}, request_id=6)
+        assert query_response.status_code == 200
+        query_result = query_response.json()["result"]
+        assert query_result["isError"] is False
+        query_payload = json.loads(query_result["content"][0]["text"])
+        assert query_payload["profile_id"] == PROFILE_ID
+        assert "total_count" in query_payload
+
+        deals_response = _call_over_http(client, "find_deals", {}, request_id=7)
+        assert deals_response.status_code == 200
+        deals_result = deals_response.json()["result"]
+        assert deals_result["isError"] is False
+        deals_payload = json.loads(deals_result["content"][0]["text"])
+        assert deals_payload["profile_id"] == PROFILE_ID
+        assert "deals" in deals_payload
+
+        price_response = _call_over_http(
+            client, "get_market_price",
+            {"generation": "1", "cpu_family": "intel-10th", "ram_tier": "16"},
+            request_id=8,
+        )
+        assert price_response.status_code == 200
+        price_result = price_response.json()["result"]
+        assert price_result["isError"] is False
+        price_payload = json.loads(price_result["content"][0]["text"])
+        assert price_payload["profile_id"] == PROFILE_ID
+        assert "baseline" in price_payload
+
+        activity_response = _call_over_http(client, "get_alert_activity", {}, request_id=9)
+        assert activity_response.status_code == 200
+        activity_result = activity_response.json()["result"]
+        assert activity_result["isError"] is False
+        activity_payload = json.loads(activity_result["content"][0]["text"])
+        assert activity_payload["profile_id"] == PROFILE_ID
+        assert "recent_events" in activity_payload
+
+        queue_response = _call_over_http(client, "get_review_queue", {}, request_id=10)
+        assert queue_response.status_code == 200
+        queue_result = queue_response.json()["result"]
+        assert queue_result["isError"] is False
+        queue_payload = json.loads(queue_result["content"][0]["text"])
+        assert queue_payload["profile_id"] == PROFILE_ID
+        assert "negative_lifespan_dropped" in queue_payload
 
 
 # ---------------------------------------------------------------------------
@@ -984,3 +1043,494 @@ def test_explain_listing_computes_a_real_score_against_a_seed_baseline(tmp_path,
     assert result["score"]["baseline_layer"] in ("seed", "computed")
     assert result["score"]["price_cents"] == 10000
     assert result["score"]["ratio_to_p25"] == pytest.approx(10000 / result["score"]["baseline_p25_cents"])
+
+
+# ---------------------------------------------------------------------------
+# V1.0 prompt 2 - the five remaining tools (design.md §15, tools 2/3/6/7/8).
+# Tests numbered per v1.0-prompt-2-mcp-tools.md's own required-test list.
+# ---------------------------------------------------------------------------
+
+
+# --- 1/2/4: query_listings ---------------------------------------------
+
+
+def test_query_listings_default_includes_every_spec_status(tmp_path, monkeypatch):
+    db_path = _make_db(tmp_path)
+    conn = connect(db_path)
+    seed_listing(conn, "v1|q1|0", spec_status="ok", bucket_key="1|intel-10th|16")
+    seed_listing(conn, "v1|q2|0", spec_status="partial", bucket_key="1|?|16")
+    seed_listing(conn, "v1|q3|0", spec_status="rejected")
+    seed_listing(conn, "v1|q4|0", spec_status="not_target")
+    conn.close()
+    _use_db(monkeypatch, db_path)
+
+    with_default = mcp_server.query_listings()
+    assert with_default["total_count"] == 4
+    assert with_default["spec_status_counts"] == {
+        "ok": 1, "partial": 1, "rejected": 1, "not_target": 1,
+    }
+
+    grouped = mcp_server.query_listings(group_by="spec_status")
+    assert grouped["spec_status_counts"] == with_default["spec_status_counts"]
+
+    # Manual sabotage (source edit, run, revert - see report): defaulting
+    # `spec_status` to `["ok", "partial"]` instead of "every status" drops
+    # with_default["total_count"] to 2 and removes "rejected"/"not_target"
+    # from the breakdown entirely, red-confirmed and reverted.
+
+
+def test_query_listings_min_price_excludes_rejected_and_not_target(tmp_path, monkeypatch):
+    db_path = _make_db(tmp_path)
+    conn = connect(db_path)
+    # The cheap rejected barebones row would win the minimum otherwise -
+    # design.md §15 tool 2's own caveat example.
+    seed_listing(conn, "v1|cheap|0", spec_status="rejected", first_seen=1_000_000)
+    seed_observation(conn, "v1|cheap|0", 1_000_000, price_cents=100, total_cents=100)
+    seed_listing(conn, "v1|real|0", spec_status="ok", bucket_key="1|intel-10th|16", first_seen=1_000_100)
+    seed_observation(conn, "v1|real|0", 1_000_100, price_cents=20000, total_cents=20000)
+    conn.close()
+    _use_db(monkeypatch, db_path)
+
+    # Filter includes 'rejected' explicitly - it must still not win the minimum.
+    result = mcp_server.query_listings(spec_status=["ok", "rejected"])
+    assert result["total_count"] == 2
+    assert result["price_stats"]["min_cents"] == 20000
+    assert result["price_stats"]["min_display"] == "$200.00"
+
+    # Manual sabotage (source edit, run, revert - see report): computing
+    # price stats from `matched` instead of `priceable` (i.e. dropping the
+    # rejected/not_target exclusion) makes min_cents come back 100 - the
+    # rejected row's price - red-confirmed and reverted.
+
+
+def test_query_listings_today_uses_the_la_calendar_day_not_utc(tmp_path, monkeypatch):
+    from zoneinfo import ZoneInfo
+
+    pacific = ZoneInfo("America/Los_Angeles")
+    # `now`: 2026-09-19 23:00 America/Los_Angeles = 2026-09-20 06:00 UTC -
+    # LA calendar day is the 19th, UTC calendar day is the 20th.
+    now = int(datetime(2026, 9, 19, 23, 0, tzinfo=pacific).timestamp())
+    # Both rows fall on LA's Sept 19 (inside [Sept19 00:00, Sept20 00:00) LA).
+    # In UTC terms: row_early is Sept 19 09:00Z (UTC day 19, NOT today's UTC
+    # day of 20), row_late is Sept 20 03:00Z (UTC day 20, matches by luck).
+    # A UTC-day query for "today" relative to `now` would only see row_late.
+    row_early = int(datetime(2026, 9, 19, 2, 0, tzinfo=pacific).timestamp())
+    row_late = int(datetime(2026, 9, 19, 20, 0, tzinfo=pacific).timestamp())
+
+    db_path = _make_db(tmp_path)
+    conn = connect(db_path)
+    seed_listing(conn, "v1|early|0", spec_status="ok", first_seen=row_early, last_seen=row_early)
+    seed_listing(conn, "v1|late|0", spec_status="ok", first_seen=row_late, last_seen=row_late)
+    conn.close()
+    _use_db(monkeypatch, db_path)
+
+    real_time = mcp_server.time
+    monkeypatch.setattr(real_time, "time", lambda: float(now))
+    result = mcp_server.query_listings(period="today")
+    assert result["total_count"] == 2  # both are within the LA calendar day
+
+
+def test_query_listings_sabotage_today_using_the_utc_day(tmp_path, monkeypatch):
+    from zoneinfo import ZoneInfo
+
+    pacific = ZoneInfo("America/Los_Angeles")
+    now = int(datetime(2026, 9, 19, 23, 0, tzinfo=pacific).timestamp())
+    row_early = int(datetime(2026, 9, 19, 2, 0, tzinfo=pacific).timestamp())
+    row_late = int(datetime(2026, 9, 19, 20, 0, tzinfo=pacific).timestamp())
+
+    db_path = _make_db(tmp_path)
+    conn = connect(db_path)
+    seed_listing(conn, "v1|early|0", spec_status="ok", first_seen=row_early, last_seen=row_early)
+    seed_listing(conn, "v1|late|0", spec_status="ok", first_seen=row_late, last_seen=row_late)
+    conn.close()
+    _use_db(monkeypatch, db_path)
+
+    def _utc_day_bounds(ts):
+        import datetime as dt
+        day = dt.datetime.fromtimestamp(ts, dt.timezone.utc).date()
+        start = dt.datetime(day.year, day.month, day.day, tzinfo=dt.timezone.utc)
+        return int(start.timestamp()), int(start.timestamp()) + 86400
+
+    monkeypatch.setattr(mcp_server, "la_day_bounds", _utc_day_bounds)
+    monkeypatch.setattr(mcp_server.time, "time", lambda: float(now))
+    result = mcp_server.query_listings(period="today")
+    assert result["total_count"] == 1  # red: row_early silently drops out
+
+
+def test_query_listings_title_contains_is_parameterized(tmp_path, monkeypatch):
+    db_path = _make_db(tmp_path)
+    conn = connect(db_path)
+    seed_listing(conn, "v1|special|0", spec_status="ok", title="100% off_deal's laptop")
+    conn.close()
+    _use_db(monkeypatch, db_path)
+
+    for needle in ("%", "_", "'", "off_deal's"):
+        result = mcp_server.query_listings(title_contains=needle)
+        assert "error" not in result
+        assert result["total_count"] == 1
+
+    # Manual sabotage (source edit, run, revert - see report): f-string
+    # interpolating title_contains directly into the SQL string (dropping
+    # the `?` parameter) breaks on the embedded single quote with
+    # sqlite3.OperationalError - red-confirmed and reverted.
+
+
+def test_query_listings_period_and_seen_since_is_an_argument_error(tmp_path, monkeypatch):
+    db_path = _make_db(tmp_path)
+    _use_db(monkeypatch, db_path)
+
+    result = mcp_server.query_listings(period="7d", seen_since=1_000_000)
+    assert "error" in result
+    assert result["as_of"] > 0
+    assert result["profile_id"] == PROFILE_ID
+
+
+# --- 5/6/7: find_deals ---------------------------------------------------
+
+
+def test_find_deals_separates_sanity_flagged_from_deals(tmp_path, monkeypatch):
+    db_path = _make_db(tmp_path)
+    conn = connect(db_path)
+    # A sanity-flagged listing at a ridiculous discount would rank #1 among
+    # deals if it weren't separated out (design.md §15 tool 3's caveat).
+    seed_listing(
+        conn, "v1|flagged|0", spec_status="ok", bucket_key="2|intel-11th|16",
+        spec_json=json.dumps({"generation": "2", "cpu_family": "intel-11th", "ram_tier": "16"}),
+    )
+    seed_observation(conn, "v1|flagged|0", 1_000_000, price_cents=100, total_cents=100)
+    seed_listing(
+        conn, "v1|real|0", spec_status="ok", bucket_key="2|intel-11th|16",
+        spec_json=json.dumps({"generation": "2", "cpu_family": "intel-11th", "ram_tier": "16"}),
+    )
+    seed_observation(conn, "v1|real|0", 1_000_000, price_cents=20000, total_cents=20000)
+    conn.close()
+    _use_db(monkeypatch, db_path)
+
+    result = mcp_server.find_deals()
+    deal_ids = {d["item_id"] for d in result["deals"]}
+    flagged_ids = {d["item_id"] for d in result["sanity_flagged"]}
+    assert "v1|flagged|0" in flagged_ids
+    assert "v1|flagged|0" not in deal_ids
+    assert "v1|real|0" in deal_ids
+
+    # Manual sabotage (source edit, run, revert - see report): appending
+    # every scored entry to `deals` regardless of result.sanity_flagged
+    # puts v1|flagged|0 at rank 1 of `deals` (lowest ratio_to_p25) - red-
+    # confirmed and reverted.
+
+
+def test_find_deals_excludes_incomplete_bucket_and_gone_listings(tmp_path, monkeypatch):
+    db_path = _make_db(tmp_path)
+    conn = connect(db_path)
+    seed_listing(conn, "v1|incomplete|0", spec_status="partial", bucket_key="2|?|16")
+    seed_observation(conn, "v1|incomplete|0", 1_000_000, price_cents=10000, total_cents=10000)
+    seed_listing(
+        conn, "v1|gone|0", spec_status="ok", bucket_key="2|intel-11th|16",
+        gone_at=2_000_000, lifespan_mins=60,
+    )
+    seed_observation(conn, "v1|gone|0", 1_000_000, price_cents=10000, total_cents=10000)
+    seed_listing(
+        conn, "v1|eligible|0", spec_status="ok", bucket_key="2|intel-11th|16",
+        spec_json=json.dumps({"generation": "2", "cpu_family": "intel-11th", "ram_tier": "16"}),
+    )
+    seed_observation(conn, "v1|eligible|0", 1_000_000, price_cents=10000, total_cents=10000)
+    conn.close()
+    _use_db(monkeypatch, db_path)
+
+    result = mcp_server.find_deals()
+    all_ids = {d["item_id"] for d in result["deals"] + result["sanity_flagged"]}
+    assert all_ids == {"v1|eligible|0"}
+
+    # Manual sabotage (source edit, run, revert - see report): dropping
+    # `AND bucket_key NOT LIKE '%?%'` pulls v1|incomplete|0 in; dropping
+    # `AND gone_at IS NULL` pulls v1|gone|0 in - each checked in turn,
+    # red-confirmed and reverted.
+
+
+def test_find_deals_rows_carry_baseline_layer_and_n(tmp_path, monkeypatch):
+    db_path = _make_db(tmp_path)
+    conn = connect(db_path)
+    # No computed baseline exists for this bucket in a fresh db - this row
+    # is necessarily seed-scored, the case design.md §15 tool 3 explicitly
+    # calls out ("including for seed-scored rows").
+    seed_listing(
+        conn, "v1|seeded|0", spec_status="ok", bucket_key="1|intel-10th|16",
+        spec_json=json.dumps({"generation": "1", "cpu_family": "intel-10th", "ram_tier": "16"}),
+    )
+    seed_observation(conn, "v1|seeded|0", 1_000_000, price_cents=10000, total_cents=10000)
+    conn.close()
+    _use_db(monkeypatch, db_path)
+
+    result = mcp_server.find_deals()
+    assert len(result["deals"]) == 1
+    deal = result["deals"][0]
+    assert deal["baseline_layer"] == "seed"
+    assert "baseline_n" in deal  # None for a seed row - the KEY still exists
+    assert deal["baseline_n"] is None
+
+    # Manual sabotage (source edit, run, revert - see report): omitting
+    # baseline_layer/baseline_n from the entry dict makes the `in` checks
+    # above fail with a KeyError - red-confirmed and reverted.
+
+
+# --- 8/9: get_market_price -----------------------------------------------
+
+
+def test_get_market_price_fast_candidate_count_matches_the_panel_function(tmp_path, monkeypatch):
+    from dealwatch.engine.baselines import derive_candidates, group_fast_candidates_by_bucket
+
+    db_path = _make_db(tmp_path)
+    conn = connect(db_path)
+    bucket_key = "1|intel-10th|16"
+    # Two fast (sweep-confirmed, dead within 24h) candidates in this
+    # bucket, plus one dead-but-NEVER-SWEPT row (first_seen == last_seen)
+    # that a naive COUNT(*) of dead listings in the bucket would still
+    # count, but the real fast-candidate derivation excludes (V0.8b).
+    for i in range(2):
+        item_id = f"v1|fast{i}|0"
+        seed_listing(
+            conn, item_id, spec_status="ok", bucket_key=bucket_key,
+            first_seen=1_000_000, last_seen=1_000_100,
+            gone_at=1_000_100, lifespan_mins=1,
+        )
+        seed_observation(conn, item_id, 1_000_000, price_cents=15000, total_cents=15000)
+    seed_listing(
+        conn, "v1|neverswept|0", spec_status="ok", bucket_key=bucket_key,
+        first_seen=1_000_000, last_seen=1_000_000, gone_at=1_000_000, lifespan_mins=None,
+    )
+    seed_observation(conn, "v1|neverswept|0", 1_000_000, price_cents=15000, total_cents=15000)
+    conn.close()
+    _use_db(monkeypatch, db_path)
+
+    # The naive count a hand-rolled query might use - deliberately
+    # different from the correct answer, so the fixture actually proves
+    # something (L13: copy the module's own predicate, don't paraphrase it).
+    naive_conn = sqlite3.connect(db_path)
+    naive_count = naive_conn.execute(
+        "SELECT COUNT(*) FROM listings WHERE bucket_key = ? AND gone_at IS NOT NULL "
+        "AND spec_status = 'ok'",
+        (bucket_key,),
+    ).fetchone()[0]
+    naive_conn.close()
+    assert naive_count == 3  # includes the never-swept row - would be wrong
+
+    result = mcp_server.get_market_price(generation="1", cpu_family="intel-10th", ram_tier="16")
+    assert result["baseline"]["fast_candidates"] == 2
+    assert result["baseline"]["fast_candidates"] != naive_count
+
+    with_conn = connect(db_path)
+    expected = len(
+        group_fast_candidates_by_bucket(derive_candidates(with_conn), 24).get(bucket_key, [])
+    )
+    with_conn.close()
+    assert result["baseline"]["fast_candidates"] == expected
+
+
+def test_get_market_price_alert_time_series_is_gapped_not_interpolated(tmp_path, monkeypatch):
+    db_path = _make_db(tmp_path)
+    conn = connect(db_path)
+    bucket_key = "1|intel-10th|16"
+    day = 86400
+    now = 20 * day
+    # Alerts on 2 of the last 5 days for this bucket - the other 3 days
+    # have nothing.
+    seed_alert(
+        conn, "v1|a1|0", sent_at=now - 4 * day, bucket_key=bucket_key,
+        baseline_p25_cents=20000, baseline_layer="seed",
+    )
+    seed_alert(
+        conn, "v1|a2|0", sent_at=now - 1 * day, bucket_key=bucket_key,
+        baseline_p25_cents=19000, baseline_layer="computed",
+    )
+    conn.close()
+    _use_db(monkeypatch, db_path)
+    monkeypatch.setattr(mcp_server.time, "time", lambda: float(now))
+
+    result = mcp_server.get_market_price(generation="1", cpu_family="intel-10th", ram_tier="16")
+    series = result["alert_time_p25_series"]
+    assert len(series) == 2  # not 5 - no forward-fill for the silent days
+    assert [p["baseline_p25_cents"] for p in series] == [20000, 19000]
+
+    # Manual sabotage (source edit, run, revert - see report): adding a
+    # forward-fill pass that emits one entry per day in the 30-day window,
+    # carrying the last known p25 forward across silent days, makes
+    # len(series) come back 5 instead of 2 - red-confirmed and reverted.
+
+
+# --- 10/11: get_alert_activity --------------------------------------------
+
+
+def test_get_alert_activity_counts_events_not_rows(tmp_path, monkeypatch):
+    db_path = _make_db(tmp_path)
+    conn = connect(db_path)
+    seed_listing(conn, "v1|fanout|0", spec_status="ok", bucket_key="1|intel-10th|16")
+    # One alert EVENT fanned out to two notifiers - same item_id, same
+    # sent_at, two rows (the real shape since V0.9a).
+    seed_alert(conn, "v1|fanout|0", sent_at=5_000_000, notifier="discord")
+    seed_alert(conn, "v1|fanout|0", sent_at=5_000_000, notifier="pushover")
+    conn.close()
+    _use_db(monkeypatch, db_path)
+
+    result = mcp_server.get_alert_activity(days=7)
+    assert len(result["recent_events"]) == 1
+    assert set(result["recent_events"][0]["delivery_statuses"]) == {"discord", "pushover"}
+
+
+def test_get_alert_activity_sabotage_counting_raw_rows_instead_of_events(tmp_path, monkeypatch):
+    db_path = _make_db(tmp_path)
+    conn = connect(db_path)
+    seed_listing(conn, "v1|fanout|0", spec_status="ok", bucket_key="1|intel-10th|16")
+    seed_alert(conn, "v1|fanout|0", sent_at=5_000_000, notifier="discord")
+    seed_alert(conn, "v1|fanout|0", sent_at=5_000_000, notifier="pushover")
+    conn.close()
+    _use_db(monkeypatch, db_path)
+
+    def _naive_rows(conn, profile_id, *, limit=20):
+        rows = conn.execute(
+            "SELECT item_id, sent_at, notifier, delivery_status FROM alerts "
+            "WHERE profile_id = ? ORDER BY sent_at DESC LIMIT ?", (profile_id, limit),
+        ).fetchall()
+        return [{"item_id": r[0], "sent_at": r[1], "delivery_statuses": {r[2]: r[3]}} for r in rows]
+
+    monkeypatch.setattr(mcp_server, "recent_alerts", _naive_rows)
+    result = mcp_server.get_alert_activity(days=7)
+    assert len(result["recent_events"]) == 2  # red: doubled, one row each
+
+
+def test_get_alert_activity_live_and_dry_run_stay_split(tmp_path, monkeypatch):
+    db_path = _make_db(tmp_path)
+    conn = connect(db_path)
+    seed_listing(conn, "v1|s|0", spec_status="ok", bucket_key="1|intel-10th|16")
+    now = 10 * 86400
+    for i in range(2):
+        seed_alert(conn, "v1|s|0", sent_at=now - i * 100, dry_run=False)
+    for i in range(3):
+        seed_alert(conn, "v1|s|0", sent_at=now - i * 100 - 50, dry_run=True)
+    conn.close()
+    _use_db(monkeypatch, db_path)
+    monkeypatch.setattr(mcp_server.time, "time", lambda: float(now))
+
+    result = mcp_server.get_alert_activity(days=1)
+    today = result["per_day_counts"][-1]
+    assert today["count_live"] == 2
+    assert today["count_dry"] == 3
+    assert "count" not in today  # no merged total field
+
+    # Manual sabotage (source edit, run, revert - see report): replacing
+    # per_day_counts's pass-through with a version that sums count_live +
+    # count_dry into one "count" field and drops the split loses exactly
+    # the distinction this test checks - red-confirmed and reverted.
+
+
+# --- 12/13: get_review_queue -----------------------------------------------
+
+
+def test_get_review_queue_reuses_the_baseline_queue_panel(tmp_path, monkeypatch):
+    from dealwatch.reporting.panels import baseline_queue as real_baseline_queue
+
+    db_path = _make_db(tmp_path)
+    conn = connect(db_path)
+    seed_listing(
+        conn, "v1|fast|0", spec_status="ok", bucket_key="1|intel-10th|16",
+        first_seen=1_000_000, last_seen=1_000_100, gone_at=1_000_100, lifespan_mins=1,
+    )
+    seed_observation(conn, "v1|fast|0", 1_000_000, price_cents=15000, total_cents=15000)
+    conn.close()
+    _use_db(monkeypatch, db_path)
+
+    with_conn = connect(db_path)
+    expected = real_baseline_queue(
+        with_conn, PROFILE_ID, min_samples=12, fast_lifespan_hours=24,
+        compiled_seeds=mcp_server.compiled_seeds, limit=10,
+    )
+    with_conn.close()
+
+    result = mcp_server.get_review_queue()
+    assert result["baseline_queue"] == expected["queue"]
+    assert result["negative_lifespan_dropped"] == expected["negative_lifespan_dropped"]
+
+
+def test_get_review_queue_sabotage_a_different_baseline_queue_panel_output(tmp_path, monkeypatch):
+    db_path = _make_db(tmp_path)
+    _use_db(monkeypatch, db_path)
+
+    fake_result = {
+        "queue": [{"bucket_key": "9|fake|99", "fast_candidates": 99}],
+        "negative_lifespan_dropped": 42,
+    }
+    monkeypatch.setattr(mcp_server, "baseline_queue", lambda *a, **k: fake_result)
+
+    result = mcp_server.get_review_queue()
+    # If get_review_queue independently recomputed its own ranking instead
+    # of reusing panels.baseline_queue()'s output, it would disagree with
+    # this stub - it doesn't, proving there is no second computation path.
+    assert result["baseline_queue"] == fake_result["queue"]
+    assert result["negative_lifespan_dropped"] == 42
+
+
+def test_get_review_queue_drop_count_present_with_an_empty_queue(tmp_path, monkeypatch):
+    db_path = _make_db(tmp_path)
+    _use_db(monkeypatch, db_path)
+
+    fake_result = {"queue": [], "negative_lifespan_dropped": 7}
+    monkeypatch.setattr(mcp_server, "baseline_queue", lambda *a, **k: fake_result)
+
+    result = mcp_server.get_review_queue()
+    assert result["baseline_queue"] == []
+    assert result["negative_lifespan_dropped"] == 7  # present and nonzero despite empty queue
+
+    # Manual sabotage (source edit, run, revert - see report): nesting
+    # "negative_lifespan_dropped" inside `if queue_result["queue"]:` before
+    # building the return dict reproduces the exact V0.13 dashboard defect
+    # shape - the key vanishes from the response precisely when the queue
+    # is empty, which is the state a nonzero drop count matters most in.
+    # Red-confirmed (KeyError / missing key) and reverted.
+
+
+# ---------------------------------------------------------------------------
+# 15. as_of/profile_id and the marketplace-caveat sentence, across all eight
+# tools (design.md §15's "Conventions shared by every tool").
+# ---------------------------------------------------------------------------
+
+
+def test_every_tool_response_carries_as_of_and_profile_id_and_every_description_ends_with_the_caveat(
+    tmp_path, monkeypatch
+):
+    db_path = _make_db(tmp_path)
+    conn = connect(db_path)
+    seed_listing(
+        conn, "v1|cov|0", spec_status="ok", bucket_key="1|intel-10th|16",
+        spec_json=json.dumps({"generation": "1", "cpu_family": "intel-10th", "ram_tier": "16"}),
+    )
+    seed_observation(conn, "v1|cov|0", 1_000_000, price_cents=10000, total_cents=10000)
+    conn.close()
+    _use_db(monkeypatch, db_path)
+
+    calls = {
+        "get_system_health": lambda: mcp_server.get_system_health(),
+        "query_listings": lambda: mcp_server.query_listings(),
+        "find_deals": lambda: mcp_server.find_deals(),
+        "trace_title": lambda: mcp_server.trace_title(title="Lenovo ThinkPad T14 Gen 1 16GB 256GB"),
+        "explain_listing": lambda: mcp_server.explain_listing(item_id_or_url="v1|cov|0"),
+        "get_market_price": lambda: mcp_server.get_market_price(
+            generation="1", cpu_family="intel-10th", ram_tier="16"
+        ),
+        "get_alert_activity": lambda: mcp_server.get_alert_activity(),
+        "get_review_queue": lambda: mcp_server.get_review_queue(),
+    }
+    assert set(calls) == {t.name for t in mcp_server.mcp._tool_manager.list_tools()}
+
+    for name, call in calls.items():
+        result = call()
+        assert "as_of" in result, f"{name} response missing as_of"
+        assert result["profile_id"] == PROFILE_ID, f"{name} response missing/wrong profile_id"
+
+    for tool in mcp_server.mcp._tool_manager.list_tools():
+        assert tool.description.endswith(mcp_server._TOOL_CAVEAT), (
+            f"{tool.name}'s description does not end with the marketplace-caveat sentence"
+        )
+
+    # Manual sabotage (source edit, run, revert - see report): stripping
+    # the caveat sentence from get_review_queue's description makes the
+    # endswith() check fail for exactly that tool - red-confirmed and
+    # reverted.
