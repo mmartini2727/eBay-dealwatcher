@@ -408,3 +408,42 @@ as a structured error before any lookup runs, case-insensitive exact
 match only, no fuzzy correction - is the general pattern: a legitimate
 fallback branch must never also be able to be reached by malformed input
 that was never a real case of the thing the fallback exists for.
+
+**Extension (V1.0 prompt 2b, design.md §15's dated 2b addendum): the fix
+above created two smaller versions of the same underlying mistake.**
+
+First - **a vocabulary derived from observed data goes stale as new data
+arrives; caching it for a process lifetime turns a new, valid
+configuration into a false rejection.** `cpu_family`'s vocabulary was
+correct at the moment it was built (2a's own fix), but it was built ONCE,
+at import, and never touched again. The first real, freshly-collected
+listing in a `cpu_family` this server had never seen before (a new CPU
+generation entering the market, say) would have been rejected as
+"unknown" - a legitimate, collected fact about the marketplace, refused
+by the exact mechanism built to stop refusing legitimate facts, for the
+same underlying reason: code that was supposed to track a source of
+truth instead had a hardcoded (if honestly-labeled) snapshot of it. The
+fix is a short TTL (60s) on the observed half specifically - the
+profile-sourced half never needs one, because nothing about `tiers`/
+`derive` changes without a profile edit, which already needs a restart.
+
+Second, and easy to miss because it looks like the opposite problem: **a
+fail-closed degradation that nothing reports is indistinguishable from
+working.** `cpu_family`'s vocabulary going empty (a database unreadable
+at container boot) rejected every value with a perfectly well-formed,
+correctly-shaped error - the SAME response shape a real bad value gets.
+`/health` still said `200 ok`. Nothing anywhere said "this field's
+vocabulary is currently empty and every call is about to fail" - the
+degradation was total for that field and silent for the whole system.
+Being narrowly correct in each individual rejection didn't make the
+aggregate state visible; only reporting `source`, `count`, and
+`built_at` per field (now in `/health`) does that.
+
+Both fixes are cheap; neither was in the original 2a scope, because 2a
+was about REJECTING bad input correctly, and both of these are about
+what happens to a CORRECT rejection mechanism over TIME - a dimension
+input validation alone doesn't have anything to say about. A validation
+fix is not finished just because it rejects the right things at the
+moment it's written; it also needs a story for what it does an hour
+later, and for what a caller (or an operator) can see when that story
+goes wrong.

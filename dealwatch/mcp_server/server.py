@@ -72,6 +72,7 @@ import asyncio
 import json
 import logging
 import sqlite3
+import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime
@@ -99,7 +100,11 @@ from dealwatch.engine.scoring import (
 )
 from dealwatch.mcp_server.formatting import age_display, money_display, parse_iso, time_display
 from dealwatch.mcp_server.item_lookup import resolve_item_ids
-from dealwatch.mcp_server.vocabulary import VOCABULARY_FIELDS, build_bucket_vocabulary
+from dealwatch.mcp_server.vocabulary import (
+    VOCABULARY_FIELDS,
+    fetch_observed_vocabularies,
+    resolve_profile_vocabulary,
+)
 from dealwatch.normalize.engine import compile_profile, normalize_verbose
 from dealwatch.normalize.listing import normalize_input_fields
 from dealwatch.providers.ratelimit import PACIFIC, la_day_bounds
@@ -202,63 +207,148 @@ def _readonly_conn():
         conn.close()
 
 
-def _load_bucket_vocabulary() -> dict:
-    """Computed once, at import time, the same "fixed at process start"
-    footing as `profile`/`compiled_seeds` (V1.0 prompt 2a, design.md §15's
-    dated addendum) - not recomputed per tool call, and not refreshed
-    without a restart, matching D13's "profile change needs a restart"
-    precedent (a `derive`/`extract`/`tiers` vocabulary source can only
-    change via a profile edit anyway; an `observed` source could in
-    principle drift as new listings normalize, but this module doesn't
-    chase that - see the design.md addendum for why refreshing it was
-    deliberately left out of this prompt's scope).
 
-    Unlike `profile`/`compiled_seeds`, this DOES need a database read for
-    any field whose vocabulary falls back to observed values (today:
-    `cpu_family`) - a real dependency `profile`/`compiled_seeds` don't
-    have. Wrapped in try/except rather than left to raise: a missing or
-    not-yet-writable database at container boot (the WAL caveat
-    `connect_readonly()`'s own docstring already states - it cannot work
-    until a writer has opened the file at least once) must not crash this
-    module's import and take the whole process down over a feature this
-    specific to three tool arguments. Degrades to an empty vocabulary for
-    the affected field(s) instead - `_validate_bucket_field()` below then
-    correctly refuses every value for that field until the next restart,
-    a real but honest failure mode, not a silent "everything is valid."
+# Computed once, at import time, from the profile alone - no database
+# access, ever (V1.0 prompt 2b, design.md §15's dated addendum splits
+# this from the observed-value half below). Fixed for process lifetime,
+# the same footing as `profile`/`compiled_seeds` themselves: nothing
+# about a field resolved here (today: generation via tiers, ram_tier via
+# derive - see vocabulary.py's own module docstring) can change without a
+# profile edit, which already requires a container restart (D13).
+_profile_vocabulary, _OBSERVED_VOCABULARY_FIELDS = resolve_profile_vocabulary(profile)
+
+# 60s (design.md's dated addendum has the reasoning): long enough that a
+# validated tool call doesn't re-scan `listings` on every invocation, short
+# enough that a newly-collected cpu_family value (or a database that just
+# became readable after container boot) is usable within about a minute,
+# not "after the next restart."
+_VOCABULARY_TTL_SECONDS = 60
+
+_vocabulary_lock = threading.Lock()
+# field -> (built_at_monotonic, built_at_epoch, values) - ONLY for fields
+# in _OBSERVED_VOCABULARY_FIELDS (today: cpu_family). Present only after
+# a SUCCESSFUL, NON-EMPTY build - prompt 2b's Problem A/B fix: a failed or
+# empty build is never written here, so the next call always retries
+# rather than serving (or worse, permanently caching) a degraded result.
+# time.monotonic() drives the TTL gate (immune to wall-clock changes, same
+# reasoning as dashboard_data.py's own cache); the epoch value is carried
+# only so /health can report a real, human-meaningful "built_at" timestamp.
+_observed_vocabulary_cache: dict[str, tuple[float, int, list[str]]] = {}
+
+
+def _current_bucket_vocabulary() -> dict[str, dict]:
+    """{field: {"values": [...], "source": ...}} for every field in
+    VOCABULARY_FIELDS - the ONE accessor every tool's validation and
+    `/health`'s own report call, so both see identical, always-current
+    state (V1.0 prompt 2b).
+
+    Profile-sourced fields come straight from the fixed `_profile_vocabulary`
+    computed at import - never rebuilt, never touch the lock or the
+    database. Observed-sourced fields are rebuilt at most once per
+    `_VOCABULARY_TTL_SECONDS`: on a cache miss or an expired entry, this
+    opens ONE connection (`_readonly_conn()`, closed before returning,
+    same D4 discipline as every other tool call in this module) and calls
+    `fetch_observed_vocabularies()` for every observed field at once.
+
+    A failed (exception) or EMPTY fetch for a field is never written to
+    the cache - the field falls back to whatever was cached before (a
+    still-meaningful, if stale, real vocabulary beats an empty one for a
+    transient hiccup) or to an empty list if nothing has ever succeeded.
+    Either way, the NEXT call tries again; nothing here remembers "this
+    field is broken" past a single call, which is what makes a database
+    that becomes readable after container boot - or a config value that
+    was simply never observed yet - self-healing within one TTL window
+    rather than permanent until a restart (docs/learnings.md L15's
+    extension).
     """
-    try:
-        with _readonly_conn() as conn:
-            return build_bucket_vocabulary(profile, conn)
-    except Exception:
-        logger.warning(
-            "bucket vocabulary: database unavailable at startup - "
-            "observed-value fields will reject everything until restart",
-            exc_info=True,
-        )
-        return build_bucket_vocabulary(profile, None)
+    result = dict(_profile_vocabulary)
+
+    with _vocabulary_lock:
+        now_mono = time.monotonic()
+        stale_or_missing = [
+            field
+            for field in _OBSERVED_VOCABULARY_FIELDS
+            if field not in _observed_vocabulary_cache
+            or now_mono - _observed_vocabulary_cache[field][0] >= _VOCABULARY_TTL_SECONDS
+        ]
+
+        fetched: dict[str, list[str]] = {}
+        if stale_or_missing:
+            try:
+                with _readonly_conn() as conn:
+                    fetched = fetch_observed_vocabularies(conn, profile.id, stale_or_missing)
+            except Exception:
+                logger.warning(
+                    "bucket vocabulary: observed-value rebuild failed for %s - "
+                    "serving prior values if any, will retry on next call",
+                    stale_or_missing,
+                    exc_info=True,
+                )
+
+        for field in _OBSERVED_VOCABULARY_FIELDS:
+            if field in stale_or_missing:
+                values = fetched.get(field) or []
+                if values:
+                    _observed_vocabulary_cache[field] = (now_mono, int(time.time()), values)
+            cached = _observed_vocabulary_cache.get(field)
+            result[field] = {
+                "values": cached[2] if cached is not None else [],
+                "source": "observed",
+            }
+
+    return result
 
 
-_bucket_vocabulary = _load_bucket_vocabulary()
+def _observed_vocabulary_built_at(field: str) -> int | None:
+    """Epoch seconds of the last successful build for an observed-sourced
+    field, or None if it has never succeeded - `/health`'s own report
+    reads this directly rather than re-deriving it from the cache tuple's
+    shape a second time."""
+    cached = _observed_vocabulary_cache.get(field)
+    return cached[1] if cached is not None else None
+
+
+# A one-time snapshot for the TWO tool descriptions below that list valid
+# values as static text (design.md §15 "descriptions carry caveats"
+# convention) - descriptions are built once, at decoration time, and are
+# never re-evaluated per call, so there is no live-updating version of
+# this to keep in sync with the TTL cache; embedding
+# _current_bucket_vocabulary()'s own real output here (rather than a
+# second, hand-written list) is what test 4 (V1.0 prompt 2a) actually
+# checks - the description must match the SAME accessor validation uses,
+# even if only as a point-in-time snapshot.
+_DESCRIPTION_VOCABULARY_SNAPSHOT = _current_bucket_vocabulary()
 
 
 def _validate_bucket_field(field: str, value: str) -> tuple[str, None] | tuple[None, dict]:
-    """Case-insensitive EXACT match against `field`'s real vocabulary - no
-    fuzzy matching, no aliasing, no "did you mean" normalization
-    (design.md's 2a addendum: silently accepting a near-miss is the same
-    class of bug as silently falling through to the seed layer, just in a
-    friendlier coat). On a match, returns the CANONICAL spelling from the
-    vocabulary - not the caller's own casing - so every downstream
-    `bucket_key` string and DB lookup uses the profile's real spelling
-    regardless of how the caller wrote it. On no match, returns the
-    structured error object V1.0 prompt 2a's contract specifies; the
-    caller is responsible for adding `as_of`/`profile_id` before
-    returning it (this function has no `now` to stamp one with)."""
-    vocabulary = _bucket_vocabulary[field]
+    """Case-insensitive EXACT match against `field`'s CURRENT vocabulary
+    (`_current_bucket_vocabulary()` - TTL-rebuilt for an observed-sourced
+    field, fixed for a profile-sourced one) - no fuzzy matching, no
+    aliasing, no "did you mean" normalization (design.md's 2a addendum:
+    silently accepting a near-miss is the same class of bug as silently
+    falling through to the seed layer, just in a friendlier coat). On a
+    match, returns the CANONICAL spelling from the vocabulary - not the
+    caller's own casing - so every downstream `bucket_key` string and DB
+    lookup uses the profile's real spelling regardless of how the caller
+    wrote it. On no match, returns the structured error object V1.0
+    prompt 2a's contract specifies, worded per the field's source (2b):
+    an observed-sourced field says the value has not been OBSERVED in any
+    collected listing - the check proved absence from collected data, not
+    that the profile can't produce it - while a profile-sourced field
+    keeps the original "unknown" wording, since there the check really
+    did prove the value can never be produced at all. The caller is
+    responsible for adding `as_of`/`profile_id` before returning this
+    (this function has no `now` to stamp one with)."""
+    vocabulary = _current_bucket_vocabulary()[field]
     for canonical in vocabulary["values"]:
         if canonical.lower() == value.lower():
             return canonical, None
+    if vocabulary["source"] == "observed":
+        message = f"{field} {value!r} has not been observed in any collected listing"
+    else:
+        message = f"unknown {field} {value!r}"
     return None, {
-        "error": f"unknown {field} {value!r}",
+        "error": message,
         "field": field,
         "valid_values": vocabulary["values"],
         "vocabulary_source": vocabulary["source"],
@@ -431,10 +521,10 @@ _QUERY_LISTINGS_GROUP_BY_FIELDS = (
         "error naming valid_values rather than silently matching zero "
         "listings with no indication why; a partial listing legitimately "
         "missing the field still won't match a VALID value. Valid "
-        "generation: " + repr(_bucket_vocabulary["generation"]["values"])
-        + ". Valid ram_tier: " + repr(_bucket_vocabulary["ram_tier"]["values"])
-        + ". Valid cpu_family (" + _bucket_vocabulary["cpu_family"]["source"]
-        + "): " + repr(_bucket_vocabulary["cpu_family"]["values"]) + ". "
+        "generation: " + repr(_DESCRIPTION_VOCABULARY_SNAPSHOT["generation"]["values"])
+        + ". Valid ram_tier: " + repr(_DESCRIPTION_VOCABULARY_SNAPSHOT["ram_tier"]["values"])
+        + ". Valid cpu_family (" + _DESCRIPTION_VOCABULARY_SNAPSHOT["cpu_family"]["source"]
+        + "): " + repr(_DESCRIPTION_VOCABULARY_SNAPSHOT["cpu_family"]["values"]) + ". "
         "period is mutually exclusive with seen_since/seen_before - "
         "passing both returns an 'error' field instead of raising. "
         + _TOOL_CAVEAT
@@ -650,7 +740,12 @@ _FIND_DEALS_ELIGIBLE_STATUSES = ("ok", "partial")
         "ratio, never the ratio alone. Baselines are the last-observation "
         "price of listings that vanished quickly - a PROXY for sold, not "
         "sold prices; no sold-price API exists for this marketplace. "
-        + _TOOL_CAVEAT
+        "generation/cpu_family/ram_tier are validated against this "
+        "profile's real vocabulary (case-insensitive exact match, no "
+        "fuzzy matching) - an unrecognized value returns a structured "
+        "error naming valid_values rather than silently returning zero "
+        "deals, which would otherwise read as a fact about the market "
+        "instead of a typo. " + _TOOL_CAVEAT
     )
 )
 def find_deals(
@@ -661,6 +756,20 @@ def find_deals(
     limit: int = _DEFAULT_EXAMPLE_ROWS,
 ) -> dict:
     now = int(time.time())
+
+    if generation is not None:
+        generation, error = _validate_bucket_field("generation", generation)
+        if error is not None:
+            return _bucket_field_error(now, error)
+    if cpu_family is not None:
+        cpu_family, error = _validate_bucket_field("cpu_family", cpu_family)
+        if error is not None:
+            return _bucket_field_error(now, error)
+    if ram_tier is not None:
+        ram_tier, error = _validate_bucket_field("ram_tier", ram_tier)
+        if error is not None:
+            return _bucket_field_error(now, error)
+
     max_price_cents = round(max_price * 100) if max_price is not None else None
 
     sql = (
@@ -1146,10 +1255,10 @@ def explain_listing(item_id_or_url: str) -> dict:
         "fuzzy matching) - an unrecognized value returns a structured "
         "error naming valid_values rather than silently falling through "
         "to a seed price for the wrong configuration. Valid generation: "
-        + repr(_bucket_vocabulary["generation"]["values"])
-        + ". Valid ram_tier: " + repr(_bucket_vocabulary["ram_tier"]["values"])
-        + ". Valid cpu_family (" + _bucket_vocabulary["cpu_family"]["source"]
-        + "): " + repr(_bucket_vocabulary["cpu_family"]["values"]) + ". "
+        + repr(_DESCRIPTION_VOCABULARY_SNAPSHOT["generation"]["values"])
+        + ". Valid ram_tier: " + repr(_DESCRIPTION_VOCABULARY_SNAPSHOT["ram_tier"]["values"])
+        + ". Valid cpu_family (" + _DESCRIPTION_VOCABULARY_SNAPSHOT["cpu_family"]["source"]
+        + "): " + repr(_DESCRIPTION_VOCABULARY_SNAPSHOT["cpu_family"]["values"]) + ". "
         + _TOOL_CAVEAT
     )
 )
@@ -1464,8 +1573,47 @@ async def _read_schema_version() -> int | None:
     return await asyncio.to_thread(_query)
 
 
+def _vocabulary_health_block() -> dict[str, dict]:
+    """{field: {"source", "count", "built_at"}} for every bucket
+    vocabulary field (V1.0 prompt 2b) - calls the SAME
+    `_current_bucket_vocabulary()` every tool's own validation uses (not
+    a second read of the cache's internals), so `/health`'s report can
+    never disagree with what a tool call would actually see. A
+    profile-sourced field's `built_at` is always None - it was resolved
+    once, from the profile, at process start, and "when was it last
+    rebuilt" isn't a meaningful question for something that is never
+    rebuilt (D13 - a profile edit needs a restart either way).
+    """
+    vocabulary = _current_bucket_vocabulary()
+    return {
+        field: {
+            "source": vocabulary[field]["source"],
+            "count": len(vocabulary[field]["values"]),
+            "built_at": (
+                None
+                if vocabulary[field]["source"] == "profile"
+                else _observed_vocabulary_built_at(field)
+            ),
+        }
+        for field in VOCABULARY_FIELDS
+    }
+
+
 @mcp.custom_route("/health", methods=["GET"])
 async def health(request: Request) -> JSONResponse:
+    """"Up" still means "can read the database" (D9) - that check is
+    unchanged and is what 503s. A degraded bucket vocabulary (V1.0
+    prompt 2b, design.md §15's dated addendum) is reported at 200, not
+    503: a DB that's genuinely unreadable already fails the schema-
+    version check above, and an empty OBSERVED vocabulary for one field
+    is a narrower, self-healing (60s TTL, retried on the next call) state
+    that most of this server's tools don't even touch - flipping the
+    WHOLE server to "down" over one field's validation fidelity would be
+    a worse signal for an uptime monitor than the truth, which is that
+    `vocabulary_degraded` names exactly what's affected. `status` still
+    carries the distinction textually ("degraded" vs "ok") for a reader
+    who wants it without computing `vocabulary_degraded` themselves.
+    """
     try:
         schema_version = await _read_schema_version()
     except Exception as exc:
@@ -1473,8 +1621,21 @@ async def health(request: Request) -> JSONResponse:
             {"status": "error", "error": f"{type(exc).__name__}: {exc}"},
             status_code=503,
         )
+
+    # _vocabulary_health_block() can do a blocking DB read (a TTL-expired
+    # or never-built observed field triggers a rebuild attempt) - kept off
+    # this process's event loop, same reasoning as _read_schema_version().
+    vocabulary = await asyncio.to_thread(_vocabulary_health_block)
+    vocabulary_degraded = any(block["count"] == 0 for block in vocabulary.values())
+
     return JSONResponse(
-        {"status": "ok", "schema_version": schema_version, "profile_id": profile.id}
+        {
+            "status": "degraded" if vocabulary_degraded else "ok",
+            "schema_version": schema_version,
+            "profile_id": profile.id,
+            "vocabulary": vocabulary,
+            "vocabulary_degraded": vocabulary_degraded,
+        }
     )
 
 

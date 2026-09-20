@@ -2777,3 +2777,142 @@ prompt; a background refresh of the `observed` vocabulary as new listings
 normalize was not built - it is fixed at process start, same footing as
 `profile`/`compiled_seeds`, and a profile change already needs a restart
 to take effect (D13) which this now shares.
+
+### Build addendum (prompt 2b, 2026-09-20)
+
+Closes three consequences of 2a's own build, surfaced before the live
+pass rather than by it: a degraded observed vocabulary was invisible and
+permanent, a newly-observed value was falsely rejected until a restart,
+and `find_deals` (correctly out of 2a's stated scope) still silently
+zero-matched a bad bucket argument in the tool most likely to inform a
+real purchase. `docs/learnings.md`'s extension to L15 has the general
+statement; this is the specific fix.
+
+**The `/health` status decision - 200 with a `vocabulary_degraded` flag,
+not 503.** D9's "up" already means "can read the database" via the
+existing schema-version check, which still 503s on a genuinely
+unreadable database - that check is unchanged. A degraded OBSERVED
+vocabulary for one field is a narrower, different condition: the
+database is fine, `/health`'s own schema query succeeds, and the
+degradation is scoped to whichever bucket fields fall back to observed
+values (today, only `cpu_family`) - five of eight tools never touch that
+field at all. Flipping the WHOLE server to `503` over one field's
+validation fidelity would page an operator for something that, with
+item 2's TTL-retry fix, is expected to self-heal within 60 seconds of
+the database becoming readable - a worse signal than the truth, which
+`vocabulary_degraded: bool` plus a per-field `vocabulary` block (source,
+count, `built_at`) already states precisely. `status` still carries the
+distinction textually (`"ok"` vs `"degraded"`) for a reader who wants it
+without computing `vocabulary_degraded` themselves. A profile-sourced
+field's `built_at` is always `null` - it was resolved once, from the
+profile, at process start, and "when was it last rebuilt" isn't a
+meaningful question for something that is never rebuilt (D13).
+
+**TTL rebuild, split cleanly from the fixed half.**
+`dealwatch/mcp_server/vocabulary.py`'s old `build_bucket_vocabulary()`
+(profile resolution + observed fallback, one call) is now two functions:
+`resolve_profile_vocabulary(profile)` (no I/O, called once at
+`server.py` import - unchanged footing from 2a) and
+`fetch_observed_vocabularies(conn, profile_id, fields)` (the DB read,
+now callable on demand instead of only at import). `build_bucket_vocabulary()`
+itself stays, unchanged in shape, as the single-call reference
+implementation prompt 2a's own tests compare against (L13) - `server.py`
+no longer calls it for its own runtime state.
+
+`server.py`'s new `_current_bucket_vocabulary()` is the ONE accessor
+every tool's `_validate_bucket_field()` and `/health`'s own report call -
+both see identical, always-current state, never two independently-drifting
+reads of "what's valid right now." Profile-sourced fields come straight
+from the fixed `_profile_vocabulary` computed at import (never touch the
+lock or the database - sabotage-verified: routing them through the
+rebuild path anyway made a monkeypatched `resolve_profile_vocabulary()`
+register calls it should never receive again after import). Observed
+fields are rebuilt at most once per 60s (`_VOCABULARY_TTL_SECONDS` - long
+enough that a validated call doesn't rescan `listings` every time, short
+enough that a database becoming readable, or a new value landing, is
+usable within about a minute rather than after the next restart) behind
+one `threading.Lock` - the same reasoning `dashboard_data.py`'s
+`get_payload()` cache already uses for concurrent renders on a cold
+cache, applied here to concurrent tool calls on an expired vocabulary.
+
+**A failed or empty build is never cached - the load-bearing line in this
+prompt.** `_current_bucket_vocabulary()` only writes a fresh cache entry
+for a field when the fetch actually returned at least one value; a
+failed fetch (exception, caught) or a successful-but-empty one leaves the
+prior cache entry (if any) untouched rather than overwriting it with a
+timestamped emptiness that would then look "fresh" for the next 60s.
+This is what makes Problem A self-healing instead of permanent -
+sabotage-verified twice: caching an empty result unconditionally (undoing
+the `if values:` guard) made a later, successful call still serve the
+stale empty vocabulary; skipping the TTL-elapsed check entirely (pinning
+the field as always "fresh") made a newly-observed value stay rejected
+past the point a real rebuild would have picked it up.
+
+**Import-time crash avoided the same way as 2a, exercised the same way.**
+The try/except moved from the old one-shot `_load_bucket_vocabulary()`
+into `_current_bucket_vocabulary()` itself, since that function is now
+called both at import (once, for `_DESCRIPTION_VOCABULARY_SNAPSHOT`, the
+frozen text embedded in the two tool descriptions that list valid values)
+and on every subsequent stale/missing rebuild. Sabotage-verified by
+removing it: with a never-created database, module IMPORT itself failed
+(a collection error in this checkout's own test run, and a non-zero
+subprocess exit in the dedicated test) rather than degrading - confirming
+the guard is still load-bearing at the exact point 2a's own addendum
+first identified.
+
+**Accurate rejection wording, one line of dispatch.**
+`_validate_bucket_field()` now reads the error message from
+`vocabulary["source"]`: an observed-sourced field says the value "has not
+been observed in any collected listing" (the check proved absence from
+COLLECTED DATA, not that the profile can't produce it - a materially
+different claim, since the very next real listing could make it true);
+a profile-sourced field keeps 2a's original "unknown {field} {value!r}"
+wording, since there the check really did prove the value can never be
+produced by this profile at all, restart or not.
+
+**`find_deals` gets the identical validation, no new logic.** Same
+`_validate_bucket_field()` calls, same `_bucket_field_error()` wrapper,
+same "return before any query runs" shape `get_market_price`/
+`query_listings` already use - closes the gap 2a's own addendum
+explicitly flagged and left open. Sabotage-verified: removing the three
+blocks let `cpu_family="Ryzen 5000"` return `{"deals": [], ...}` - a
+well-formed, empty-but-plausible answer that reads as "no deals right
+now" instead of "that isn't a real value."
+
+**Testing.** 8 new tests in `tests/test_mcp_server.py` (70 total for this
+file, 625 in the full suite), every required test sabotage-verified via
+real manual edit-run-revert (each behavior lives in
+`_current_bucket_vocabulary()`'s or `find_deals()`'s own inline logic,
+not behind a separately-importable seam): the try/except removal (import
+itself failed); the `if values:` cache guard removed (a later successful
+call still served stale emptiness); the TTL-elapsed check bypassed
+(cache never invalidated, `fetch_observed_vocabularies` called on every
+single validation instead of once per field per 60s window - caught via
+a counting wrapper around the imported function); the TTL check itself
+skipped in the other direction (a post-expiry call still rejected a
+newly-observed value); `_current_bucket_vocabulary()` re-resolving
+`resolve_profile_vocabulary(profile)` on every call instead of reading
+the fixed snapshot (caught via a counting wrapper - the real code path
+calls it exactly once, at import, for the whole process lifetime);
+`_vocabulary_health_block()` hardcoding `"count": 999`; the two rejection
+wordings collapsed to one; and `find_deals`' three validation blocks
+removed. `grep -n SABOTAGE dealwatch/mcp_server/server.py` returns
+nothing in the committed tree.
+
+The existing `_seed_cpu_family_vocabulary` autouse fixture (2a) was
+rewritten to seed `mcp_server._observed_vocabulary_cache` directly (the
+old `_bucket_vocabulary` static dict it patched no longer exists) - tests
+exercising the degraded/TTL mechanics themselves pop that one cache entry
+back out at the start of their own body, which `monkeypatch.setitem`'s
+teardown still correctly reverses regardless of what happens to the dict
+in between.
+
+**Out of scope, deliberately not attempted:** background threads,
+schedulers, or cache warming (the rebuild is purely lazy, triggered by
+the next call that needs it - including `/health`'s own, which is why
+`/health` can do a blocking DB read and is routed through
+`asyncio.to_thread` the same way `_read_schema_version()` already is);
+fuzzy matching or aliases (2a's reasoning stands, unchanged); parsing
+`cpu_family`'s templated extract rules to make it profile-enumerable
+(still not attempted - the TTL fix addresses staleness, not
+enumerability, and the two are independent problems).

@@ -31,6 +31,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -86,9 +87,25 @@ _TEST_CPU_FAMILIES = [
 
 @pytest.fixture(autouse=True)
 def _seed_cpu_family_vocabulary(monkeypatch):
-    vocab = dict(mcp_server._bucket_vocabulary)
-    vocab["cpu_family"] = {"values": list(_TEST_CPU_FAMILIES), "source": "observed"}
-    monkeypatch.setattr(mcp_server, "_bucket_vocabulary", vocab)
+    """Seeds mcp_server._observed_vocabulary_cache directly (V1.0 prompt
+    2b replaced the old static `_bucket_vocabulary` with a TTL-cached
+    accessor, `_current_bucket_vocabulary()`) - a fresh (real
+    time.monotonic()) cache entry so ordinary tests never trigger a
+    rebuild attempt against this checkout's real, listings-less
+    data/dealwatch.db. monkeypatch.setitem restores whatever was there
+    (nothing, in a fresh test session) after the test.
+
+    Tests that exercise the TTL/degraded-path mechanics THEMSELVES pop
+    "cpu_family" back out at the start of their own body
+    (`mcp_server._observed_vocabulary_cache.pop("cpu_family", None)`) -
+    monkeypatch still correctly restores the pre-fixture state afterward
+    regardless of what a test does to the dict in between.
+    """
+    monkeypatch.setitem(
+        mcp_server._observed_vocabulary_cache,
+        "cpu_family",
+        (time.monotonic(), int(time.time()), list(_TEST_CPU_FAMILIES)),
+    )
 
 
 def _use_db(monkeypatch, db_path) -> None:
@@ -1576,7 +1593,10 @@ def test_get_market_price_bad_cpu_family_errors_never_returns_seed(tmp_path, mon
     _use_db(monkeypatch, db_path)
 
     result = mcp_server.get_market_price(generation="1", cpu_family="Ryzen 5000", ram_tier="16")
-    assert result["error"] == "unknown cpu_family 'Ryzen 5000'"
+    # V1.0 prompt 2b: observed-sourced wording says NOT OBSERVED, not
+    # "unknown" - the check proved absence from collected data, not that
+    # the profile can't produce it.
+    assert result["error"] == "cpu_family 'Ryzen 5000' has not been observed in any collected listing"
     assert result["field"] == "cpu_family"
     assert "amd-ryzen-5000" in result["valid_values"]
     assert result["vocabulary_source"] == "observed"
@@ -1663,8 +1683,8 @@ def test_valid_values_matches_the_profile_vocabulary_helper_not_a_hardcoded_list
     assert result["valid_values"] == fresh["generation"]["values"]
 
     # Manual sabotage (source edit, run, revert - see report):
-    # _validate_bucket_field()'s `vocabulary = _bucket_vocabulary[field]`
-    # line replaced with a hardcoded stale dict for "generation"
+    # _validate_bucket_field()'s `vocabulary = _current_bucket_vocabulary()
+    # [field]` line replaced with a hardcoded stale dict for "generation"
     # ({"values": ["1", "2"], "source": "profile"} - missing 3-6) -
     # result["valid_values"] no longer equals fresh["generation"]["values"]
     # (["1",...,"6"]) - red-confirmed, reverted.
@@ -1678,7 +1698,7 @@ def test_tool_descriptions_embed_the_real_vocabulary_not_a_hardcoded_copy():
     for name in ("get_market_price", "query_listings"):
         description = tools[name].description
         for field in ("generation", "ram_tier"):
-            expected = repr(mcp_server._bucket_vocabulary[field]["values"])
+            expected = repr(mcp_server._DESCRIPTION_VOCABULARY_SNAPSHOT[field]["values"])
             assert expected in description, f"{name} description missing {field}'s real values"
 
     # Manual sabotage (source edit, run, revert - see report): replacing
@@ -1700,7 +1720,7 @@ def test_case_insensitive_match_accepted_near_miss_rejected(tmp_path, monkeypatc
     assert ok["resolved_bucket_key"] == "2|amd-ryzen-5000|16"  # canonical casing, not the caller's
 
     bad = mcp_server.get_market_price(generation="2", cpu_family="Ryzen 5000", ram_tier="16")
-    assert bad.get("error") == "unknown cpu_family 'Ryzen 5000'"
+    assert bad.get("error") == "cpu_family 'Ryzen 5000' has not been observed in any collected listing"
 
     # Manual sabotage (source edit, run, revert - see report): added a
     # difflib.get_close_matches() fallback to _validate_bucket_field() so
@@ -1795,3 +1815,278 @@ def test_invalid_bucket_argument_over_http_is_data_not_a_protocol_error(tmp_path
         assert payload["error"] == "unknown generation 'Gen 2'"
         assert payload["as_of"] > 0
         assert payload["profile_id"] == PROFILE_ID
+
+
+# ---------------------------------------------------------------------------
+# V1.0 prompt 2b - vocabulary freshness and visibility (design.md §15's
+# dated 2b addendum). Tests numbered per
+# v1.0-prompt-2b-vocabulary-freshness.md's own required-test list.
+# ---------------------------------------------------------------------------
+
+
+# --- 1: the degraded path is visible and survives import ----------------
+
+
+def test_degraded_vocabulary_path_imports_and_serves(tmp_path, monkeypatch):
+    # Opt out of the autouse cpu_family seed - this test exercises the
+    # real degraded/empty state, which the seed exists precisely to hide
+    # from every other test in this file.
+    mcp_server._observed_vocabulary_cache.pop("cpu_family", None)
+
+    # Import survival: a genuinely unreadable database (never created) at
+    # import time must not crash the module - the try/except inside
+    # _current_bucket_vocabulary() (exercised once, at import, for
+    # _DESCRIPTION_VOCABULARY_SNAPSHOT) is what prevents that.
+    never_created = tmp_path / "never-created.db"
+    script = (
+        "import os\n"
+        f"os.environ['PROFILE_PATH'] = {PROFILE_PATH!r}\n"
+        f"os.environ['DB_PATH'] = {str(never_created)!r}\n"
+        "import dealwatch.mcp_server.server\n"
+        "print('IMPORT_OK')\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, cwd=str(REPO_ROOT)
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "IMPORT_OK" in result.stdout
+
+    # Serves degraded: a READABLE but listings-less database (migrated,
+    # zero rows) - /health reports the zero count and the "degraded"
+    # status item 1's decision picked (200, not 503 - a narrow,
+    # self-healing degradation, not a whole-server outage - design.md's
+    # 2b addendum has the reasoning); a cpu_family argument is rejected as
+    # structured data, never an exception.
+    db_path = _make_db(tmp_path)
+    _use_db(monkeypatch, db_path)
+
+    with TestClient(mcp_server._build_app()) as client:
+        health_response = client.get("/health")
+    assert health_response.status_code == 200
+    health_body = health_response.json()
+    assert health_body["vocabulary"]["cpu_family"]["count"] == 0
+    assert health_body["vocabulary_degraded"] is True
+    assert health_body["status"] == "degraded"
+
+    result = mcp_server.get_market_price(generation="1", cpu_family="amd-ryzen-5000", ram_tier="16")
+    assert "error" in result
+    assert result["field"] == "cpu_family"
+
+    # Manual sabotage (source edit, run, revert - see report): removed the
+    # try/except inside _current_bucket_vocabulary() around the
+    # fetch_observed_vocabularies() call - the subprocess import above
+    # then raised sqlite3.OperationalError and the import itself failed
+    # (returncode != 0, "IMPORT_OK" never printed) - red-confirmed and
+    # reverted.
+
+
+# --- 2: an empty/failed build is never cached ----------------------------
+
+
+def test_empty_build_is_not_cached_retries_on_next_call(tmp_path, monkeypatch):
+    mcp_server._observed_vocabulary_cache.pop("cpu_family", None)
+
+    # First call: database doesn't exist yet at all - the fetch fails,
+    # degrades, and (this is the point) is NOT cached.
+    unreadable = tmp_path / "not-yet.db"
+    _use_db(monkeypatch, unreadable)
+    first = mcp_server.get_market_price(generation="1", cpu_family="amd-ryzen-5000", ram_tier="16")
+    assert first.get("field") == "cpu_family"
+    assert "cpu_family" not in mcp_server._observed_vocabulary_cache
+
+    # Database becomes available, with the value present - no restart.
+    db_path = _make_db(tmp_path)
+    conn = connect(db_path)
+    seed_listing(
+        conn, "v1|x|0", spec_status="ok", bucket_key="1|amd-ryzen-5000|16",
+        spec_json=json.dumps({"generation": "1", "cpu_family": "amd-ryzen-5000", "ram_tier": "16"}),
+    )
+    conn.close()
+    _use_db(monkeypatch, db_path)
+
+    second = mcp_server.get_market_price(generation="1", cpu_family="amd-ryzen-5000", ram_tier="16")
+    assert "error" not in second
+
+    # Manual sabotage (source edit, run, revert - see report): cached the
+    # empty fetch result unconditionally (dropped the `if values:` guard
+    # before writing to _observed_vocabulary_cache) - the second call,
+    # even with the database now readable and the value present, still
+    # returned the cached empty vocabulary and rejected the value -
+    # red-confirmed and reverted.
+
+
+# --- 3: a successful build IS cached within the TTL -----------------------
+
+
+def test_successful_build_is_cached_within_ttl(tmp_path, monkeypatch):
+    mcp_server._observed_vocabulary_cache.pop("cpu_family", None)
+    db_path = _make_db(tmp_path)
+    conn = connect(db_path)
+    seed_listing(
+        conn, "v1|x|0", spec_status="ok", bucket_key="1|amd-ryzen-5000|16",
+        spec_json=json.dumps({"generation": "1", "cpu_family": "amd-ryzen-5000", "ram_tier": "16"}),
+    )
+    conn.close()
+    _use_db(monkeypatch, db_path)
+
+    calls = []
+    real_fetch = mcp_server.fetch_observed_vocabularies
+
+    def _counting_fetch(conn, profile_id, fields):
+        calls.append(list(fields))
+        return real_fetch(conn, profile_id, fields)
+
+    monkeypatch.setattr(mcp_server, "fetch_observed_vocabularies", _counting_fetch)
+
+    mcp_server.get_market_price(generation="1", cpu_family="amd-ryzen-5000", ram_tier="16")
+    mcp_server.get_market_price(generation="1", cpu_family="amd-ryzen-5000", ram_tier="16")
+    assert len(calls) == 1
+
+    # Manual sabotage (source edit, run, revert - see report): the
+    # `stale_or_missing` filter in _current_bucket_vocabulary() changed to
+    # always include every observed field regardless of the cache -
+    # `calls` came back length 2 instead of 1 - red-confirmed and reverted.
+
+
+# --- 4: a newly-observed value is accepted after the TTL ------------------
+
+
+def test_newly_observed_value_accepted_after_ttl_expiry(tmp_path, monkeypatch):
+    mcp_server._observed_vocabulary_cache.pop("cpu_family", None)
+    db_path = _make_db(tmp_path)
+    conn = connect(db_path)
+    seed_listing(
+        conn, "v1|x|0", spec_status="ok", bucket_key="1|amd-ryzen-5000|16",
+        spec_json=json.dumps({"generation": "1", "cpu_family": "amd-ryzen-5000", "ram_tier": "16"}),
+    )
+    conn.close()
+    _use_db(monkeypatch, db_path)
+
+    clock = [1_000_000.0]
+    monkeypatch.setattr(mcp_server.time, "monotonic", lambda: clock[0])
+
+    # amd-ryzen-7000 not present at build time.
+    first = mcp_server.get_market_price(generation="4", cpu_family="amd-ryzen-7000", ram_tier="16")
+    assert first.get("field") == "cpu_family"
+
+    # A real listing lands.
+    conn = connect(db_path)
+    seed_listing(
+        conn, "v1|y|0", spec_status="ok", bucket_key="4|amd-ryzen-7000|16",
+        spec_json=json.dumps({"generation": "4", "cpu_family": "amd-ryzen-7000", "ram_tier": "16"}),
+    )
+    conn.close()
+
+    # Still inside the TTL - still rejected (serving the cached build).
+    clock[0] += 30
+    still_rejected = mcp_server.get_market_price(generation="4", cpu_family="amd-ryzen-7000", ram_tier="16")
+    assert still_rejected.get("field") == "cpu_family"
+
+    # Past the TTL - the rebuild picks up the newly-observed value, no
+    # restart needed. Clock controlled explicitly, never slept on.
+    clock[0] += mcp_server._VOCABULARY_TTL_SECONDS
+    accepted = mcp_server.get_market_price(generation="4", cpu_family="amd-ryzen-7000", ram_tier="16")
+    assert "error" not in accepted
+
+    # Manual sabotage (source edit, run, revert - see report): pinned
+    # _current_bucket_vocabulary() to always treat "cpu_family" as fresh
+    # (skip the TTL-elapsed check entirely) - the post-expiry call still
+    # rejected amd-ryzen-7000 - red-confirmed and reverted.
+
+
+# --- 5: profile-sourced fields are never rebuilt on the TTL path ----------
+
+
+def test_profile_sourced_fields_are_not_rebuilt_on_ttl_path(monkeypatch):
+    calls = []
+    real_resolve = mcp_server.resolve_profile_vocabulary
+
+    def _counting_resolve(profile):
+        calls.append(profile)
+        return real_resolve(profile)
+
+    monkeypatch.setattr(mcp_server, "resolve_profile_vocabulary", _counting_resolve)
+
+    clock = [2_000_000.0]
+    monkeypatch.setattr(mcp_server.time, "monotonic", lambda: clock[0])
+
+    mcp_server._current_bucket_vocabulary()
+    clock[0] += mcp_server._VOCABULARY_TTL_SECONDS * 3
+    mcp_server._current_bucket_vocabulary()
+    mcp_server._current_bucket_vocabulary()
+
+    # resolve_profile_vocabulary() ran exactly once, at import - never
+    # again, regardless of how many times the TTL has elapsed since.
+    assert calls == []
+
+    # Manual sabotage (source edit, run, revert - see report):
+    # _current_bucket_vocabulary() changed to call
+    # resolve_profile_vocabulary(profile) fresh on every invocation
+    # instead of reading the fixed _profile_vocabulary - `calls` came back
+    # non-empty - red-confirmed and reverted.
+
+
+# --- 6: /health's vocabulary block matches the live accessor --------------
+
+
+def test_health_vocabulary_block_matches_the_live_accessor(tmp_path, monkeypatch):
+    db_path = _make_db(tmp_path)
+    _use_db(monkeypatch, db_path)
+
+    expected = mcp_server._current_bucket_vocabulary()
+
+    with TestClient(mcp_server._build_app()) as client:
+        response = client.get("/health")
+    body = response.json()
+
+    for field in ("generation", "cpu_family", "ram_tier"):
+        assert body["vocabulary"][field]["count"] == len(expected[field]["values"]), field
+        assert body["vocabulary"][field]["source"] == expected[field]["source"], field
+
+    # Manual sabotage (source edit, run, revert - see report):
+    # _vocabulary_health_block() hardcoded "count": 999 for every field
+    # instead of len(vocabulary[field]["values"]) - every one of the three
+    # assertions above failed - red-confirmed and reverted.
+
+
+# --- 7: rejection wording differs by vocabulary source ---------------------
+
+
+def test_rejection_wording_differs_by_vocabulary_source(tmp_path, monkeypatch):
+    db_path = _make_db(tmp_path)
+    _use_db(monkeypatch, db_path)
+
+    observed_error = mcp_server.get_market_price(generation="1", cpu_family="nonsense", ram_tier="16")
+    assert observed_error["error"] == "cpu_family 'nonsense' has not been observed in any collected listing"
+    assert "unknown" not in observed_error["error"]
+
+    profile_error = mcp_server.get_market_price(generation="99", cpu_family="amd-ryzen-5000", ram_tier="16")
+    assert profile_error["error"] == "unknown generation '99'"
+    assert "observed" not in profile_error["error"]
+
+    # Manual sabotage (source edit, run, revert - see report):
+    # _validate_bucket_field() changed to always build the "unknown
+    # {field} {value!r}" message regardless of vocabulary["source"] -
+    # observed_error["error"] became "unknown cpu_family 'nonsense'",
+    # failing the not-observed assertion above - red-confirmed and
+    # reverted.
+
+
+# --- 8: find_deals validates its bucket arguments --------------------------
+
+
+def test_find_deals_rejects_bad_bucket_argument_instead_of_empty_deals(tmp_path, monkeypatch):
+    db_path = _make_db(tmp_path)
+    _use_db(monkeypatch, db_path)
+
+    result = mcp_server.find_deals(cpu_family="Ryzen 5000")
+    assert "deals" not in result
+    assert result.get("field") == "cpu_family"
+    assert result.get("as_of") is not None
+    assert result.get("profile_id") == PROFILE_ID
+
+    # Manual sabotage (source edit, run, revert - see report): removed
+    # find_deals' three validation blocks - "Ryzen 5000" then silently
+    # matched zero listings and the response carried "deals": [] (a
+    # legitimate-looking, empty market answer) instead of an error -
+    # red-confirmed and reverted.

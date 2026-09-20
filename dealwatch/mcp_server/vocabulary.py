@@ -86,7 +86,34 @@ def _extract_vocabulary(profile: Profile, field: str) -> list[str] | None:
     return _literal_or_none([rule.value for rule in extract_field.rules])
 
 
-def _observed_vocabularies(
+def resolve_profile_vocabulary(profile: Profile) -> tuple[dict[str, dict], list[str]]:
+    """({field: {"values": [...], "source": "profile"}}, [fields needing
+    the observed fallback]) - the profile-only half of vocabulary
+    resolution, needing no database access at all (V1.0 prompt 2b,
+    design.md §15's dated addendum). Split out from the old single
+    build_bucket_vocabulary() so a caller can compute this ONCE, at
+    process start, and never touch it again - unlike the observed
+    fallback, nothing about a field resolved here can change without a
+    profile edit, which already requires a container restart (D13).
+    """
+    profile_vocabulary: dict[str, dict] = {}
+    observed_fields: list[str] = []
+
+    for field in VOCABULARY_FIELDS:
+        values = _tier_vocabulary(profile, field)
+        if values is None:
+            values = _derive_vocabulary(profile, field)
+        if values is None:
+            values = _extract_vocabulary(profile, field)
+        if values is None:
+            observed_fields.append(field)
+        else:
+            profile_vocabulary[field] = {"values": values, "source": "profile"}
+
+    return profile_vocabulary, observed_fields
+
+
+def fetch_observed_vocabularies(
     conn: sqlite3.Connection, profile_id: str, fields: list[str]
 ) -> dict[str, list[str]]:
     """Distinct non-NULL values `fields` have actually taken, read from
@@ -100,6 +127,12 @@ def _observed_vocabularies(
     reporting/panels.py's baseline_queue() already use - never a second,
     SQL-side JSON extraction the rest of this codebase doesn't use
     elsewhere.
+
+    A real database dependency, unlike resolve_profile_vocabulary() above -
+    the caller (server.py's TTL-rebuild accessor, V1.0 prompt 2b) is
+    responsible for deciding how often to call this and what to do with
+    an empty or failed result; this function itself has no notion of
+    caching, staleness, or a fallback value.
     """
     found: dict[str, set[str]] = {field: set() for field in fields}
     rows = conn.execute(
@@ -120,32 +153,24 @@ def build_bucket_vocabulary(
     profile: Profile, conn: sqlite3.Connection | None
 ) -> dict[str, dict]:
     """{field: {"values": [...], "source": "profile" | "observed"}} for
-    every field in VOCABULARY_FIELDS. Called once at server.py import
-    time (see that module's own comment on why the observed-fallback
-    branch degrades gracefully to an empty list rather than crashing
-    startup when `conn` can't be used). `conn` may be None - every field
-    that needs the observed fallback then gets an empty vocabulary rather
-    than a query attempt; this is a genuine "cannot validate yet" state,
-    not treated as "everything is valid."
+    every field in VOCABULARY_FIELDS - a one-shot composition of
+    resolve_profile_vocabulary() + fetch_observed_vocabularies() for a
+    caller that wants the whole thing in one call and doesn't need TTL
+    caching (V1.0 prompt 2a's original shape; V1.0 prompt 2b's server.py
+    no longer calls this directly for its own runtime state - see that
+    module's `_current_bucket_vocabulary()` - but keeps it as the
+    single-call reference implementation tests compare against, L13).
+    `conn` may be None - every field needing the observed fallback then
+    gets an empty vocabulary rather than a query attempt.
     """
-    result: dict[str, dict] = {}
-    needs_observed: list[str] = []
+    profile_vocabulary, observed_fields = resolve_profile_vocabulary(profile)
+    result: dict[str, dict] = dict(profile_vocabulary)
+    for field in observed_fields:
+        result[field] = {"values": [], "source": "observed"}
 
-    for field in VOCABULARY_FIELDS:
-        values = _tier_vocabulary(profile, field)
-        if values is None:
-            values = _derive_vocabulary(profile, field)
-        if values is None:
-            values = _extract_vocabulary(profile, field)
-        if values is None:
-            needs_observed.append(field)
-            result[field] = {"values": [], "source": "observed"}
-        else:
-            result[field] = {"values": values, "source": "profile"}
-
-    if needs_observed and conn is not None:
-        observed = _observed_vocabularies(conn, profile.id, needs_observed)
-        for field in needs_observed:
+    if observed_fields and conn is not None:
+        observed = fetch_observed_vocabularies(conn, profile.id, observed_fields)
+        for field in observed_fields:
             result[field]["values"] = observed.get(field, [])
 
     return result
