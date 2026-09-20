@@ -373,3 +373,38 @@ LOOKS like it exercised the thing being verified, without actually doing
 so. The fix is procedural, not technical - when verifying an MCP tool (or
 any tool-calling client) actually ran something, check the callee's own
 side, not the caller's summary of it.
+
+## L15 - a tool description is advice a model may drop; anything that selects a code path must be enforced in tool code
+
+V1.0 prompt 2's live pass (design.md §15's 2a addendum): `get_market_price`
+called with `generation="Gen 2"`, `cpu_family="Ryzen 5000"`,
+`ram_tier="16GB"` - none of which are this profile's real values (`2`,
+`amd-ryzen-5000`, `16`) - did not error. The computed-baseline lookup
+missed on the malformed `bucket_key` (as it should have - that bucket_key
+genuinely has no computed row), execution fell through to the **seed**
+layer exactly as it would for any bucket with no computed baseline yet,
+and the tool returned a confident, correctly-caveated, WRONG price. The
+tool's own description already said generation/cpu_family/ram_tier had to
+match normalized fields - that caveat did nothing, because a description
+is read (or not) by the model, not enforced by the runtime.
+
+The seed-layer fallthrough is not the bug - it is a legitimate branch,
+the correct answer for a real bucket that just hasn't reached
+`min_samples` yet. The bug is that the SAME branch was also silently the
+destination for a value nobody in this system ever produces. Nothing in
+`get_market_price`'s code path could tell "immature but real" apart from
+"not real to begin with" - both looked exactly like "no computed baseline
+row," because both took the identical code path to get there.
+
+The general shape: a tool DESCRIPTION is advice - the model may summarize
+it, forget part of it, or just not have read it closely enough to catch
+that "Gen 2" isn't the same string as "2". Tool CODE is a contract - it
+runs on every call regardless of whether the description was read at all.
+Any caveat that changes which code path executes (not just how a result
+is interpreted) has to be enforced where the branch actually happens, not
+stated next to it and trusted. `dealwatch/mcp_server/vocabulary.py`'s
+fix - reject an out-of-vocabulary `generation`/`cpu_family`/`ram_tier`
+as a structured error before any lookup runs, case-insensitive exact
+match only, no fuzzy correction - is the general pattern: a legitimate
+fallback branch must never also be able to be reached by malformed input
+that was never a real case of the thing the fallback exists for.

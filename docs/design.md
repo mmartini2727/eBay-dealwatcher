@@ -2609,3 +2609,171 @@ client behavior, the actual `find_deals` timing against production data,
 and whether the tool descriptions are good enough that a model reaches
 the right conclusions from them. All three are the live-verification
 steps below, Myke's to run.
+
+### Build addendum (prompt 2a, 2026-09-20)
+
+**The live-pass defect that caused this prompt.** `get_market_price`
+called with `generation="Gen 2"`, `cpu_family="Ryzen 5000"`,
+`ram_tier="16GB"` - none of which are this profile's real values (`2`,
+`amd-ryzen-5000`, `16`) - did not error. The malformed `bucket_key` had no
+`baselines` row (correctly - it never could), execution fell through to
+the seed layer exactly as it would for any immature-but-real bucket, and
+the tool returned a confident, correctly-caveated, wrong price. `docs/
+learnings.md` L15 has the full account; the principle it generalizes to:
+a tool DESCRIPTION is advice the model may drop; tool CODE is a contract
+that runs regardless. Anything that changes which code path executes has
+to be enforced in code, not stated in a description and trusted.
+
+**Which bucket fields were enumerable from the profile, and which
+weren't - the milestone's own required finding.** New module
+`dealwatch/mcp_server/vocabulary.py`, checked against the real profile
+before wiring it into `server.py`:
+- `ram_tier` - **profile**, via `tiers`. `profile.tiers["ram_tier"]
+  .breaks` labels ("8"/"16"/"32"/"48") are exhaustive by construction:
+  `_apply_tier()` (normalize/engine.py) always returns one of these
+  labels or `None`, never anything else.
+- `generation` - **profile**, via `derive`, not `extract`. Its own
+  `extract` rules (`\bgen\s*([1-6])\b` etc.) are both template-valued
+  (`value: '{1}'`) and can't be read as a literal list. But every
+  `derive` rule targeting `generation` maps one `cpu_family` value to a
+  literal digit string ("1" through "6", one rule per family) - a
+  finite, profile-authored mapping, enumerable the same way a tier's
+  breaks are, regardless of the fact that a *different* mechanism
+  (extract) can also produce the same field. `vocabulary.py`'s priority
+  order (tiers, then derive, then extract, then observed) exists
+  specifically so a field like this - not a tier, but still genuinely
+  enumerable - doesn't fall all the way to the observed-values fallback
+  for no real reason.
+- `cpu_family` - **observed** (falls back to real data). Its `extract`
+  rules mix literal values (`amd-ryzen-5000`, ...) with two
+  capture-group-templated ones (`'intel-{1}th'` for the two ordinal
+  fallback patterns) - not every rule in the list is literal, so the
+  rule list alone is not a safe, complete enumeration without parsing
+  the templated patterns' character classes, which this module
+  deliberately does not attempt (see "out of scope" below). Falls back
+  to the distinct non-NULL `cpu_family` values actually present in
+  `listings.spec_json` for this profile - real marketplace vocabulary
+  that can't drift from what the profile actually produces, unlike a
+  hand-maintained list would.
+
+If **no** field had turned out enumerable this prompt would have stopped
+short of building the tiers/derive/extract inspection at all and reported
+that instead - it didn't come to that; two of three fields resolved from
+the profile with no database dependency whatsoever.
+
+**Computed once, but LAZILY-eager rather than the literal "at startup" -
+a deliberate deviation, not an oversight.** `profile`/`compiled_seeds`
+need no I/O at all and are safely computed at raw Python import time. The
+`observed` fallback for `cpu_family` needs a real database read, and
+computing that unconditionally at import time (before any request has
+landed, before uvicorn's own lifespan has even started) means a
+not-yet-writable database at container boot - the exact WAL caveat
+`connect_readonly()`'s own docstring already states, "cannot work until a
+writer has opened the file at least once" - would raise `sqlite3
+.OperationalError` and crash the whole module import, taking the MCP
+container down over a feature scoped to three tool arguments. `server.py`
+still computes the full vocabulary once, still at the earliest possible
+point (module import), but wraps the database-dependent branch in a
+`try`/`except` that degrades to an empty vocabulary for the affected
+field(s) rather than crashing - the same "up means the database is
+readable, not that uvicorn is listening" posture D9's `/health` route
+already takes, applied to import time instead of request time. The
+honest cost: if the database genuinely isn't reachable at container
+boot, `cpu_family` validation rejects every value until the next
+restart - a real, narrow failure mode, not a silent "everything is
+valid." Confirmed empirically in this checkout (no Docker daemon, and
+`data/dealwatch.db` here is a fresh 0-byte file with no `listings`
+table): import logs a warning and proceeds; `generation`/`ram_tier`
+validate correctly throughout (they need no database at all);
+`cpu_family` rejects everything until a real database with `listings`
+rows exists at the next import.
+
+**Case-insensitive exact match, canonical spelling returned.**
+`_validate_bucket_field()` matches `value.lower() == canonical.lower()`
+against the field's real vocabulary and, on a match, returns the
+CANONICAL spelling from the vocabulary - not the caller's own casing -
+so every downstream `bucket_key` string and `baselines`/`alerts` lookup
+uses the profile's real spelling (`amd-ryzen-5000`) regardless of how the
+model wrote it (`AMD-RYZEN-5000`). No fuzzy matching, no alias table, no
+"did you mean" correction - sabotage-verified: adding a
+`difflib.get_close_matches()` fallback let `"Ryzen 5000"` silently
+resolve to `amd-ryzen-5000` with no error, which is the exact class of
+bug this prompt exists to close, just with an extra step. Reverted.
+
+**Two empty cases, one new query.** `get_market_price`'s `baseline.state`
+now distinguishes `no_computed_baseline` (the bucket has real listing
+history - some listing has this exact `bucket_key` - but hasn't reached
+`min_samples` fast candidates yet) from `bucket_never_observed` (no
+listing, ever, has normalized into this exact `bucket_key`). The check is
+one cheap point-ish query (`SELECT 1 FROM listings WHERE profile_id = ?
+AND bucket_key = ? LIMIT 1`) run only when there's no computed row;
+`derive_candidates()`'s much more expensive full scan of every dead 'ok'
+listing (the same pass `reporting/panels.py`'s `baseline_queue()` and
+this tool's own prompt-2 build already use) is skipped entirely for a
+never-observed bucket, since a bucket nobody has ever listed into has
+zero fast candidates by construction - no need to run the scan to learn
+that.
+
+**`resolved_bucket_key` added, not renamed, in three places.**
+`get_market_price` (the bucket key constructed from validated,
+canonicalized arguments), every `find_deals` row (identical to that row's
+existing `bucket_key` field today - a real listing's own bucket_key IS
+what it was scored against, so there's no "requested vs. used"
+distinction for this tool the way there is for `get_market_price`; added
+for naming parity so a caller doesn't need to know which of the two tools
+it's reading from to find "the bucket key this answer used"), and
+`explain_listing` (top-level, alongside `identity`/`normalization`/etc. -
+the same value `_score_section()` already scored against, surfaced
+without requiring a read into that nested section).
+
+**Testing.** 10 new tests in `tests/test_mcp_server.py` (62 total for
+this file, 617 in the full suite), every required test sabotage-verified.
+Six went through a real manual edit-run-revert pass (inline validation
+blocks and a literal string in a docstring, not behind an importable
+seam): dropping all three of `get_market_price`'s validation blocks in
+one pass (every field's bad-value test went red together, prices
+appeared where an error should have); the identical drop for
+`query_listings`' three blocks (all three cases silently returned
+`total_count` with no error field); hardcoding a stale
+`{"values": ["1", "2"], ...}` dict inline in `_validate_bucket_field()`
+for the `generation` field (the tool's echoed `valid_values` stopped
+matching a fresh, independent call to `build_bucket_vocabulary()` against
+the same loaded profile); hardcoding a literal `"['1', '2']"` string into
+`query_listings`' description instead of the `repr(...)` expression (the
+description no longer contained the real 6-value list); adding a
+`difflib`-based fuzzy fallback (documented above); and hardcoding
+`ever_observed = True` (both the "3 dead candidates, no baseline yet" and
+the "genuinely never observed" fixtures collapsed to the same
+`no_computed_baseline` state). One test - `resolved_bucket_key` presence
+- was sabotaged by commenting out the field's assignment in
+`explain_listing` specifically (a `KeyError` on the test's own access,
+red-confirmed). `grep -n SABOTAGE dealwatch/mcp_server/server.py` returns
+nothing in the committed tree.
+
+Existing prompt-1/prompt-2 tests needed one fixture addition to keep
+passing under real `cpu_family` validation: an autouse
+`_seed_cpu_family_vocabulary` fixture in `tests/test_mcp_server.py`
+seeds a representative set of this profile's real `cpu_family` literal
+values into `mcp_server._bucket_vocabulary` for the duration of each
+test, the same reasoning `_use_db` already applies to `DB_PATH` - this
+checkout's own `data/dealwatch.db` (empty, no `listings` table) would
+otherwise leave `cpu_family`'s observed vocabulary permanently empty for
+the whole test session, rejecting every real value used elsewhere in the
+file.
+
+**Out of scope, deliberately not attempted:** parsing a templated
+`extract` rule's regex pattern to derive its own character-class-bounded
+domain (would have made `cpu_family`'s two ordinal-fallback rules and
+`generation`'s own `extract` rules enumerable without the `derive`/
+`observed` fallbacks, but is exactly the kind of speculative generality
+this prompt's own "do not extend it" rules out - the `derive`-sourced
+enumeration for `generation` and the `observed` fallback for `cpu_family`
+both work today without it); any fuzzy/alias/"interpret natural language"
+layer; `find_deals`' own `generation`/`cpu_family`/`ram_tier` filter
+arguments were NOT given input validation (only `get_market_price` and
+`query_listings` are named in the milestone's deliverable 2) - they
+remain silently zero-matching on a bad value today, same as before this
+prompt; a background refresh of the `observed` vocabulary as new listings
+normalize was not built - it is fixed at process start, same footing as
+`profile`/`compiled_seeds`, and a profile change already needs a restart
+to take effect (D13) which this now shares.

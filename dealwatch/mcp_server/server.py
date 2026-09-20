@@ -99,6 +99,7 @@ from dealwatch.engine.scoring import (
 )
 from dealwatch.mcp_server.formatting import age_display, money_display, parse_iso, time_display
 from dealwatch.mcp_server.item_lookup import resolve_item_ids
+from dealwatch.mcp_server.vocabulary import VOCABULARY_FIELDS, build_bucket_vocabulary
 from dealwatch.normalize.engine import compile_profile, normalize_verbose
 from dealwatch.normalize.listing import normalize_input_fields
 from dealwatch.providers.ratelimit import PACIFIC, la_day_bounds
@@ -161,6 +162,14 @@ def _argument_error(message: str, now: int) -> dict:
     return {"error": message, "as_of": now, "profile_id": profile.id}
 
 
+def _bucket_field_error(now: int, error: dict) -> dict:
+    """Stamps `as_of`/`profile_id` onto a `_validate_bucket_field()`
+    error object (D11's "every response carries as_of/profile_id"
+    convention applies to an argument-error response too, not just a
+    successful one)."""
+    return {**error, "as_of": now, "profile_id": profile.id}
+
+
 @contextmanager
 def _readonly_conn():
     """The ONE connect_readonly() call site every tool in this module uses
@@ -191,6 +200,69 @@ def _readonly_conn():
         yield conn
     finally:
         conn.close()
+
+
+def _load_bucket_vocabulary() -> dict:
+    """Computed once, at import time, the same "fixed at process start"
+    footing as `profile`/`compiled_seeds` (V1.0 prompt 2a, design.md §15's
+    dated addendum) - not recomputed per tool call, and not refreshed
+    without a restart, matching D13's "profile change needs a restart"
+    precedent (a `derive`/`extract`/`tiers` vocabulary source can only
+    change via a profile edit anyway; an `observed` source could in
+    principle drift as new listings normalize, but this module doesn't
+    chase that - see the design.md addendum for why refreshing it was
+    deliberately left out of this prompt's scope).
+
+    Unlike `profile`/`compiled_seeds`, this DOES need a database read for
+    any field whose vocabulary falls back to observed values (today:
+    `cpu_family`) - a real dependency `profile`/`compiled_seeds` don't
+    have. Wrapped in try/except rather than left to raise: a missing or
+    not-yet-writable database at container boot (the WAL caveat
+    `connect_readonly()`'s own docstring already states - it cannot work
+    until a writer has opened the file at least once) must not crash this
+    module's import and take the whole process down over a feature this
+    specific to three tool arguments. Degrades to an empty vocabulary for
+    the affected field(s) instead - `_validate_bucket_field()` below then
+    correctly refuses every value for that field until the next restart,
+    a real but honest failure mode, not a silent "everything is valid."
+    """
+    try:
+        with _readonly_conn() as conn:
+            return build_bucket_vocabulary(profile, conn)
+    except Exception:
+        logger.warning(
+            "bucket vocabulary: database unavailable at startup - "
+            "observed-value fields will reject everything until restart",
+            exc_info=True,
+        )
+        return build_bucket_vocabulary(profile, None)
+
+
+_bucket_vocabulary = _load_bucket_vocabulary()
+
+
+def _validate_bucket_field(field: str, value: str) -> tuple[str, None] | tuple[None, dict]:
+    """Case-insensitive EXACT match against `field`'s real vocabulary - no
+    fuzzy matching, no aliasing, no "did you mean" normalization
+    (design.md's 2a addendum: silently accepting a near-miss is the same
+    class of bug as silently falling through to the seed layer, just in a
+    friendlier coat). On a match, returns the CANONICAL spelling from the
+    vocabulary - not the caller's own casing - so every downstream
+    `bucket_key` string and DB lookup uses the profile's real spelling
+    regardless of how the caller wrote it. On no match, returns the
+    structured error object V1.0 prompt 2a's contract specifies; the
+    caller is responsible for adding `as_of`/`profile_id` before
+    returning it (this function has no `now` to stamp one with)."""
+    vocabulary = _bucket_vocabulary[field]
+    for canonical in vocabulary["values"]:
+        if canonical.lower() == value.lower():
+            return canonical, None
+    return None, {
+        "error": f"unknown {field} {value!r}",
+        "field": field,
+        "valid_values": vocabulary["values"],
+        "vocabulary_source": vocabulary["source"],
+    }
 
 
 mcp = MCPServer(
@@ -353,8 +425,16 @@ _QUERY_LISTINGS_GROUP_BY_FIELDS = (
         "'ci5' and 'i5-1135G7') - use cpu_family for a normalized count. "
         "A relisted machine gets a brand-new item_id and cannot be linked "
         "to its earlier listing here - this counts LISTINGS, not "
-        "machines. generation/cpu_family/ram_tier match normalized "
-        "fields; a partial listing missing that field will not match. "
+        "machines. generation/cpu_family/ram_tier are validated against "
+        "this profile's real vocabulary (case-insensitive exact match, "
+        "no fuzzy matching) - an unrecognized value returns a structured "
+        "error naming valid_values rather than silently matching zero "
+        "listings with no indication why; a partial listing legitimately "
+        "missing the field still won't match a VALID value. Valid "
+        "generation: " + repr(_bucket_vocabulary["generation"]["values"])
+        + ". Valid ram_tier: " + repr(_bucket_vocabulary["ram_tier"]["values"])
+        + ". Valid cpu_family (" + _bucket_vocabulary["cpu_family"]["source"]
+        + "): " + repr(_bucket_vocabulary["cpu_family"]["values"]) + ". "
         "period is mutually exclusive with seen_since/seen_before - "
         "passing both returns an 'error' field instead of raising. "
         + _TOOL_CAVEAT
@@ -386,6 +466,18 @@ def query_listings(
         return _argument_error(
             f"group_by must be one of {_QUERY_LISTINGS_GROUP_BY_FIELDS}", now
         )
+    if generation is not None:
+        generation, error = _validate_bucket_field("generation", generation)
+        if error is not None:
+            return _bucket_field_error(now, error)
+    if cpu_family is not None:
+        cpu_family, error = _validate_bucket_field("cpu_family", cpu_family)
+        if error is not None:
+            return _bucket_field_error(now, error)
+    if ram_tier is not None:
+        ram_tier, error = _validate_bucket_field("ram_tier", ram_tier)
+        if error is not None:
+            return _bucket_field_error(now, error)
 
     if seen_since is not None or seen_before is not None:
         window_start, window_end = seen_since, seen_before
@@ -619,6 +711,14 @@ def find_deals(
                 "title": row["title"],
                 "item_web_url": row["item_web_url"],
                 "bucket_key": row["bucket_key"],
+                # Same value as bucket_key here (a stored listing's own
+                # bucket_key IS what it was scored against, unlike
+                # get_market_price which resolves one from validated
+                # arguments) - present under this name too so a caller
+                # doesn't need to know which of the two tools it's reading
+                # from to find "the bucket key this answer used" (V1.0
+                # prompt 2a, design.md §15's dated addendum).
+                "resolved_bucket_key": row["bucket_key"],
                 "price_cents": result.price_cents,
                 "price_display": money_display(result.price_cents),
                 "baseline_layer": result.baseline_layer,
@@ -993,6 +1093,12 @@ def explain_listing(item_id_or_url: str) -> dict:
             "found": True,
             "as_of": now,
             "profile_id": profile.id,
+            # The bucket_key the score section actually scored against
+            # (row["bucket_key"], the stored value - not a re-derived
+            # one), surfaced at the top level so it's visible without
+            # reading into "score" (V1.0 prompt 2a, design.md §15's dated
+            # addendum).
+            "resolved_bucket_key": row["bucket_key"],
             "identity": _identity_section(row),
             "normalization": _normalization_section(row, observations),
             "timeline": _timeline_section(row, observations, now),
@@ -1022,18 +1128,44 @@ def explain_listing(item_id_or_url: str) -> dict:
         "When no computed baseline exists yet, fast_candidates/"
         "min_samples shows how close this bucket is, using the exact "
         "fast-candidate definition compute_baselines() itself uses - not "
-        "a hand-rolled count. alert_time_p25_series is p25 AS OF each "
+        "a hand-rolled count. baseline.state distinguishes TWO different "
+        "empty cases: 'no_computed_baseline' means this bucket has real "
+        "listing history but hasn't reached min_samples fast candidates "
+        "yet; 'bucket_never_observed' means no listing has EVER "
+        "normalized into this exact bucket - the seed price reported is "
+        "an estimate for a configuration nobody has actually listed, not "
+        "just an immature one. alert_time_p25_series is p25 AS OF each "
         "time this bucket actually alerted over the last 30 days - it has "
         "GAPS wherever nothing alerted and is NOT a continuous price "
         "trend. There is no baseline_history table - `baselines` is "
         "overwritten on every manual recompute, so this series is the "
         "only record of what p25 used to be, and it is biased toward "
         "whatever triggered an alert, not a representative sample. "
+        "generation/cpu_family/ram_tier are validated against this "
+        "profile's real vocabulary (case-insensitive exact match, no "
+        "fuzzy matching) - an unrecognized value returns a structured "
+        "error naming valid_values rather than silently falling through "
+        "to a seed price for the wrong configuration. Valid generation: "
+        + repr(_bucket_vocabulary["generation"]["values"])
+        + ". Valid ram_tier: " + repr(_bucket_vocabulary["ram_tier"]["values"])
+        + ". Valid cpu_family (" + _bucket_vocabulary["cpu_family"]["source"]
+        + "): " + repr(_bucket_vocabulary["cpu_family"]["values"]) + ". "
         + _TOOL_CAVEAT
     )
 )
 def get_market_price(generation: str, cpu_family: str, ram_tier: str) -> dict:
     now = int(time.time())
+
+    generation, error = _validate_bucket_field("generation", generation)
+    if error is not None:
+        return _bucket_field_error(now, error)
+    cpu_family, error = _validate_bucket_field("cpu_family", cpu_family)
+    if error is not None:
+        return _bucket_field_error(now, error)
+    ram_tier, error = _validate_bucket_field("ram_tier", ram_tier)
+    if error is not None:
+        return _bucket_field_error(now, error)
+
     bucket_key = f"{generation}|{cpu_family}|{ram_tier}"
     spec = {"generation": generation, "cpu_family": cpu_family, "ram_tier": ram_tier}
     min_samples = profile.scoring.get("min_samples", 12)
@@ -1047,16 +1179,35 @@ def get_market_price(generation: str, cpu_family: str, ram_tier: str) -> dict:
         ).fetchone()
 
         fast_candidates = None
+        state = "computed"
         if row is None:
-            # Same function group_fast_candidates_by_bucket()/
-            # derive_candidates() compute_baselines() and
-            # reporting/panels.py's baseline_queue() already call - the
-            # "one exclusion definition" rule (docs/learnings.md L13), not
-            # a second, hand-rolled COUNT(*).
-            fast_lifespan_hours = profile.scoring.get("fast_lifespan_hours", 24)
-            candidates = derive_candidates(conn)
-            fast_by_bucket = group_fast_candidates_by_bucket(candidates, fast_lifespan_hours)
-            fast_candidates = len(fast_by_bucket.get(bucket_key, []))
+            # A bucket nobody has ever listed into doesn't need the
+            # derive_candidates() pass run just to learn its fast count is
+            # trivially 0 - that pass scans every dead 'ok' listing
+            # (engine/baselines.py), the most expensive part of this tool,
+            # and skipping it here is free: zero listings in the bucket
+            # means zero fast candidates by construction.
+            ever_observed = (
+                conn.execute(
+                    "SELECT 1 FROM listings WHERE profile_id = ? AND bucket_key = ? LIMIT 1",
+                    (profile.id, bucket_key),
+                ).fetchone()
+                is not None
+            )
+            if not ever_observed:
+                state = "bucket_never_observed"
+                fast_candidates = 0
+            else:
+                state = "no_computed_baseline"
+                # Same function group_fast_candidates_by_bucket()/
+                # derive_candidates() compute_baselines() and
+                # reporting/panels.py's baseline_queue() already call - the
+                # "one exclusion definition" rule (docs/learnings.md L13),
+                # not a second, hand-rolled COUNT(*).
+                fast_lifespan_hours = profile.scoring.get("fast_lifespan_hours", 24)
+                candidates = derive_candidates(conn)
+                fast_by_bucket = group_fast_candidates_by_bucket(candidates, fast_lifespan_hours)
+                fast_candidates = len(fast_by_bucket.get(bucket_key, []))
 
         thirty_days_ago = now - 30 * 86400
         alert_rows = conn.execute(
@@ -1068,7 +1219,7 @@ def get_market_price(generation: str, cpu_family: str, ram_tier: str) -> dict:
 
     if row is not None:
         baseline = {
-            "resolved": True,
+            "state": state,
             "baseline_layer": BASELINE_LAYER_COMPUTED,
             "n": row["n"],
             "n_price_only": row["n_price_only"],
@@ -1086,13 +1237,13 @@ def get_market_price(generation: str, cpu_family: str, ram_tier: str) -> dict:
         seed = resolve_seed_baseline(compiled_seeds, spec)
         if seed is None:
             baseline = {
-                "resolved": False,
+                "state": state,
                 "baseline_layer": None,
                 "note": "no computed baseline and no matching seed_baselines entry",
             }
         else:
             baseline = {
-                "resolved": True,
+                "state": state,
                 "baseline_layer": BASELINE_LAYER_SEED,
                 "p25_cents": seed.p25_cents,
                 "p25_display": money_display(seed.p25_cents),
@@ -1106,6 +1257,7 @@ def get_market_price(generation: str, cpu_family: str, ram_tier: str) -> dict:
         "as_of": now,
         "profile_id": profile.id,
         "bucket_key": bucket_key,
+        "resolved_bucket_key": bucket_key,
         "baseline": baseline,
         "alert_time_p25_series": [
             {

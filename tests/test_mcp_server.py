@@ -66,6 +66,31 @@ def _clear_settings_cache():
     get_settings.cache_clear()
 
 
+# cpu_family's real vocabulary source is "observed" (vocabulary.py - its
+# extract rules mix literal values with two capture-group templates, so
+# the rule list alone isn't a safe, complete enumeration) - computed once
+# at THIS test session's module-import time from whatever `listings` rows
+# exist in the checkout's real data/dealwatch.db, which has no `listings`
+# table at all in this checkout (empty file). Every test that exercises a
+# real cpu_family value needs it in the vocabulary, so this autouse
+# fixture seeds a representative one covering every literal cpu_family
+# value this profile's extract rules can produce - the same reasoning
+# `_use_db` already applies to DB_PATH: tests set up what they need
+# explicitly rather than relying on the checkout's actual file contents.
+_TEST_CPU_FAMILIES = [
+    "amd-ryzen-4000", "amd-ryzen-5000", "amd-ryzen-6000", "amd-ryzen-7000",
+    "amd-ryzen-8000", "amd-ryzen-ai", "intel-10th", "intel-11th", "intel-12th",
+    "intel-13th", "intel-ultra-1", "intel-ultra-2",
+]
+
+
+@pytest.fixture(autouse=True)
+def _seed_cpu_family_vocabulary(monkeypatch):
+    vocab = dict(mcp_server._bucket_vocabulary)
+    vocab["cpu_family"] = {"values": list(_TEST_CPU_FAMILIES), "source": "observed"}
+    monkeypatch.setattr(mcp_server, "_bucket_vocabulary", vocab)
+
+
 def _use_db(monkeypatch, db_path) -> None:
     """Point the already-imported server module's tools at db_path for
     the duration of one test, via the fresh-get_settings() escape hatch
@@ -1534,3 +1559,239 @@ def test_every_tool_response_carries_as_of_and_profile_id_and_every_description_
     # the caveat sentence from get_review_queue's description makes the
     # endswith() check fail for exactly that tool - red-confirmed and
     # reverted.
+
+
+# ---------------------------------------------------------------------------
+# V1.0 prompt 2a - bucket vocabulary is a contract, not advice
+# (design.md §15's dated 2a addendum). Tests numbered per
+# v1.0-prompt-2a-vocabulary.md's own required-test list.
+# ---------------------------------------------------------------------------
+
+
+# --- 1/2: unknown values error, never fall through --------------------
+
+
+def test_get_market_price_bad_cpu_family_errors_never_returns_seed(tmp_path, monkeypatch):
+    db_path = _make_db(tmp_path)
+    _use_db(monkeypatch, db_path)
+
+    result = mcp_server.get_market_price(generation="1", cpu_family="Ryzen 5000", ram_tier="16")
+    assert result["error"] == "unknown cpu_family 'Ryzen 5000'"
+    assert result["field"] == "cpu_family"
+    assert "amd-ryzen-5000" in result["valid_values"]
+    assert result["vocabulary_source"] == "observed"
+    assert result["as_of"] > 0
+    assert result["profile_id"] == PROFILE_ID
+    assert "baseline" not in result
+    assert "p25_cents" not in result
+
+    # Manual sabotage (source edit, run, revert - see report): removing
+    # get_market_price's three validation blocks in one pass and re-running
+    # this test (and the generation/ram_tier tests below) together - every
+    # one of them went red, with "Ryzen 5000" falling through to a real
+    # seed price instead of an error. Reverted.
+
+
+def test_get_market_price_bad_generation_errors_never_returns_seed(tmp_path, monkeypatch):
+    db_path = _make_db(tmp_path)
+    _use_db(monkeypatch, db_path)
+
+    result = mcp_server.get_market_price(generation="Gen 2", cpu_family="amd-ryzen-5000", ram_tier="16")
+    assert result["error"] == "unknown generation 'Gen 2'"
+    assert result["field"] == "generation"
+    assert result["valid_values"] == ["1", "2", "3", "4", "5", "6"]
+    assert result["vocabulary_source"] == "profile"
+    assert "baseline" not in result
+
+
+def test_get_market_price_bad_ram_tier_errors_never_returns_seed(tmp_path, monkeypatch):
+    db_path = _make_db(tmp_path)
+    _use_db(monkeypatch, db_path)
+
+    result = mcp_server.get_market_price(generation="1", cpu_family="amd-ryzen-5000", ram_tier="16GB")
+    assert result["error"] == "unknown ram_tier '16GB'"
+    assert result["field"] == "ram_tier"
+    assert set(result["valid_values"]) == {"8", "16", "32", "48"}
+    assert result["vocabulary_source"] == "profile"
+    assert "baseline" not in result
+
+
+def test_query_listings_bad_bucket_filters_error_instead_of_zero_matches(tmp_path, monkeypatch):
+    db_path = _make_db(tmp_path)
+    conn = connect(db_path)
+    seed_listing(
+        conn, "v1|z1|0", spec_status="ok", bucket_key="2|amd-ryzen-5000|16",
+        spec_json=json.dumps({"generation": "2", "cpu_family": "amd-ryzen-5000", "ram_tier": "16"}),
+    )
+    conn.close()
+    _use_db(monkeypatch, db_path)
+
+    for kwargs, field in (
+        ({"generation": "Gen 2"}, "generation"),
+        ({"cpu_family": "Ryzen 5000"}, "cpu_family"),
+        ({"ram_tier": "16GB"}, "ram_tier"),
+    ):
+        result = mcp_server.query_listings(**kwargs)
+        assert result["field"] == field
+        assert "error" in result
+        assert "total_count" not in result  # never silently ran the query
+
+    # Manual sabotage (source edit, run, revert - see report): removing
+    # query_listings' three validation blocks in one pass - re-running
+    # this test showed all three cases silently returning total_count: 0
+    # (or, for the real value some rows still matched) instead of an
+    # error - red-confirmed, reverted.
+
+
+# --- 3: valid_values tracks the profile, not a hardcoded copy ----------
+
+
+def test_valid_values_matches_the_profile_vocabulary_helper_not_a_hardcoded_list(
+    tmp_path, monkeypatch
+):
+    from dealwatch.mcp_server.vocabulary import build_bucket_vocabulary
+
+    db_path = _make_db(tmp_path)
+    _use_db(monkeypatch, db_path)
+
+    # Independently recomputed from the same real profile this server
+    # loaded at import time - not read back from mcp_server's own cache.
+    fresh = build_bucket_vocabulary(mcp_server.profile, None)
+
+    result = mcp_server.get_market_price(generation="9", cpu_family="amd-ryzen-5000", ram_tier="16")
+    assert result["field"] == "generation"
+    assert result["valid_values"] == fresh["generation"]["values"]
+
+    # Manual sabotage (source edit, run, revert - see report):
+    # _validate_bucket_field()'s `vocabulary = _bucket_vocabulary[field]`
+    # line replaced with a hardcoded stale dict for "generation"
+    # ({"values": ["1", "2"], "source": "profile"} - missing 3-6) -
+    # result["valid_values"] no longer equals fresh["generation"]["values"]
+    # (["1",...,"6"]) - red-confirmed, reverted.
+
+
+# --- 4: description vocabulary matches the helper's output -------------
+
+
+def test_tool_descriptions_embed_the_real_vocabulary_not_a_hardcoded_copy():
+    tools = {t.name: t for t in mcp_server.mcp._tool_manager.list_tools()}
+    for name in ("get_market_price", "query_listings"):
+        description = tools[name].description
+        for field in ("generation", "ram_tier"):
+            expected = repr(mcp_server._bucket_vocabulary[field]["values"])
+            assert expected in description, f"{name} description missing {field}'s real values"
+
+    # Manual sabotage (source edit, run, revert - see report): replacing
+    # query_listings' embedded generation list with a hardcoded literal
+    # string ("['1', '2']") instead of the repr(...) expression - this
+    # test failed on the missing "['1', '2', '3', '4', '5', '6']"
+    # substring - red-confirmed, reverted.
+
+
+# --- 5: case-insensitive exact match, no fuzzy matching -----------------
+
+
+def test_case_insensitive_match_accepted_near_miss_rejected(tmp_path, monkeypatch):
+    db_path = _make_db(tmp_path)
+    _use_db(monkeypatch, db_path)
+
+    ok = mcp_server.get_market_price(generation="2", cpu_family="AMD-RYZEN-5000", ram_tier="16")
+    assert "error" not in ok
+    assert ok["resolved_bucket_key"] == "2|amd-ryzen-5000|16"  # canonical casing, not the caller's
+
+    bad = mcp_server.get_market_price(generation="2", cpu_family="Ryzen 5000", ram_tier="16")
+    assert bad.get("error") == "unknown cpu_family 'Ryzen 5000'"
+
+    # Manual sabotage (source edit, run, revert - see report): added a
+    # difflib.get_close_matches() fallback to _validate_bucket_field() so
+    # a near-miss resolves to its closest vocabulary entry instead of
+    # erroring - "Ryzen 5000" then resolved to "amd-ryzen-5000" with no
+    # error, exactly the class of bug this prompt exists to close -
+    # red-confirmed, reverted.
+
+
+# --- 6: resolved_bucket_key everywhere a bucket key is used -------------
+
+
+def test_resolved_bucket_key_present_and_correct_everywhere(tmp_path, monkeypatch):
+    db_path = _make_db(tmp_path)
+    conn = connect(db_path)
+    seed_listing(
+        conn, "v1|rbk|0", spec_status="ok", bucket_key="2|amd-ryzen-5000|16",
+        spec_json=json.dumps({"generation": "2", "cpu_family": "amd-ryzen-5000", "ram_tier": "16"}),
+    )
+    seed_observation(conn, "v1|rbk|0", 1_000_000, price_cents=20000, total_cents=20000)
+    conn.close()
+    _use_db(monkeypatch, db_path)
+
+    price_result = mcp_server.get_market_price(generation="2", cpu_family="amd-ryzen-5000", ram_tier="16")
+    assert price_result["resolved_bucket_key"] == "2|amd-ryzen-5000|16"
+
+    deals_result = mcp_server.find_deals()
+    assert len(deals_result["deals"]) == 1
+    assert deals_result["deals"][0]["resolved_bucket_key"] == "2|amd-ryzen-5000|16"
+
+    explain_result = mcp_server.explain_listing(item_id_or_url="v1|rbk|0")
+    assert explain_result["resolved_bucket_key"] == "2|amd-ryzen-5000|16"
+
+    # Manual sabotage (source edit, run, revert - see report): omitted
+    # "resolved_bucket_key" from explain_listing's top-level return dict -
+    # this test's explain_result["resolved_bucket_key"] access raised
+    # KeyError - red-confirmed, reverted.
+
+
+# --- 7: the two empty cases are distinguishable --------------------------
+
+
+def test_get_market_price_distinguishes_no_baseline_from_never_observed(tmp_path, monkeypatch):
+    db_path = _make_db(tmp_path)
+    conn = connect(db_path)
+    # Fixture A: dead listings exist in this bucket, but fewer than
+    # min_samples (12) - "no_computed_baseline".
+    for i in range(3):
+        item_id = f"v1|dead{i}|0"
+        seed_listing(
+            conn, item_id, spec_status="ok", bucket_key="1|intel-10th|16",
+            first_seen=1_000_000, last_seen=1_000_100, gone_at=1_000_100, lifespan_mins=1,
+        )
+        seed_observation(conn, item_id, 1_000_000, price_cents=15000, total_cents=15000)
+    conn.close()
+    _use_db(monkeypatch, db_path)
+
+    observed = mcp_server.get_market_price(generation="1", cpu_family="intel-10th", ram_tier="16")
+    assert observed["baseline"]["state"] == "no_computed_baseline"
+    assert observed["baseline"]["fast_candidates"] == 3
+
+    # Fixture B: nothing has ever normalized into this bucket at all.
+    never = mcp_server.get_market_price(generation="4", cpu_family="intel-12th", ram_tier="8")
+    assert never["baseline"]["state"] == "bucket_never_observed"
+    assert never["baseline"]["fast_candidates"] == 0
+
+    assert observed["baseline"]["state"] != never["baseline"]["state"]
+
+    # Manual sabotage (source edit, run, revert - see report): hardcoded
+    # `ever_observed = True` regardless of the query - both fixtures
+    # reported "no_computed_baseline", collapsing the distinction this
+    # test exists to check - red-confirmed, reverted.
+
+
+# --- 8: over the wire, an argument error is isError: false --------------
+
+
+def test_invalid_bucket_argument_over_http_is_data_not_a_protocol_error(tmp_path, monkeypatch):
+    db_path = _make_db(tmp_path)
+    _use_db(monkeypatch, db_path)
+
+    with TestClient(mcp_server._build_app()) as client:
+        response = _call_over_http(
+            client, "get_market_price",
+            {"generation": "Gen 2", "cpu_family": "amd-ryzen-5000", "ram_tier": "16"},
+            request_id=1,
+        )
+        assert response.status_code == 200
+        result = response.json()["result"]
+        assert result["isError"] is False
+        payload = json.loads(result["content"][0]["text"])
+        assert payload["error"] == "unknown generation 'Gen 2'"
+        assert payload["as_of"] > 0
+        assert payload["profile_id"] == PROFILE_ID
