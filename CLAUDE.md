@@ -42,6 +42,12 @@ Prefers understanding failure modes over abstractions that hide them.
 5. **`dealwatch/mcp_server/`, never `dealwatch/mcp/`** — avoids confusion with
    the `mcp` SDK package.
 
+6. **One database, `profile_id`-scoped — not one database per profile.**
+   Decided 2026-09-20 with the rejected alternative and its real merits
+   recorded in design.md §16. One collector container per profile; one MCP
+   server and one dashboard, both reading every profile. Do not re-open —
+   §16 P5 is the argument you are about to make.
+
 ---
 
 ## Layout

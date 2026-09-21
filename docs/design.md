@@ -2916,3 +2916,145 @@ fuzzy matching or aliases (2a's reasoning stands, unchanged); parsing
 `cpu_family`'s templated extract rules to make it profile-enumerable
 (still not attempted - the TTL fix addresses staleness, not
 enumerability, and the two are independent problems).
+
+## 16. Multi-profile data model — one database (decided 2026-09-20, not yet built)
+
+### The question
+
+DealWatch was designed so that hunting a new target costs a YAML file in
+`profiles/`. Everything built through V1.0 has run against exactly one
+profile (`thinkpad-t14`), and several decisions were deferred with the note
+"decide when a second profile exists" — most importantly `docs/learnings.md`
+L2, which refused to scope `engine/baselines.py`'s candidate query by
+`profile_id` until the multi-profile model was settled.
+
+This section settles it. The choice was between one shared database with
+`profile_id` scoping, and one database file per profile.
+
+### Decisions
+
+**P1. One database.** `data/dealwatch.db` holds every profile's rows,
+scoped by `profile_id`. The data model was already built this way:
+`listings`, `alerts`, `sweeps`, and `baselines` all carry `profile_id`, and
+migration 8's indexes already lead with it. The exceptions — `observations`
+and `engine/baselines.py`'s candidate query — are the prerequisites in P6,
+not counter-evidence.
+
+**P2. One collector container per profile.** Not a consequence of P1.
+`main.py` loads exactly one profile at startup (`Settings.profile_path`)
+and `storage/sqlite.py`'s connection-ownership convention gives the
+collector one long-lived connection for its loop; two collector loops in
+one process would share that connection across interleaved writes, which
+that convention explicitly does not cover. Separate containers also keep a
+bad regex or a malformed profile from taking down an unrelated target's
+collection. Cheap: `dealwatch` and `dealwatch-mcp` already share
+`image: dealwatch:local`, so a third service is a `command:`/env difference,
+not a second build.
+
+**P3. One MCP server and one dashboard, each reading every profile.** The
+MCP server answers cross-profile questions; the dashboard toggles between
+profiles with per-profile panels. Both discover which profiles exist rather
+than being told — `SELECT DISTINCT profile_id`, or the contents of
+`profiles/`. This is the decisive advantage over P5: with one database per
+profile, every reader needs a maintained list of files to open or `ATTACH`,
+and that list is a third artifact that must be edited on every add and every
+retire. A stale registry is silent, and it is the same failure class this
+project keeps getting caught by (a profile edited but not restarted, §15's
+`image:` tag added but the service not recreated, §8's seed chart authored
+but never pasted): the configuration reads correctly and the running system
+disagrees, with no error anywhere.
+
+**P4. The budget stays one global row.** `providers/ratelimit.py` writes a
+single row (`id = 1`) via a guarded UPDATE. eBay's 5,000/day ceiling is
+app-level, not per-profile, so one row is the correct semantics and the
+guarded UPDATE is already atomic across processes. Allocation between
+profiles is therefore first-come-first-served: a fast-polling profile can
+starve a slower one late in the day, and `/health` cannot attribute spend
+to a profile. Accepted deliberately. Per-profile allocation would need a
+`profile_id` on the budget write path and a policy for dividing the
+ceiling; neither is worth building before a second profile demonstrates the
+problem.
+
+**P5. Rejected: one database per profile.** Its merits are real and were
+weighed, not dismissed. L2 would disappear structurally rather than by a
+`WHERE` clause — cross-profile contamination becomes impossible because the
+other profile's rows are not in the file. No `observations.profile_id`
+migration would be needed; `reporting/status.py`'s `_alive()` last-
+observation walk would stay O(1) by construction instead of by index
+design. Each file would have exactly one writer, so a long
+`scripts/backfill_normalize.py` run against one profile could not stall
+another profile's collector. Corruption would cost one profile, not all.
+
+Two things killed it.
+
+First, the budget. Split the databases and the single global row splits
+with them — two profiles each believing they hold 4,750 calls against one
+5,000 app-level ceiling, which is disqualifying. The fix is a third, shared
+`budget.db`, which re-centralizes the *hottest* write path in the system
+(one guarded UPDATE per Browse call) into a shared file. Every write path
+would be isolated except the one that runs most often, so the isolation
+argument largely evaporates while the registry cost remains.
+
+Second, the lifecycle. Retiring a profile under P5 means its history stays
+readable only while its file remains in every reader's list; drop it and
+months of comps become unreachable, which contradicts CLAUDE.md's
+"SQLite history is irreplaceable." Under P1, a retired profile's rows
+remain queryable by `profile_id` indefinitely at no cost, and re-adding the
+profile is putting the YAML back. Two mechanical notes reinforce this:
+SQLite's default attached-database ceiling is 10, and `connect_readonly()`
+would have to re-`ATTACH` every file on every connection — the MCP server
+opens one per request.
+
+**P6. Prerequisites this decision creates.** Both are now unblocked, and
+neither was actionable before P1.
+
+- **`docs/learnings.md` L2 — scope the candidate query.** `_DEAD_OK_LISTINGS`
+  (`engine/baselines.py`) has no `profile_id` filter. With a second profile
+  it pools both profiles' dead listings and writes cross-contaminated
+  percentiles under a single `profile_id`: plausible numbers, silently
+  wrong, no crash — the same shape as §8's un-pasted seed chart. The fix
+  threads `profile_id` through `_derive()`, `derive_candidates()`,
+  `derive_candidate_pool_stats()`, and the three callers
+  (`scripts/recompute_baselines.py`, `scripts/baseline_report.py`,
+  `reporting/panels.py`'s `baseline_queue()`). No schema change, so this can
+  land today, against one profile, and it must land before the baseline
+  recompute is scheduled — a cron running a contaminating recompute is worse
+  than a manual one, because nobody reads the output. The required test uses
+  a two-profile fixture whose dead listings land in the **same** `bucket_key`
+  string (collision across profiles is possible and must not be assumed
+  away), asserting each profile's percentiles come out unmixed; sabotage by
+  removing the clause must go red. A single-profile fixture passes either
+  way and proves nothing here.
+- **`observations.profile_id`.** `reporting/status.py`'s `_alive()` already
+  documents, from a measurement against a synthetic second profile rather
+  than an inference, that "newest observation for this profile" degrades
+  from an O(1) index hit to a backwards walk past the other profile's newer
+  rows, because `observations` has no `profile_id` column. The dashboard
+  calls this on every render. This is a schema change, so per §15 D5 the
+  collector deploys before the MCP server. It pays off only once a second
+  profile exists, but it is what will bite on the day one is added, so it
+  should not drift far behind the L2 fix.
+
+**P7. What this does not decide.** The generic MCP tool signatures
+(`vocabulary.py`'s `VOCABULARY_FIELDS` and the fixed
+`generation`/`cpu_family`/`ram_tier` arguments, §15 D13), the dashboard's
+profile-toggle mechanics, and the supervisor in P8 are all open and being
+designed separately. This section decides where the rows live and nothing
+more.
+
+**P8. The remaining gap to the original goal, stated honestly.** Under
+P1–P3, adding a profile costs a YAML file, a compose stanza, and a cron
+line — not a YAML file alone. Closing that gap needs a supervisor that reads
+`profiles/`, spawns a collector task per profile, and requires no other
+change; that is a future milestone, not this one. It is recorded here
+because it is the reason P1 matters beyond present convenience: a supervisor
+that must provision, migrate, snapshot, and attach a new database file per
+YAML is not a YAML-only operation under any reading, so P5 would have closed
+off the end state this architecture was designed toward.
+
+### Recorded elsewhere
+
+CLAUDE.md gains locked decision #6 pointing here. `docs/learnings.md` L2's
+closing claim — that the multi-profile model must be decided before its fix
+can be scoped — is superseded by this section and corrected in place, since
+that sentence is what would otherwise stop someone from fixing it.

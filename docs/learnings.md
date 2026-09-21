@@ -45,10 +45,29 @@ dead listings together, and `scripts/recompute_baselines.py` will write
 the resulting cross-contaminated baselines under a single `profile_id` -
 silently wrong, not a crash. Do not add a partial `profile_id` filter to
 just one of these call sites without fixing all of them together; a
-half-applied filter (query filtered but nothing decided about how
-multi-profile baselines should even be scoped) is worse than the
-documented gap, because it would look fixed while still being wrong
-somewhere else in the chain. Needs the multi-profile model decided first.
+half-applied filter is worse than the documented gap, because it would
+look fixed while still being wrong somewhere else in the chain.
+
+**Correction (2026-09-20): the multi-profile model is decided
+(design.md §16 P1 - one database, `profile_id`-scoped) - this fix is
+unblocked, not waiting on anything further.** The earlier version of
+this entry said the fix needed the multi-profile model decided first;
+that is no longer true, and leaving that sentence in place is exactly
+what would stop someone from doing the fix now that the thing it was
+waiting on has happened. The shape of the fix (§16 P6): thread
+`profile_id` through `_derive()`, `derive_candidates()`,
+`derive_candidate_pool_stats()`, and all three callers
+(`scripts/recompute_baselines.py`, `scripts/baseline_report.py`,
+`reporting/panels.py`'s `baseline_queue()`) together, in one change - no
+schema migration required, so it can land today against the single real
+profile. The required test needs a two-profile fixture whose dead
+listings land in the SAME `bucket_key` string (collision across profiles
+is possible and must not be assumed away), asserting each profile's
+percentiles come out unmixed; a single-profile fixture passes whether or
+not the filter is there and proves nothing. Land this before the
+baseline recompute is ever put on a schedule - a cron silently
+contaminating baselines is worse than a manual one, because nobody is
+watching the output closely enough to notice.
 
 ## L3. Negative-lifespan anomaly: three items, one explained pattern
 
