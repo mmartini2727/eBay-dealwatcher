@@ -1292,10 +1292,13 @@ def get_market_price(generation: str, cpu_family: str, ram_tier: str) -> dict:
         if row is None:
             # A bucket nobody has ever listed into doesn't need the
             # derive_candidates() pass run just to learn its fast count is
-            # trivially 0 - that pass scans every dead 'ok' listing
-            # (engine/baselines.py), the most expensive part of this tool,
-            # and skipping it here is free: zero listings in the bucket
-            # means zero fast candidates by construction.
+            # trivially 0 - that pass scans every dead 'ok' listing FOR
+            # THIS PROFILE (profile_id required keyword-only as of
+            # design.md §16 P6 - engine/baselines.py's _DEAD_OK_LISTINGS
+            # no longer pools every profile's rows), still the most
+            # expensive part of this tool, and skipping it here is free:
+            # zero listings in the bucket means zero fast candidates by
+            # construction.
             ever_observed = (
                 conn.execute(
                     "SELECT 1 FROM listings WHERE profile_id = ? AND bucket_key = ? LIMIT 1",
@@ -1314,7 +1317,7 @@ def get_market_price(generation: str, cpu_family: str, ram_tier: str) -> dict:
                 # "one exclusion definition" rule (docs/learnings.md L13),
                 # not a second, hand-rolled COUNT(*).
                 fast_lifespan_hours = profile.scoring.get("fast_lifespan_hours", 24)
-                candidates = derive_candidates(conn)
+                candidates = derive_candidates(conn, profile_id=profile.id)
                 fast_by_bucket = group_fast_candidates_by_bucket(candidates, fast_lifespan_hours)
                 fast_candidates = len(fast_by_bucket.get(bucket_key, []))
 

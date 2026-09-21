@@ -50,8 +50,8 @@ def run_report(profile, conn) -> str:
     min_samples = profile.scoring.get("min_samples", 12)
     threshold_seconds = fast_lifespan_hours * 3600
 
-    pool_stats = derive_candidate_pool_stats(conn)
-    candidates = derive_candidates(conn)
+    pool_stats = derive_candidate_pool_stats(conn, profile_id=profile.id)
+    candidates = derive_candidates(conn, profile_id=profile.id)
 
     by_bucket: dict[str, list] = {}
     for c in candidates:

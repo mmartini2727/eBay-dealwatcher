@@ -31,7 +31,7 @@ def run_recompute(profile, conn) -> str:
     fast_lifespan_hours = profile.scoring.get("fast_lifespan_hours", 24)
     min_samples = profile.scoring.get("min_samples", 12)
 
-    candidates = derive_candidates(conn)
+    candidates = derive_candidates(conn, profile_id=profile.id)
     baselines = compute_baselines(
         candidates, fast_lifespan_hours=fast_lifespan_hours, min_samples=min_samples
     )

@@ -160,10 +160,14 @@ will hard-code, so changing one is a breaking change to all of them:
   "baseline": {
       baseline_buckets_total, baselines_computed_age_mins,
       dead_spec_ok_count, dead_spec_ok_deaths_7d,
-          # dead_spec_ok_count is scoped to this profile_id, but
-          # engine.baselines._DEAD_OK_LISTINGS is NOT profile-scoped -
-          # the two numbers agree today (one profile exists) and will
-          # diverge the day a second profile does.
+          # Both this query and engine.baselines._DEAD_OK_LISTINGS are
+          # profile_id-scoped (design.md §16 P6, docs/learnings.md L2 -
+          # corrected 2026-09-20; the two were NOT both scoped before
+          # that). The counts still differ, for a different reason:
+          # _DEAD_OK_LISTINGS additionally excludes variation_id IS NOT
+          # NULL rows (V0.8d) - a multi-variation listing flapping in and
+          # out of search results, not survival-signal material - which
+          # this query does not exclude.
       baseline_layer_counts_7d,
           # dict, alerts.baseline_layer -> EVENT count (same dedup as
           # "finding" above). An alerts-only proxy for "how often are we
@@ -495,9 +499,10 @@ def _baseline(conn: sqlite3.Connection, profile_id: str, now: int) -> dict:
         "SELECT MAX(computed_at) FROM baselines WHERE profile_id = ?", (profile_id,)
     ).fetchone()[0]
 
-    # Scoped to profile_id here, unlike engine.baselines._DEAD_OK_LISTINGS
-    # (not profile-scoped) - the two agree while only one profile exists
-    # and will diverge the day a second one does.
+    # Both this query and engine.baselines._DEAD_OK_LISTINGS are now
+    # profile_id-scoped (design.md §16 P6, docs/learnings.md L2). They
+    # still disagree in count - _DEAD_OK_LISTINGS additionally excludes
+    # variation_id IS NOT NULL rows (V0.8d), which this query does not.
     dead_spec_ok_count = conn.execute(
         "SELECT COUNT(*) FROM listings "
         "WHERE profile_id = ? AND gone_at IS NOT NULL AND spec_status = ?",

@@ -1362,7 +1362,9 @@ def test_get_market_price_fast_candidate_count_matches_the_panel_function(tmp_pa
 
     with_conn = connect(db_path)
     expected = len(
-        group_fast_candidates_by_bucket(derive_candidates(with_conn), 24).get(bucket_key, [])
+        group_fast_candidates_by_bucket(
+            derive_candidates(with_conn, profile_id=PROFILE_ID), 24
+        ).get(bucket_key, [])
     )
     with_conn.close()
     assert result["baseline"]["fast_candidates"] == expected

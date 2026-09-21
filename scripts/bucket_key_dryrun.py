@@ -88,14 +88,25 @@ class PreBucketCandidate:
     lifespan_seconds: int
 
 
-def derive_pre_bucket_candidates(conn) -> list[PreBucketCandidate]:
+def derive_pre_bucket_candidates(conn, *, profile_id: str) -> list[PreBucketCandidate]:
     """Same exclusions as baselines._derive(), in the same order, EXCEPT
     the '?' filter - deliberately omitted, since which keys contain '?'
     depends on the field list being measured, not on some fixed pipeline
     fact. Uses baselines.select_price and baselines._LAST_OBSERVATION
     directly rather than reimplementing either.
+
+    profile_id is required keyword-only, no default - _DRY_RUN_LISTINGS is
+    baselines._DEAD_OK_LISTINGS with only its SELECT column list changed
+    (see that .replace() above), so it carries the identical
+    `WHERE profile_id = ? AND ...` this module didn't write and must not
+    silently drop - the same required-parameter shape
+    baselines.derive_candidates() now has, kept comparable on purpose:
+    verify_against_derive_candidates() below asserts this function's
+    output matches baselines.derive_candidates() exactly, and that
+    assertion is only meaningful if both sides are scoped to the same
+    profile.
     """
-    rows = conn.execute(_DRY_RUN_LISTINGS).fetchall()
+    rows = conn.execute(_DRY_RUN_LISTINGS, (profile_id,)).fetchall()
     candidates: list[PreBucketCandidate] = []
 
     for row in rows:
@@ -172,7 +183,7 @@ def verify_against_derive_candidates(conn, pre_bucket: list[PreBucketCandidate],
         if "?" not in c.bucket_key
     }
 
-    real = baselines.derive_candidates(conn)
+    real = baselines.derive_candidates(conn, profile_id=profile.id)
     real_set = {
         (c.item_id, c.bucket_key, c.price_cents, c.price_is_price_only, c.lifespan_seconds)
         for c in real
@@ -286,7 +297,7 @@ def run_dry_run(profile, conn) -> str:
     fast_lifespan_hours = profile.scoring.get("fast_lifespan_hours", 24)
     min_samples = profile.scoring.get("min_samples", 12)
 
-    pre_bucket = derive_pre_bucket_candidates(conn)
+    pre_bucket = derive_pre_bucket_candidates(conn, profile_id=profile.id)
     verify_against_derive_candidates(conn, pre_bucket, profile)
 
     sections = [

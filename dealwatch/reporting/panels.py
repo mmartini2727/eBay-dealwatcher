@@ -694,12 +694,13 @@ def baseline_queue(
     compute_baselines() and scripts/recompute_baselines.py about what
     "fast" means for this profile.
 
-    Not profile-scoped in the candidate-derivation step, because
-    derive_candidates_with_stats() itself isn't (engine/baselines.py's
-    _DEAD_OK_LISTINGS has no profile_id filter - reporting/status.py's own
-    dead_spec_ok_count comment already flags this same gap for a
-    different reader). Correct while one profile exists; will need a real
-    fix the day a second one does, same as that.
+    Profile-scoped in the candidate-derivation step as of design.md §16 P6
+    (docs/learnings.md L2, corrected 2026-09-20): derive_candidates_with_stats()
+    now requires profile_id, passed through from this function's own
+    argument - engine/baselines.py's _DEAD_OK_LISTINGS carries the filter,
+    not a second one re-derived here. Before this correction neither was
+    scoped, and the two agreed only because a single profile existed to
+    agree about.
     """
     computed = {
         row[0]
@@ -711,7 +712,7 @@ def baseline_queue(
     previous_row_factory = conn.row_factory
     conn.row_factory = sqlite3.Row
     try:
-        candidates, stats = derive_candidates_with_stats(conn)
+        candidates, stats = derive_candidates_with_stats(conn, profile_id=profile_id)
     finally:
         conn.row_factory = previous_row_factory
 

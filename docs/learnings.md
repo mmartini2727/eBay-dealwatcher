@@ -56,11 +56,18 @@ that is no longer true, and leaving that sentence in place is exactly
 what would stop someone from doing the fix now that the thing it was
 waiting on has happened. The shape of the fix (§16 P6): thread
 `profile_id` through `_derive()`, `derive_candidates()`,
-`derive_candidate_pool_stats()`, and all three callers
-(`scripts/recompute_baselines.py`, `scripts/baseline_report.py`,
-`reporting/panels.py`'s `baseline_queue()`) together, in one change - no
-schema migration required, so it can land today against the single real
-profile. The required test needs a two-profile fixture whose dead
+`derive_candidate_pool_stats()` (and `derive_candidates_with_stats()`,
+V0.13 Part B) and **every** call site: `scripts/recompute_baselines.py`,
+`scripts/baseline_report.py`, `reporting/panels.py`'s `baseline_queue()`,
+and `mcp_server/server.py`'s `get_market_price()`, which calls
+`derive_candidates(conn)` directly in its `no_computed_baseline` branch
+(line ~1317) - a fourth caller the first version of this correction
+missed, and exactly the half-applied-filter failure this entry's own
+text warns about above. `server.py`'s `get_review_queue()` is covered
+transitively via `baseline_queue()` - four call sites, not five, and not
+three. All of them together, in one change - no schema migration
+required, so it can land today against the single real profile. The
+required test needs a two-profile fixture whose dead
 listings land in the SAME `bucket_key` string (collision across profiles
 is possible and must not be assumed away), asserting each profile's
 percentiles come out unmixed; a single-profile fixture passes whether or

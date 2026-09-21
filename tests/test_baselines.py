@@ -30,7 +30,7 @@ def make_conn(tmp_path):
     return connect(tmp_path / "dealwatch.db")
 
 
-def sight(conn, item_id, seen_at, *, price_cents=None, shipping_cents=None):
+def sight(conn, item_id, seen_at, *, price_cents=None, shipping_cents=None, profile_id=PROFILE_ID):
     total_cents = None
     if price_cents is not None and shipping_cents is not None:
         total_cents = price_cents + shipping_cents
@@ -44,8 +44,15 @@ def sight(conn, item_id, seen_at, *, price_cents=None, shipping_cents=None):
         # (V0.8d), not injected as a separate fixture parameter - production
         # never gets to choose it independently of item_id, and a test that
         # could would no longer catch parse_variation_id() regressing to
-        # "always None" (see the exclusion test below).
-        dict(profile_id=PROFILE_ID, title="t", variation_id=parse_variation_id(item_id)),
+        # "always None" (see the exclusion test below). profile_id defaults
+        # to the module constant so every existing call site is unaffected;
+        # the two-profile test below is the one caller that passes a real
+        # second value. record_sighting()'s existence check is on item_id
+        # ALONE (design.md §16 P6's first, separately-scoped prerequisite -
+        # not touched by this task), so two profiles must never share an
+        # item_id in a fixture or the second sight() would silently UPDATE
+        # the first profile's row instead of inserting a second one.
+        dict(profile_id=profile_id, title="t", variation_id=parse_variation_id(item_id)),
         dict(
             price_cents=price_cents,
             shipping_cents=shipping_cents,
@@ -95,7 +102,7 @@ def test_price_cut_produces_one_candidate_from_the_last_observation_only(tmp_pat
     set_spec(conn, "item-1", BUCKET)
     mark_gone(conn, "item-1", t0 + 2 * 3600 + 30 * 3600)
 
-    candidates = derive_candidates(conn)
+    candidates = derive_candidates(conn, profile_id=PROFILE_ID)
 
     assert len(candidates) == 1
     assert candidates[0].price_cents == 70000
@@ -109,7 +116,7 @@ def test_single_observation_lifespan_is_gone_at_minus_that_observation(tmp_path)
     set_spec(conn, "item-1", BUCKET)
     mark_gone(conn, "item-1", t0 + 5 * 3600)
 
-    candidates = derive_candidates(conn)
+    candidates = derive_candidates(conn, profile_id=PROFILE_ID)
 
     assert len(candidates) == 1
     assert candidates[0].price_cents == 50000
@@ -129,7 +136,7 @@ def test_never_swept_listing_is_excluded(tmp_path):
     set_spec(conn, "item-1", BUCKET)
     mark_gone(conn, "item-1", t0)
 
-    assert derive_candidates(conn) == []
+    assert derive_candidates(conn, profile_id=PROFILE_ID) == []
 
 
 def test_swept_listing_with_otherwise_identical_shape_is_included(tmp_path):
@@ -143,7 +150,7 @@ def test_swept_listing_with_otherwise_identical_shape_is_included(tmp_path):
     set_spec(conn, "item-1", BUCKET)
     mark_gone(conn, "item-1", t0 + 3600)
 
-    candidates = derive_candidates(conn)
+    candidates = derive_candidates(conn, profile_id=PROFILE_ID)
 
     assert len(candidates) == 1
     assert candidates[0].price_cents == 50000
@@ -155,7 +162,7 @@ def test_live_listing_is_excluded(tmp_path):
     set_spec(conn, "item-1", BUCKET)
     # never marked gone
 
-    assert derive_candidates(conn) == []
+    assert derive_candidates(conn, profile_id=PROFILE_ID) == []
 
 
 @pytest.mark.parametrize("spec_status", ["partial", "pending"])
@@ -167,7 +174,7 @@ def test_non_ok_spec_status_is_excluded(tmp_path, spec_status):
     set_spec(conn, "item-1", BUCKET, spec_status=spec_status)
     mark_gone(conn, "item-1", 1_000_000 + 3600)
 
-    assert derive_candidates(conn) == []
+    assert derive_candidates(conn, profile_id=PROFILE_ID) == []
 
 
 def test_bucket_key_with_question_mark_is_excluded(tmp_path):
@@ -176,7 +183,7 @@ def test_bucket_key_with_question_mark_is_excluded(tmp_path):
     set_spec(conn, "item-1", "1|?|16|256")
     mark_gone(conn, "item-1", 1_000_000 + 3600)
 
-    assert derive_candidates(conn) == []
+    assert derive_candidates(conn, profile_id=PROFILE_ID) == []
 
 
 def test_null_bucket_key_is_excluded(tmp_path):
@@ -185,7 +192,7 @@ def test_null_bucket_key_is_excluded(tmp_path):
     set_spec(conn, "item-1", None, spec_status="ok")
     mark_gone(conn, "item-1", 1_000_000 + 3600)
 
-    assert derive_candidates(conn) == []
+    assert derive_candidates(conn, profile_id=PROFILE_ID) == []
 
 
 def test_variation_listing_is_excluded(tmp_path):
@@ -209,7 +216,7 @@ def test_variation_listing_is_excluded(tmp_path):
     set_spec(conn, "plain-1", BUCKET)
     mark_gone(conn, "plain-1", t0 + 3600)
 
-    candidates = derive_candidates(conn)
+    candidates = derive_candidates(conn, profile_id=PROFILE_ID)
 
     assert [c.item_id for c in candidates] == ["plain-1"]
 
@@ -220,7 +227,7 @@ def test_null_shipping_uses_price_cents_and_counts_as_price_only(tmp_path):
     set_spec(conn, "item-1", BUCKET)
     mark_gone(conn, "item-1", 1_000_000 + 3600)
 
-    candidates = derive_candidates(conn)
+    candidates = derive_candidates(conn, profile_id=PROFILE_ID)
 
     assert len(candidates) == 1
     assert candidates[0].price_cents == 50000
@@ -233,7 +240,7 @@ def test_known_shipping_uses_total_cents_and_is_not_price_only(tmp_path):
     set_spec(conn, "item-1", BUCKET)
     mark_gone(conn, "item-1", 1_000_000 + 3600)
 
-    candidates = derive_candidates(conn)
+    candidates = derive_candidates(conn, profile_id=PROFILE_ID)
 
     assert len(candidates) == 1
     assert candidates[0].price_cents == 51000
@@ -247,7 +254,7 @@ def test_both_prices_null_is_dropped(tmp_path):
     set_spec(conn, "item-1", BUCKET)
     mark_gone(conn, "item-1", 1_000_000 + 3600)
 
-    assert derive_candidates(conn) == []
+    assert derive_candidates(conn, profile_id=PROFILE_ID) == []
 
 
 def test_negative_lifespan_is_dropped_and_logged_entirely_at_debug(tmp_path, caplog):
@@ -266,7 +273,7 @@ def test_negative_lifespan_is_dropped_and_logged_entirely_at_debug(tmp_path, cap
     mark_gone(conn, "item-1", t0 - 3600)  # gone_at BEFORE the observation
 
     with caplog.at_level(logging.DEBUG):
-        candidates = derive_candidates(conn)
+        candidates = derive_candidates(conn, profile_id=PROFILE_ID)
 
     assert candidates == []
     debug_records = [
@@ -296,7 +303,7 @@ def test_negative_lifespan_no_longer_emits_at_warning_level(tmp_path, caplog):
     mark_gone(conn, "item-1", t0 - 3600)
 
     with caplog.at_level(logging.WARNING):
-        derive_candidates(conn)
+        derive_candidates(conn, profile_id=PROFILE_ID)
 
     assert not any(r.levelname == "WARNING" for r in caplog.records)
 
@@ -313,7 +320,7 @@ def test_negative_lifespan_aggregate_counts_all_dropped_items_in_one_line(tmp_pa
         mark_gone(conn, item_id, t0 - 3600)
 
     with caplog.at_level(logging.DEBUG):
-        candidates = derive_candidates(conn)
+        candidates = derive_candidates(conn, profile_id=PROFILE_ID)
 
     assert candidates == []
     aggregate_records = [
@@ -347,8 +354,8 @@ def test_candidate_pool_stats_breakdown_matches_final_candidate_count(tmp_path):
     set_spec(conn, "noprice", BUCKET)
     mark_gone(conn, "noprice", t0 + 3600)
 
-    stats = derive_candidate_pool_stats(conn)
-    candidates = derive_candidates(conn)
+    stats = derive_candidate_pool_stats(conn, profile_id=PROFILE_ID)
+    candidates = derive_candidates(conn, profile_id=PROFILE_ID)
 
     assert stats.total_dead_ok == 5
     assert stats.sweep_confirmed == 4  # excludes neverswept
@@ -374,8 +381,8 @@ def test_negative_lifespan_dropped_count_is_excluded_from_the_final_candidates(t
     set_spec(conn, "negative", BUCKET)
     mark_gone(conn, "negative", t0 - 3600)  # gone_at BEFORE the observation
 
-    stats = derive_candidate_pool_stats(conn)
-    candidates = derive_candidates(conn)
+    stats = derive_candidate_pool_stats(conn, profile_id=PROFILE_ID)
+    candidates = derive_candidates(conn, profile_id=PROFILE_ID)
 
     assert stats.has_usable_price == 2
     assert stats.negative_lifespan_dropped == 1
@@ -399,13 +406,85 @@ def test_derive_candidates_with_stats_matches_the_two_separate_calls(tmp_path):
     set_spec(conn, "negative", BUCKET)
     mark_gone(conn, "negative", t0 - 3600)
 
-    candidates_separate = derive_candidates(conn)
-    stats_separate = derive_candidate_pool_stats(conn)
+    candidates_separate = derive_candidates(conn, profile_id=PROFILE_ID)
+    stats_separate = derive_candidate_pool_stats(conn, profile_id=PROFILE_ID)
 
-    candidates_combined, stats_combined = derive_candidates_with_stats(conn)
+    candidates_combined, stats_combined = derive_candidates_with_stats(conn, profile_id=PROFILE_ID)
 
     assert candidates_combined == candidates_separate
     assert stats_combined == stats_separate
+
+
+# ---------------------------------------------------------------------------
+# profile_id scoping (design.md §16 P6, docs/learnings.md L2)
+# ---------------------------------------------------------------------------
+
+OTHER_PROFILE_ID = "other-profile"
+
+
+def test_candidates_and_percentiles_do_not_mix_across_profiles_even_with_a_colliding_bucket_key(
+    tmp_path,
+):
+    """The required L2 test: two profiles, dead candidates landing in the
+    SAME bucket_key string - bucket_key collision across profiles is
+    possible (it is built purely from normalized spec fields, which say
+    nothing about which profile produced them) and must not be assumed
+    away. Item ids are kept globally unique across the two profiles on
+    purpose - record_sighting()'s existence check is on item_id alone
+    (design.md §16 P6's separately-scoped, NOT-touched-here prerequisite),
+    so two profiles sharing an item_id would silently collapse into one
+    row before this test ever got to the code path it's checking.
+
+    Prices are chosen so a mixed pool gives a THIRD, visibly wrong p50 -
+    not merely "a different number from one side," which a boundary
+    coincidence could produce by accident, but a value that matches
+    neither profile's own real percentile at all.
+    """
+    conn = make_conn(tmp_path)
+    t0 = 1_000_000
+    bucket_key = "1|intel-10th|16|256"  # identical string for both profiles
+
+    # thinkpad-t14: five fast candidates at $100-$140. Real p50 = $120.00.
+    a_prices = [10000, 11000, 12000, 13000, 14000]
+    for i, price in enumerate(a_prices):
+        item_id = f"a-item-{i}"
+        sight(conn, item_id, t0 + i, price_cents=price, profile_id=PROFILE_ID)
+        set_spec(conn, item_id, bucket_key)
+        mark_gone(conn, item_id, t0 + i + 600)
+
+    # other-profile: five fast candidates at $500-$540. Real p50 = $520.00.
+    b_prices = [50000, 51000, 52000, 53000, 54000]
+    for i, price in enumerate(b_prices):
+        item_id = f"b-item-{i}"
+        sight(conn, item_id, t0 + i, price_cents=price, profile_id=OTHER_PROFILE_ID)
+        set_spec(conn, item_id, bucket_key)
+        mark_gone(conn, item_id, t0 + i + 600)
+
+    a_candidates = derive_candidates(conn, profile_id=PROFILE_ID)
+    b_candidates = derive_candidates(conn, profile_id=OTHER_PROFILE_ID)
+
+    assert {c.item_id for c in a_candidates} == {f"a-item-{i}" for i in range(5)}
+    assert {c.item_id for c in b_candidates} == {f"b-item-{i}" for i in range(5)}
+    assert sorted(c.price_cents for c in a_candidates) == a_prices
+    assert sorted(c.price_cents for c in b_candidates) == b_prices
+
+    a_baselines = compute_baselines(a_candidates, fast_lifespan_hours=24, min_samples=5)
+    b_baselines = compute_baselines(b_candidates, fast_lifespan_hours=24, min_samples=5)
+    assert len(a_baselines) == 1 and a_baselines[0].bucket_key == bucket_key
+    assert len(b_baselines) == 1 and b_baselines[0].bucket_key == bucket_key
+    assert a_baselines[0].p50_cents == 12000  # $120.00 - A alone
+    assert b_baselines[0].p50_cents == 52000  # $520.00 - B alone
+
+    # A pooled derivation (what the pre-fix code did) would see all ten
+    # candidates under the one shared bucket_key and compute p50 over the
+    # combined ten-value list: index ceil(0.5*10)-1 = 4 -> 14000 ($140.00),
+    # a THIRD value distinct from either profile's own $120.00 or $520.00 -
+    # this is the number that must never appear on either side.
+    pooled_prices = sorted(a_prices + b_prices)
+    pooled_p50 = nearest_rank_percentile(pooled_prices, 50)
+    assert pooled_p50 == 14000
+    assert a_baselines[0].p50_cents != pooled_p50
+    assert b_baselines[0].p50_cents != pooled_p50
 
 
 # ---------------------------------------------------------------------------
@@ -447,7 +526,7 @@ def test_group_fast_candidates_by_bucket_excludes_slow_ones(tmp_path):
     set_spec(conn, "slow-1", BUCKET)
     mark_gone(conn, "slow-1", t0 + 100 * 3600)  # 100h - slow
 
-    candidates = derive_candidates(conn)
+    candidates = derive_candidates(conn, profile_id=PROFILE_ID)
     by_bucket = group_fast_candidates_by_bucket(candidates, fast_lifespan_hours=24)
 
     assert list(by_bucket.keys()) == [BUCKET]
@@ -472,7 +551,7 @@ def test_min_samples_boundary_eleven_no_row_twelve_a_row(tmp_path):
     conn = make_conn(tmp_path)
     _seed_fast_candidates(conn, tmp_path, 11)
 
-    candidates = derive_candidates(conn)
+    candidates = derive_candidates(conn, profile_id=PROFILE_ID)
     assert len(candidates) == 11
     assert compute_baselines(candidates, fast_lifespan_hours=24, min_samples=12) == []
 
@@ -480,7 +559,7 @@ def test_min_samples_boundary_eleven_no_row_twelve_a_row(tmp_path):
     set_spec(conn, "item-11", BUCKET)
     mark_gone(conn, "item-11", 1_000_000 + 3600)
 
-    candidates = derive_candidates(conn)
+    candidates = derive_candidates(conn, profile_id=PROFILE_ID)
     assert len(candidates) == 12
     baselines = compute_baselines(candidates, fast_lifespan_hours=24, min_samples=12)
     assert len(baselines) == 1
@@ -499,7 +578,7 @@ def test_slow_candidates_do_not_count_toward_min_samples(tmp_path):
         set_spec(conn, item_id, BUCKET)
         mark_gone(conn, item_id, t0 + 100 * 3600)  # 100h - slow at a 24h threshold
 
-    candidates = derive_candidates(conn)
+    candidates = derive_candidates(conn, profile_id=PROFILE_ID)
     assert len(candidates) == 20
     assert compute_baselines(candidates, fast_lifespan_hours=24, min_samples=12) == []
 
@@ -522,7 +601,7 @@ def test_mixed_bucket_with_enough_dead_but_too_few_fast_does_not_qualify(tmp_pat
         set_spec(conn, item_id, BUCKET)
         mark_gone(conn, item_id, t0 + 100 * 3600)  # 100h - slow
 
-    candidates = derive_candidates(conn)
+    candidates = derive_candidates(conn, profile_id=PROFILE_ID)
     assert len(candidates) == 25
     assert compute_baselines(candidates, fast_lifespan_hours=24, min_samples=12) == []
 

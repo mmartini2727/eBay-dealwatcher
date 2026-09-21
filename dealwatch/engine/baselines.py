@@ -34,9 +34,23 @@ logger = logging.getLogger(__name__)
 _DEAD_OK_LISTINGS = """
     SELECT item_id, bucket_key, gone_at, first_seen, last_seen
     FROM listings
-    WHERE gone_at IS NOT NULL AND spec_status = 'ok'
+    WHERE profile_id = ? AND gone_at IS NOT NULL AND spec_status = 'ok'
       AND variation_id IS NULL
 """
+# profile_id = ? (design.md §16 P6, docs/learnings.md L2's correction):
+# without this, every function built on _derive() pools dead listings
+# across every profile in the database, not just the one being asked
+# about - with two profiles, compute_baselines() would write cross-
+# contaminated percentiles under a single profile_id: plausible numbers,
+# silently wrong, no crash. Harmless while exactly one profile exists,
+# which is why this went undetected for as long as it did - see L2 for
+# the full history. profile_id is bound as this query's ONE parameter;
+# every function in this module that runs it takes profile_id as a
+# required keyword-only argument with NO default (see _derive() below) -
+# a default meaning "every profile" would silently reintroduce this exact
+# bug at any call site that forgot to pass it, and it would pass every
+# test written against a single-profile fixture.
+#
 # variation_id IS NULL (V0.8d, design.md's dated entry): a row for one
 # variation of a multi-variation listing (item_id shaped
 # v1|<listing>|<non-zero variation>) flaps in and out of search results
@@ -100,14 +114,19 @@ def select_price(total_cents: int | None, price_cents: int | None) -> tuple[int,
     return None
 
 
-def _derive(conn) -> tuple[list[LifespanCandidate], CandidatePoolStats]:
+def _derive(conn, *, profile_id: str) -> tuple[list[LifespanCandidate], CandidatePoolStats]:
     """Shared implementation behind derive_candidates() and
     derive_candidate_pool_stats() - one pass over the data, one place the
     exclusion order (design.md §2.1 / the V0.8a task) is encoded, so the
     report's stage counts can never drift from what the candidates
     themselves actually are.
+
+    profile_id is required keyword-only, no default (design.md §16 P6,
+    docs/learnings.md L2) - see _DEAD_OK_LISTINGS's own comment for why a
+    default would silently reintroduce the cross-profile contamination
+    bug this parameter exists to close.
     """
-    rows = conn.execute(_DEAD_OK_LISTINGS).fetchall()
+    rows = conn.execute(_DEAD_OK_LISTINGS, (profile_id,)).fetchall()
     total_dead_ok = len(rows)
     sweep_confirmed = 0
     has_bucket_key = 0
@@ -209,26 +228,33 @@ def _derive(conn) -> tuple[list[LifespanCandidate], CandidatePoolStats]:
     return candidates, stats
 
 
-def derive_candidates(conn) -> list[LifespanCandidate]:
-    """One candidate per dead, cleanly-bucketed, priced listing, built from
-    its LAST observation only (see module docstring for why). Pure aside
-    from taking an already-open sqlite3.Connection as its first argument,
-    matching record_sighting's convention (CLAUDE.md) - no writes, no
-    normalize() calls, no profile argument, because bucket_key/spec_status
-    are already what the engine decided them to be.
+def derive_candidates(conn, *, profile_id: str) -> list[LifespanCandidate]:
+    """One candidate per dead, cleanly-bucketed, priced listing for
+    profile_id, built from its LAST observation only (see module docstring
+    for why). Pure aside from taking an already-open sqlite3.Connection as
+    its first argument, matching record_sighting's convention (CLAUDE.md) -
+    no writes, no normalize() calls. profile_id is required keyword-only,
+    no default (design.md §16 P6, docs/learnings.md L2) - bucket_key/
+    spec_status are already what the engine decided them to be, but WHICH
+    profile's rows to pool is not something this function can infer, and
+    guessing "every profile" is exactly the bug this parameter exists to
+    close.
     """
-    candidates, _ = _derive(conn)
+    candidates, _ = _derive(conn, profile_id=profile_id)
     return candidates
 
 
-def derive_candidate_pool_stats(conn) -> CandidatePoolStats:
+def derive_candidate_pool_stats(conn, *, profile_id: str) -> CandidatePoolStats:
     """Same derivation as derive_candidates(), broken down by exclusion
-    stage - scripts/baseline_report.py section (a)."""
-    _, stats = _derive(conn)
+    stage - scripts/baseline_report.py section (a). profile_id required
+    keyword-only, no default - see derive_candidates()'s own docstring."""
+    _, stats = _derive(conn, profile_id=profile_id)
     return stats
 
 
-def derive_candidates_with_stats(conn) -> tuple[list[LifespanCandidate], CandidatePoolStats]:
+def derive_candidates_with_stats(
+    conn, *, profile_id: str
+) -> tuple[list[LifespanCandidate], CandidatePoolStats]:
     """Both derive_candidates() and derive_candidate_pool_stats() in one
     pass (V0.13) - for a caller (reporting/panels.py's baseline_queue())
     that needs both the candidates themselves and
@@ -239,9 +265,10 @@ def derive_candidates_with_stats(conn) -> tuple[list[LifespanCandidate], Candida
     exclusion definition" rule this module's own docstring states stays
     true for all three: there remains exactly one place the exclusion
     order is encoded, never a second, differently-shaped implementation
-    fork for this one caller's convenience.
+    fork for this one caller's convenience. profile_id required
+    keyword-only, no default - see derive_candidates()'s own docstring.
     """
-    return _derive(conn)
+    return _derive(conn, profile_id=profile_id)
 
 
 def nearest_rank_percentile(sorted_values: list[int], pct: float) -> int:

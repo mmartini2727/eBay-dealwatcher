@@ -3005,8 +3005,32 @@ SQLite's default attached-database ceiling is 10, and `connect_readonly()`
 would have to re-`ATTACH` every file on every connection — the MCP server
 opens one per request.
 
-**P6. Prerequisites this decision creates.** Both are now unblocked, and
-neither was actionable before P1.
+**P6. Prerequisites this decision creates.** Three, ranked by what they
+cost when profile 2 arrives: the first makes results wrong, the second
+makes them wrong more quietly, the third makes them slow.
+
+- **`listings` must be keyed by `(profile_id, item_id)`, not `item_id`
+  alone.** Migration 2 declares `item_id TEXT PRIMARY KEY` with
+  `profile_id` as an ordinary column, so one eBay listing can exist as
+  exactly one row in the database, owned by whichever profile's collector
+  saw it first. `record_sighting()`'s existence check is
+  `SELECT * FROM listings WHERE item_id = ?` with no profile scope, so the
+  INSERT branch never fires for an item another profile already owns. When
+  two profiles' searches overlap — a broad "ThinkPad" profile alongside the
+  T14 one, or two adjacent models — profile B's collector takes the UPDATE
+  branch: the row keeps A's `profile_id` while B's title, `spec_json`, and
+  `bucket_key` get written over it. The listing is permanently invisible to
+  every one of B's profile-scoped queries, and its normalized fields thrash
+  between two profiles' rule sets on alternating polls. No error; it reads
+  as B's search simply returning fewer results than eBay shows. Note that
+  scoping the candidate query (the next bullet) does not help here and
+  arguably hides it, by removing the contamination that would have made the
+  problem loud. SQLite cannot alter a primary key in place, so the fix is a
+  table-rebuild migration touching `record_sighting()`, `record_sweep()`,
+  `_LAST_OBSERVATION`, `mcp_server/item_lookup.py`, and every
+  `WHERE item_id = ?` in `server.py`. Substantially larger than the other
+  two and getting its own design pass; recorded here so it is not
+  discovered on the day profile 2 is added.
 
 - **`docs/learnings.md` L2 — scope the candidate query.** `_DEAD_OK_LISTINGS`
   (`engine/baselines.py`) has no `profile_id` filter. With a second profile
@@ -3014,11 +3038,17 @@ neither was actionable before P1.
   percentiles under a single `profile_id`: plausible numbers, silently
   wrong, no crash — the same shape as §8's un-pasted seed chart. The fix
   threads `profile_id` through `_derive()`, `derive_candidates()`,
-  `derive_candidate_pool_stats()`, and the three callers
-  (`scripts/recompute_baselines.py`, `scripts/baseline_report.py`,
-  `reporting/panels.py`'s `baseline_queue()`). No schema change, so this can
-  land today, against one profile, and it must land before the baseline
-  recompute is scheduled — a cron running a contaminating recompute is worse
+  `derive_candidate_pool_stats()` (and `derive_candidates_with_stats()`,
+  V0.13 Part B) and **every** call site: `scripts/recompute_baselines.py`,
+  `scripts/baseline_report.py`, `reporting/panels.py`'s `baseline_queue()`,
+  and `mcp_server/server.py`'s `get_market_price()`, which calls
+  `derive_candidates(conn)` directly in its `no_computed_baseline` branch
+  (line ~1317) — a fourth caller the first version of this section missed,
+  and exactly the half-applied-filter failure L2 warns about. `server.py`'s
+  `get_review_queue()` is covered transitively via `baseline_queue()`. No
+  schema change, so this can land today, against one profile, and it must
+  land before the baseline recompute is scheduled — a cron running a
+  contaminating recompute is worse
   than a manual one, because nobody reads the output. The required test uses
   a two-profile fixture whose dead listings land in the **same** `bucket_key`
   string (collision across profiles is possible and must not be assumed
