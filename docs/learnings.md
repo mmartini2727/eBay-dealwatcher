@@ -76,6 +76,55 @@ baseline recompute is ever put on a schedule - a cron silently
 contaminating baselines is worse than a manual one, because nobody is
 watching the output closely enough to notice.
 
+**Shipped 2026-09-20 - six call sites, not four.** This correction's own
+count was still short by two. A required, pre-edit enumeration pass over
+every caller of `_derive`/`derive_candidates`/`derive_candidate_pool_stats`/
+`derive_candidates_with_stats` (not a repeat of the same grep that missed
+site 4 above, but a fresh one, checked against this entry's list rather
+than trusted to match it) found a fifth and sixth site neither this entry
+nor design.md §16 P6 had recorded: `scripts/bucket_key_dryrun.py`'s
+`verify_against_derive_candidates()` (calls `baselines.derive_candidates()`
+directly, to compare against the dry-run's own derivation) and
+`derive_pre_bucket_candidates()` in the same file, which runs its own
+query, `_DRY_RUN_LISTINGS` - textually `_DEAD_OK_LISTINGS` with the SELECT
+column list swapped via `.replace()`, so it silently inherited the new
+`profile_id = ?` placeholder the moment the base query changed. See L16
+below for what that inheritance mechanism means for the *next* change to
+`_DEAD_OK_LISTINGS`, which will not be caught the same way this one was.
+
+All six sites now pass `profile_id` as a required keyword-only argument
+with no default, anywhere - not `profile_id: str | None = None`, no
+module-level fallback constant, no "all profiles" branch. Comments
+claiming the query was unscoped were corrected at every site that stated
+it: `reporting/status.py`, `reporting/panels.py`'s `baseline_queue()`,
+`engine/baselines.py`'s own `_DEAD_OK_LISTINGS`, and
+`mcp_server/server.py`. Required test: a two-profile fixture whose dead
+listings collide on the same `bucket_key` string, asserting each
+profile's percentiles come out unmixed. Sabotage-verified by a real
+edit-run-revert pass (defeat the filter as `profile_id = ? OR 1 = 1` -
+keeping the bound parameter so binding doesn't error, which is the
+semantically correct sabotage for a `WHERE` clause becoming a no-op, as
+opposed to deleting it outright and getting a binding-count error
+instead of the intended silent-pooling behavior): only the new
+two-profile test went red, all 27 pre-existing `test_baselines.py` calls
+(mechanically updated to pass a real `profile_id`, not a default) stayed
+green, and the full suite passed at 626 both before sabotage and after
+revert - exactly the prediction stated before the sabotage was run, not
+adjusted after the fact. Schema unchanged, still version 8.
+
+Live-verified 2026-09-20 against the real LXC, one profile: unfiltered
+and filtered candidate counts both 778 - the filter is a confirmed no-op
+with one profile today, checked directly against the database rather
+than inferred from the sabotage test alone.
+
+**Coverage limit:** the sabotage proves the filter is load-bearing inside
+`engine/baselines.py`. It does not prove any of the six call sites passes
+the *correct* `profile_id` - a site passing a wrong-but-valid value would
+leave this test green, since the test exercises the engine function
+directly, not any call site's own argument. Not covered by choice; the
+write path (`run_recompute()` against a two-profile fixture) is where a
+wrong-value bug would actually surface, and it is not exercised here.
+
 ## L3. Negative-lifespan anomaly: three items, one explained pattern
 
 Three listings where `gone_at` precedes their last observation's
@@ -135,6 +184,17 @@ auto-exclusion of this bucket. One violation at low n is not evidence the
 premise is wrong for this bucket, only evidence worth watching as the
 sample grows. If this bucket (or others) keeps violating the premise as
 `n` increases, that's the point at which it stops being a footnote.
+
+**Correction (2026-09-20 live report): the violation reversed as n grew.**
+Same bucket, re-measured: fast n=16 $455.00, slow n=9 $474.99 - fast is
+now $19.99 *cheaper*, the direction the premise predicts. The original
+observation above is left in place rather than edited or deleted, per
+this project's own convention for `learnings.md` - the fact that a
+small-n violation resolved as the sample grew is itself the learning,
+not a reason to erase the record of the violation ever having been seen.
+This is one bucket, once; see the broader fast-sale-premise open item in
+CLAUDE.md (updated the same date) for how it reads across all eligible
+buckets, not just this one.
 
 ## L5. `baseline_queue()`'s seed lookup picks ONE listing per bucket - sound only because no seed matches outside the bucket_key today
 
@@ -473,3 +533,35 @@ fix is not finished just because it rejects the right things at the
 moment it's written; it also needs a story for what it does an hour
 later, and for what a caller (or an operator) can see when that story
 goes wrong.
+
+## L16. `_DRY_RUN_LISTINGS`'s `.replace()` coupling to `_DEAD_OK_LISTINGS` - inheritance that only fails loudly by accident
+
+`scripts/bucket_key_dryrun.py` builds `_DRY_RUN_LISTINGS` as
+`_DEAD_OK_LISTINGS` (`engine/baselines.py`) with its SELECT column list
+swapped via a Python `.replace()` call - the WHERE clause is inherited
+verbatim, unread, every time either string changes. When L2's fix added
+`profile_id = ?` to `_DEAD_OK_LISTINGS`'s WHERE clause, `_DRY_RUN_LISTINGS`
+picked it up automatically, and that was caught safely only because the
+change it needed to survive happened to raise
+`sqlite3.ProgrammingError: Incorrect number of bindings supplied` the
+instant `derive_pre_bucket_candidates()` ran unmodified against the new
+query text - a loud, immediate, unmissable failure.
+
+That is not a property of the coupling; it is a property of this
+particular change happening to alter the bound-parameter count. The
+learning is the inverse case, and it is the actual point of this entry: a
+future edit to `_DEAD_OK_LISTINGS` that adds a WHERE condition needing
+**no** new parameter - a literal comparison, another `IS NULL`, a fixed
+date bound - propagates into `_DRY_RUN_LISTINGS` exactly as silently as
+the profile_id clause did, except nothing errors. The dry-run's self-check
+(`verify_against_derive_candidates()`, comparing its own derivation
+against `baselines.derive_candidates()`) would keep passing, having
+silently started comparing two queries whose relationship changed, with
+no edit made in this file and no test that would notice. Inheritance via
+`.replace()` is the intent right up until the day it isn't, and nothing at
+the `bucket_key_dryrun.py` end marks where that boundary is. Not fixed
+here - the L2 task that surfaced this was explicitly scoped not to
+consolidate or redesign `bucket_key_dryrun.py`'s own copy of this query
+(or its separate `open_readonly()` copy); recorded so the next person
+editing `_DEAD_OK_LISTINGS` checks this file by hand rather than trusting
+the test suite to catch a parameter-count-preserving change.

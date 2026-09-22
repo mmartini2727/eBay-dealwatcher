@@ -3032,29 +3032,59 @@ makes them wrong more quietly, the third makes them slow.
   two and getting its own design pass; recorded here so it is not
   discovered on the day profile 2 is added.
 
-- **`docs/learnings.md` L2 — scope the candidate query.** `_DEAD_OK_LISTINGS`
-  (`engine/baselines.py`) has no `profile_id` filter. With a second profile
-  it pools both profiles' dead listings and writes cross-contaminated
-  percentiles under a single `profile_id`: plausible numbers, silently
-  wrong, no crash — the same shape as §8's un-pasted seed chart. The fix
-  threads `profile_id` through `_derive()`, `derive_candidates()`,
-  `derive_candidate_pool_stats()` (and `derive_candidates_with_stats()`,
-  V0.13 Part B) and **every** call site: `scripts/recompute_baselines.py`,
-  `scripts/baseline_report.py`, `reporting/panels.py`'s `baseline_queue()`,
-  and `mcp_server/server.py`'s `get_market_price()`, which calls
-  `derive_candidates(conn)` directly in its `no_computed_baseline` branch
-  (line ~1317) — a fourth caller the first version of this section missed,
-  and exactly the half-applied-filter failure L2 warns about. `server.py`'s
-  `get_review_queue()` is covered transitively via `baseline_queue()`. No
-  schema change, so this can land today, against one profile, and it must
-  land before the baseline recompute is scheduled — a cron running a
-  contaminating recompute is worse
-  than a manual one, because nobody reads the output. The required test uses
-  a two-profile fixture whose dead listings land in the **same** `bucket_key`
-  string (collision across profiles is possible and must not be assumed
-  away), asserting each profile's percentiles come out unmixed; sabotage by
-  removing the clause must go red. A single-profile fixture passes either
-  way and proves nothing here.
+- **`docs/learnings.md` L2 — scope the candidate query. Shipped 2026-09-20.**
+  `_DEAD_OK_LISTINGS` (`engine/baselines.py`) had no `profile_id` filter.
+  With a second profile it would pool both profiles' dead listings and
+  write cross-contaminated percentiles under a single `profile_id`:
+  plausible numbers, silently wrong, no crash — the same shape as §8's
+  un-pasted seed chart. The fix threads `profile_id` through `_derive()`,
+  `derive_candidates()`, `derive_candidate_pool_stats()` (and
+  `derive_candidates_with_stats()`, V0.13 Part B) as a required
+  keyword-only argument with no default, and **every** call site — six,
+  not three or four as earlier drafts of this bullet said:
+  `scripts/recompute_baselines.py`, `scripts/baseline_report.py` (two
+  calls), `reporting/panels.py`'s `baseline_queue()`,
+  `mcp_server/server.py`'s `get_market_price()` (its
+  `no_computed_baseline` branch, line ~1317 — the fourth caller an earlier
+  draft of this bullet missed), and `scripts/bucket_key_dryrun.py` (two
+  calls — `verify_against_derive_candidates()` and
+  `derive_pre_bucket_candidates()`, which runs its own query,
+  `_DRY_RUN_LISTINGS`, textually derived from `_DEAD_OK_LISTINGS`). The
+  `bucket_key_dryrun.py` sites were not on either document's list at all —
+  they surfaced from the implementing agent's own call-site enumeration
+  pass, done before any edit, which is exactly why that enumeration step
+  was required rather than trusted to memory. `server.py`'s
+  `get_review_queue()` is covered transitively via `baseline_queue()`.
+
+  Live-verified 2026-09-20 against the real LXC, one profile
+  (`thinkpad-t14`): the unfiltered and `profile_id`-filtered candidate
+  counts are identical — 778 / 778 — confirmed directly against the
+  database rather than by comparing two report runs against each other.
+  This is the expected result with one profile and proves the filter is a
+  no-op today, not that it is correct; that came from the sabotage test
+  below.
+
+  No schema change, so this landed against the single real profile without
+  waiting on anything else, and it landed before the baseline recompute is
+  ever scheduled — a cron running a contaminating recompute would be worse
+  than a manual one, because nobody reads the output closely enough to
+  notice. The required test uses a two-profile fixture whose dead listings
+  land in the **same** `bucket_key` string (collision across profiles is
+  possible and must not be assumed away), asserting each profile's
+  percentiles come out unmixed; sabotage-verified by a real edit-run-revert
+  pass — removing the filter's effect (keeping the bound parameter, so
+  binding doesn't error) turned only that new test red, all 27 pre-existing
+  `test_baselines.py` calls and the full suite otherwise green, as
+  predicted before the sabotage was run.
+
+  **Coverage limit, stated as a limit, not a caveat:** the sabotage proves
+  the filter is load-bearing inside `engine/baselines.py`. It does not
+  prove any of the six call sites passes the *correct* `profile_id` — a
+  site passing a wrong-but-valid value would leave this test green, since
+  the test only exercises the engine function directly. Not covered by
+  choice; the write path (`run_recompute()` exercised end-to-end against a
+  two-profile fixture) is where a wrong-value bug would actually show up,
+  and that path is not tested here.
 - **`observations.profile_id`.** `reporting/status.py`'s `_alive()` already
   documents, from a measurement against a synthetic second profile rather
   than an inference, that "newest observation for this profile" degrades

@@ -285,3 +285,20 @@ and `-shm`: they belong to the database you just replaced.
   docker exec dealwatch sh -c 'md5sum /app/scripts/*.py' | awk '{print $1}' | sort > /tmp/remote.md5
   diff /tmp/local.md5 /tmp/remote.md5 && echo "scripts match"
   ```
+
+## Commonly used commands
+
+Run the maintenance/report scripts **inside the container**, not from the
+LXC host:
+
+```bash
+docker exec dealwatch python scripts/baseline_report.py \
+  --profile profiles/thinkpad-t14.yaml
+```
+
+The host-side form (`scripts/baseline_report.py --profile ...`, run
+directly on the LXC) fails with `Permission denied` despite the file's
+shebang — the shebang points at a venv Python that only exists inside the
+container, where the `dealwatch` package is actually installed. The LXC
+host itself has no venv. Same applies to `recompute_baselines.py` and any
+other `scripts/*.py` invocation.
