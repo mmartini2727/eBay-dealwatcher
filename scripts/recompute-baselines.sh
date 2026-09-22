@@ -15,6 +15,14 @@ shopt -s nullglob
 paths=("$REPO_ROOT"/profiles/*.yaml)
 [ ${#paths[@]} -gt 0 ] || { echo "no profiles in $REPO_ROOT/profiles" >&2; exit 1; }
 
+ids=()
+for path in "${paths[@]}"; do
+  pid="$(awk '/^id:[[:space:]]/ {print $2; exit}' "$path")"
+  [ -n "$pid" ] && ids+=("$pid")
+done
+dupes="$(printf '%s\n' "${ids[@]}" | sort | uniq -d)"
+[ -z "$dupes" ] || { echo "FAIL duplicate profile id(s): $dupes" >&2; exit 1; }
+
 rc=0
 for path in "${paths[@]}"; do
   rel="profiles/$(basename "$path")"
@@ -54,8 +62,16 @@ for path in "${paths[@]}"; do
   echo "ok  $id  baselines $before -> $after  |  $(echo "$out" | tail -n1)"
 done
 
-if [ "$rc" -eq 0 ] && [ -n "$KUMA_URL" ]; then
-  curl -fsS -m 10 "$KUMA_URL" >/dev/null || echo "kuma push failed" >&2
+if [ -n "$KUMA_URL" ]; then
+  if [ "$rc" -eq 0 ]; then
+    curl -fsS -m 10 -G "$KUMA_URL" \
+      --data-urlencode "status=up" --data-urlencode "msg=ok" >/dev/null \
+      || echo "kuma push failed" >&2
+  else
+    curl -fsS -m 10 -G "$KUMA_URL" \
+      --data-urlencode "status=down" --data-urlencode "msg=recompute failed" >/dev/null \
+      || echo "kuma push failed" >&2
+  fi
 fi
 
 exit "$rc"
