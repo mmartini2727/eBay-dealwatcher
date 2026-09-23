@@ -302,3 +302,38 @@ shebang — the shebang points at a venv Python that only exists inside the
 container, where the `dealwatch` package is actually installed. The LXC
 host itself has no venv. Same applies to `recompute_baselines.py` and any
 other `scripts/*.py` invocation.
+
+```bash
+# nightly recompute, by hand
+cd /root/eBay-dealwatcher
+DEALWATCH_KUMA_PUSH_URL='https://kuma.example/api/push/TOKEN' \
+  ./scripts/recompute-baselines.sh
+
+# what cron runs (01:45 local, 15 min after the 01:30 snapshot)
+45 1 * * * cd /root/eBay-dealwatcher && \
+  DEALWATCH_KUMA_PUSH_URL='https://kuma.example/api/push/TOKEN' \
+  ./scripts/recompute-baselines.sh >> /var/log/dealwatch-recompute.log 2>&1
+```
+
+Single-quote the URL and pass only the base push endpoint, no query
+string — an unquoted `&` in a URL set as an environment variable on a
+shell command line splits into background jobs, silently losing the
+variable, and the script still reports success (`docs/learnings.md` L19).
+
+### Host state not in version control
+
+The crontab entries above, the Uptime Kuma monitor and its push token, and
+any logrotate config for `/var/log/dealwatch-*.log` all live on the LXC
+itself and are captured by nothing in this repo. If the LXC is rebuilt,
+they are gone — and the failure is silent: the collector keeps running,
+`/health` stays green, and the baselines simply stop being recomputed
+until someone notices `baselines_age` has gone stale again. This README is
+the only record of what has to be recreated:
+
+- The 01:30 snapshot cron line (Database snapshots, above) and the 01:45
+  recompute cron line (above), both on the LXC host, not in the container.
+- The Uptime Kuma Push monitor backing `DEALWATCH_KUMA_PUSH_URL`, and its
+  push token.
+- Any logrotate config for `/var/log/dealwatch-snapshot.log` and
+  `/var/log/dealwatch-recompute.log` — neither log is rotated by anything
+  in this repo.

@@ -3030,7 +3030,13 @@ makes them wrong more quietly, the third makes them slow.
   `_LAST_OBSERVATION`, `mcp_server/item_lookup.py`, and every
   `WHERE item_id = ?` in `server.py`. Substantially larger than the other
   two and getting its own design pass; recorded here so it is not
-  discovered on the day profile 2 is added.
+  discovered on the day profile 2 is added. `docs/learnings.md` L18 found
+  the same identity-collision shape one layer up, in `profiles/*.yaml`
+  itself rather than in `listings`: two profile files sharing an `id:`
+  silently overwrite each other's baselines. Different fix (a duplicate-id
+  guard in §17's cron wrapper, not a schema change), same underlying
+  failure class — an identity that is supposed to be unique has nothing
+  actually enforcing it.
 
 - **`docs/learnings.md` L2 — scope the candidate query. Shipped 2026-09-20.**
   `_DEAD_OK_LISTINGS` (`engine/baselines.py`) had no `profile_id` filter.
@@ -3118,3 +3124,99 @@ CLAUDE.md gains locked decision #6 pointing here. `docs/learnings.md` L2's
 closing claim — that the multi-profile model must be decided before its fix
 can be scoped — is superseded by this section and corrected in place, since
 that sentence is what would otherwise stop someone from fixing it.
+
+## 17. Nightly baseline recompute — host cron (shipped 2026-09-21)
+
+§15's Deliberately Deferred list and CLAUDE.md's open items both flagged
+"schedule the recompute" as overdue — live evidence being a real 6.7-day
+gap (V0.10) and then a real 6-day gap (§15 V1.0 live verification) between
+manual runs, each one leaving buckets scoring off seed values with nothing
+but the `baselines_age` indicator, itself only checked by someone opening
+the dashboard, to notice. This section records the three choices made
+shipping the fix, each against a specific rejected alternative, so the
+shape doesn't get re-litigated the next time someone looks at this script.
+
+**Choice 1: host cron, not a hook inside the collector loop.** The
+collector (`engine/collector.py`) is a single long-lived loop; a recompute
+call inside it blocks poll and sweep for the recompute's duration — the
+same class of problem the dashboard route's sync/async pin and the MCP
+server's sync-tool pin both exist to avoid, just on the write side instead
+of the read side. Host cron is already the established pattern for the
+nightly snapshot (`snapshot.sh`, 01:30 local) with a working precedent for
+failure visibility: a failed cron job is not invisible, because the Kuma
+push monitor added alongside it alerts on both an exit failure and a
+never-arriving heartbeat.
+
+**Choice 2: a separate script (`scripts/recompute-baselines.sh`), not
+appended to `snapshot.sh`.** `snapshot.sh` accepts an optional TAG
+argument for manual pre-migration snapshots — `snapshot.sh pre-migration`
+run by hand before a risky change must not have the side effect of also
+triggering a baseline recompute. Secondary reasons: `snapshot.sh` runs
+under `set -euo pipefail`, so a recompute failure appended to it would read
+as a snapshot failure after the snapshot itself had already succeeded and
+been written; and the two operate in different execution contexts — the
+snapshot runs entirely with the host's own `sqlite3` CLI (design.md's
+existing "container image has no `sqlite3` CLI" constraint), while the
+recompute has to run inside the container via `docker exec`, since that's
+where the `dealwatch` package and its dependencies are installed.
+
+**Choice 3: sequenced after the snapshot (01:45, fifteen minutes behind
+the 01:30 snapshot), not before.** A recompute that goes wrong — a bad
+profile edit, a bug in `engine/baselines.py` — is always recoverable from
+a snapshot taken minutes earlier rather than one taken after the damage.
+
+**The profile loop globs `profiles/*.yaml`** rather than hardcoding a
+list, skipping any profile with `enabled: false`. Adding a target
+therefore costs a YAML file and nothing else *for this specific path* —
+no cron edit needed — which is notable because §16 P8 names the general
+version of this same gap (a new profile still needs a compose stanza and,
+until now, a cron line) as the reason a from-scratch supervisor is a
+future milestone and not a solved problem. This script is the one place
+in the system today where the "just a YAML file" goal is actually reached.
+
+Two failure modes were found live, not anticipated in advance, and both
+are guarded against directly by the wrapper rather than by anything in
+`engine/baselines.py` itself:
+
+- **A zero-bucket recompute silently wipes the profile's baselines.**
+  `store_baselines()` deletes every row for the profile, then inserts —
+  one transaction. A run that derives zero qualifying buckets (a bad
+  profile edit, a database problem) leaves the profile with *zero* rows,
+  not stale ones, and `baselines_age` cannot flag it because there is
+  nothing left to be old. The wrapper counts baseline rows before and
+  after each profile's run and fails the whole invocation if a non-empty
+  set became empty. See `docs/learnings.md` L17 for the sabotage
+  verification and why this is a detector, not a lock.
+- **Two profile YAMLs sharing an `id:` silently clobber each other's
+  baselines.** Found while sabotage-testing the guard above, not by
+  design: a copied profile file that hadn't had its `id:` changed ran
+  second in the loop and overwrote the first profile's rows, and the
+  zero-wipe guard above does not catch it, because the row count after is
+  non-zero. The wrapper now collects every profile's `id:` up front and
+  refuses the entire run if any two collide, before any recompute
+  executes. This is the same identity-collision shape as P6's `listings`
+  primary-key problem above — see that bullet's own note pointing here.
+  Full account in `docs/learnings.md` L18.
+
+A third, narrower defect was found in the Kuma push itself — an unquoted
+`&` in a URL passed as an environment variable on a shell command line
+splits into background jobs, so the variable never reaches the script and
+the wrapper reports success while silently sending nothing. See
+`docs/learnings.md` L19. Fixed by quoting the URL and passing only the
+base endpoint; the script builds the query string itself.
+
+Live-verified on the LXC, 2026-09-21: a clean run reported
+`baselines 8 -> 8` with 741 dead candidates considered (up from 707 the
+same evening before the run — see CLAUDE.md's status entry), and the Kuma
+monitor went green. Not built or verified here: `baseline_history` (§15's
+Deliberately Deferred list, above) — it pairs naturally with this
+milestone but is its own table and its own design pass, not a consequence
+of scheduling alone.
+
+### Recorded elsewhere
+
+`docs/learnings.md` gains L17, L18, and L19. §16 P6's `listings`
+composite-PK bullet gets a one-line cross-reference to L18. CLAUDE.md's
+open items list closes the stale-baseline item and opens two narrower ones
+(the silent-skip Kuma push, and the `awk` line-prefix parse's fragility
+against a nested or reindented `id:`/`enabled:` key).

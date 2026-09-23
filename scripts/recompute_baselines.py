@@ -58,9 +58,12 @@ def main(argv: list[str] | None = None) -> None:
     # lifespan message from WARNING to DEBUG (build_payload() now calls
     # into it on every dashboard render, and a per-item WARNING at that
     # frequency floods a container log for the same handful of items
-    # every time). This script has no dashboard-refresh frequency
-    # problem - it's a manual, one-shot run - so it configures DEBUG
-    # itself to see every one of those lines, not just the INFO-level
+    # every time). This script runs nightly under cron now
+    # (scripts/recompute-baselines.sh, design.md §17), not as a one-shot
+    # manual run - but the wrapper captures this script's output and only
+    # emits it on failure, so DEBUG here costs one log line per successful
+    # run, not a nightly flood. On a failure, the DEBUG lines are exactly
+    # what's needed to see every dropped item, not just the INFO-level
     # aggregate. Set in main(), not at module import time: this module is
     # imported directly by tests/test_recompute_baselines.py, which must
     # not have logging.basicConfig() called as an import side effect.

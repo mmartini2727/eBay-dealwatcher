@@ -565,3 +565,89 @@ consolidate or redesign `bucket_key_dryrun.py`'s own copy of this query
 (or its separate `open_readonly()` copy); recorded so the next person
 editing `_DEAD_OK_LISTINGS` checks this file by hand rather than trusting
 the test suite to catch a parameter-count-preserving change.
+
+## L17. DELETE-then-INSERT means a zero-bucket recompute wipes baselines, and the staleness indicator stays quiet
+
+`engine/baselines.py`'s `store_baselines()` deletes every existing
+`baselines` row for a profile, then inserts the newly-derived rows, in one
+transaction - the natural shape for "replace the profile's baselines with
+what was just computed," and correct for every ordinary run. It has one
+consequence nobody had reason to think through until scheduling made a
+bad run possible without a human watching: a recompute that derives *zero*
+qualifying buckets (a bad profile edit, `min_samples` misconfigured, a
+transient database problem) doesn't leave the profile with stale rows -
+it leaves it with **zero** rows. Scoring falls through to the seed layer
+for every bucket, alerts on computed-baseline buckets stop meaning what
+they used to mean, and `baselines_age` (`BASELINE_STALE_WARN_MINS`,
+`reporting/indicators.py`) cannot flag any of it as amber, because there
+is nothing left in the table to be old - the indicator watches an age, not
+a row count.
+
+`scripts/recompute-baselines.sh` guards this by counting `baselines` rows
+for the profile before and after each run and failing the whole
+invocation if a non-empty count became zero. **This is a detector, not a
+lock** - the guard fires after the DELETE has already committed, which is
+only an acceptable shape because the recompute is cheap, idempotent, and
+a snapshot exists from fifteen minutes earlier (design.md §17, Choice 3).
+A system where the wipe itself were expensive or irreversible would need
+the check before the transaction, not after it.
+
+Sabotage-verified on the real LXC: a copy of the live profile with
+`min_samples: 9999` (making every bucket fail the sample-count gate)
+recomputed to zero qualifying buckets, the guard fired, and the wrapper
+exited 1.
+
+## L18. Two profile YAMLs sharing an `id:` silently clobber each other's baselines
+
+Found by accident, sabotage-testing L17's guard: a copied
+`thinkpad-t14.yaml`, edited for a hypothetical second profile but never
+given its own `id:`, ran second in the cron wrapper's loop and overwrote
+the first profile's baseline rows outright - `store_baselines()` has no
+way to know two files claimed the same identity, it only sees the
+`profile_id` it was handed. L17's zero-wipe guard does **not** catch this
+case, because the row count after the second run is non-zero - it looks
+like a completely ordinary successful recompute, for the wrong profile's
+data.
+
+This is the copy-paste path to an actual second profile: duplicate an
+existing YAML, edit the search terms and thresholds, and forget to change
+`id:`. Nothing rejects the file at load time, nothing rejects it in the
+collector, and this script would have run it nightly, clobbering the
+same profile's baselines every night, until someone noticed the
+percentiles looked wrong and had no obvious reason why.
+
+Now guarded structurally rather than by inference: the wrapper collects
+every profile's `id:` up front, before the recompute loop starts, and
+refuses the entire run on any duplicate - `FAIL duplicate profile id(s):
+...`, exit 1, nothing executed. This is the same identity-collision shape
+as design.md §16 P6's `listings` primary-key problem (`item_id` alone,
+not `(profile_id, item_id)`) - a value that is supposed to be unique
+across profiles with nothing in the schema or the loading path actually
+enforcing it. §16 P6 now cross-references this entry.
+
+## L19. An unquoted `&` in an environment variable set on the command line never reaches the script, and it reports success anyway
+
+Running `DEALWATCH_KUMA_PUSH_URL=https://kuma.example/api/push/TOKEN?status=up&msg=OK
+./scripts/recompute-baselines.sh` looked like it set the variable and ran
+the script. It did neither, correctly. Unquoted, the shell treats `&` as a
+job-control operator - it split the line at `&`, so `msg=OK
+./scripts/recompute-baselines.sh` ran as its own (immediately-failing)
+background job, and `DEALWATCH_KUMA_PUSH_URL` was set only in the
+environment of the job that exited before doing anything. The actual
+script invocation ran with the variable unset.
+
+The wrapper's push block is conditional on the variable being non-empty,
+so an unset variable doesn't error - it just skips the block silently.
+The script therefore ran the real recompute, printed `ok`, and exited 0,
+having sent nothing to Kuma. The visible symptom was not a failure at
+all: a monitor that never changes state, which reads identically to a
+monitor that is passing, right up until someone needs the heartbeat and
+finds it stopped an unknown number of days ago.
+
+Fixed at the call site, not in the script: single-quote the URL, and pass
+only the base push endpoint with no query string. The script already
+builds the query itself (`curl -G --data-urlencode "status=..."
+--data-urlencode "msg=..."`) - a URL that arrives with its own `?status=`
+already attached produces a malformed double-query request even once the
+quoting is fixed, so both parts of the call site matter, not just the
+quoting. See README.md's command examples, which use the corrected form.
