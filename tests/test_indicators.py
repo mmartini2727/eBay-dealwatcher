@@ -31,6 +31,7 @@ from dealwatch.reporting.indicators import (
     build_best_ratio_chart,
     build_budget_pacing,
     build_indicators,
+    build_sweeps_chart,
 )
 
 SWEEP_INTERVAL = 60
@@ -251,6 +252,14 @@ def test_baselines_age_is_unknown_when_none():
     result = _build(_status(baseline={"baselines_computed_age_mins": None}))
     assert result["baselines_age"]["state"] == "unknown"
     assert result["baselines_age"]["value"] is None
+
+
+def test_baselines_age_displays_in_hours_not_minutes():
+    # A2: "1122 min ago" isn't readable at a glance; the underlying
+    # baselines_computed_age_mins payload field (status.py) stays in
+    # minutes - only this indicator's display string converts.
+    result = _build(_status(baseline={"baselines_computed_age_mins": 1122}))
+    assert result["baselines_age"]["value"] == "18.7h ago"
 
 
 # ---------------------------------------------------------------------------
@@ -624,3 +633,79 @@ def test_best_ratio_chart_ratio_display_formats_to_two_decimals():
     chart = build_best_ratio_chart(entries)
 
     assert chart[0]["ratio_display"] == "0.72"
+
+
+# ---------------------------------------------------------------------------
+# build_sweeps_chart (2026-09-23, docs/learnings.md L20/L22)
+# ---------------------------------------------------------------------------
+
+
+def _sweep_day(day_start, sweeps, coverage_pct=96.0):
+    return {"day_start": day_start, "label": "x", "sweeps": sweeps, "coverage_pct": coverage_pct}
+
+
+def test_sweeps_chart_scale_is_fixed_not_relative_to_the_window():
+    # The one deliberate difference from build_best_ratio_chart: an
+    # outage spanning the WHOLE window must not make its worst day the
+    # window's tallest bar by construction - a relative scale (best_ratio_
+    # chart's own approach) would do exactly that and hide the incident
+    # this chart exists to surface.
+    entries = [_sweep_day(0, 10), _sweep_day(1, 12)]  # a bad window, no 24-sweep day at all
+
+    chart = build_sweeps_chart(entries, sweep_interval_minutes=60)
+
+    # nominal=24, headroom=1.25 -> scale_max=30 -> 10/30*100, 12/30*100
+    assert chart["days"][0]["bar_pct"] == pytest.approx(100 / 3)
+    assert chart["days"][1]["bar_pct"] == pytest.approx(40.0)
+
+
+def test_sweeps_chart_nominal_line_is_80_pct_at_the_default_60_minute_cadence():
+    chart = build_sweeps_chart([_sweep_day(0, 24)], sweep_interval_minutes=60)
+
+    assert chart["nominal_line_pct"] == pytest.approx(80.0)
+    assert chart["nominal_per_day_display"] == "24/day"
+
+
+def test_sweeps_chart_bar_pct_is_clamped_at_100_on_a_deploy_day_spike():
+    # L22: real deploy-day counts of 29/27/28 observed against a 24
+    # nominal - scale_max (30) already has headroom for these, but the
+    # clamp is what protects against anything bigger.
+    chart = build_sweeps_chart([_sweep_day(0, 45)], sweep_interval_minutes=60)
+
+    assert chart["days"][0]["bar_pct"] == 100.0
+
+
+def test_sweeps_chart_coverage_display_is_a_dash_not_zero_when_none():
+    chart = build_sweeps_chart([_sweep_day(0, 0, coverage_pct=None)], sweep_interval_minutes=60)
+
+    assert chart["days"][0]["coverage_display"] == "—"
+
+
+def test_sweeps_chart_mean_sweeps_includes_zero_sweep_days():
+    # An outage day pulling the mean down is the point - zero-sweep days
+    # must not be excluded from this average.
+    entries = [_sweep_day(0, 24), _sweep_day(1, 0)]
+
+    chart = build_sweeps_chart(entries, sweep_interval_minutes=60)
+
+    assert chart["mean_sweeps_display"] == "12.0/day"
+
+
+def test_sweeps_chart_mean_coverage_excludes_none_days_rather_than_averaging_them_as_zero():
+    # Same "absent is not zero" discipline as best_ratio_per_day()'s A3 -
+    # averaging a missing day in as 0% would understate every window
+    # that ever contains an outage, exactly backwards from this panel's
+    # purpose.
+    entries = [_sweep_day(0, 24, coverage_pct=90.0), _sweep_day(1, 0, coverage_pct=None)]
+
+    chart = build_sweeps_chart(entries, sweep_interval_minutes=60)
+
+    assert chart["mean_coverage_display"] == "90.0%"
+
+
+def test_sweeps_chart_mean_coverage_is_a_message_not_a_number_when_every_day_is_none():
+    entries = [_sweep_day(0, 0, coverage_pct=None) for _ in range(3)]
+
+    chart = build_sweeps_chart(entries, sweep_interval_minutes=60)
+
+    assert chart["mean_coverage_display"] == "no coverage data in window"

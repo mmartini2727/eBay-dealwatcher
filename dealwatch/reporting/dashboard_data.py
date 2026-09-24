@@ -46,6 +46,12 @@ V0.12b addendum: `best_ratio_chart` is independent of `status` and
 (panels.best_ratio_per_day()) transformed by a pure function
 (indicators.build_best_ratio_chart()), so unlike `alerts_summary` it
 needs no error-propagation check against another section before running.
+
+2026-09-23 addendum: `sweeps_chart` follows the identical independent
+shape as `best_ratio_chart` - panels.sweeps_per_day() transformed by
+indicators.build_sweeps_chart(). No schema change (`sweeps` gained no new
+column or index); see panels.sweeps_per_day()'s own docstring for why
+this is the one panel query in this module that isn't index-backed.
 """
 
 import logging
@@ -60,6 +66,7 @@ from dealwatch.reporting.indicators import (
     build_best_ratio_chart,
     build_budget_pacing,
     build_indicators,
+    build_sweeps_chart,
 )
 from dealwatch.reporting.status import collect_status
 from dealwatch.storage.sqlite import connect_readonly
@@ -175,6 +182,19 @@ def build_payload(
         lambda: build_best_ratio_chart(panels.best_ratio_per_day(conn, profile_id, now=now)),
     )
 
+    # 2026-09-23: independent of `status` and `alerts_per_day`, same
+    # reasoning as best_ratio_chart above - built entirely from its own
+    # query (panels.sweeps_per_day()) transformed by a pure function
+    # (build_sweeps_chart()), so no error-propagation check against
+    # another section is needed before running it.
+    sweeps_chart_result = _safe(
+        "sweeps_chart",
+        lambda: build_sweeps_chart(
+            panels.sweeps_per_day(conn, profile_id, now=now),
+            sweep_interval_minutes=sweep_interval_minutes,
+        ),
+    )
+
     return {
         "generated_at": now,
         "profile_id": profile_id,
@@ -191,6 +211,7 @@ def build_payload(
         "alerts_per_day": alerts_per_day_result,
         "alerts_summary": _safe("alerts_summary", _build_alerts_summary),
         "best_ratio_chart": best_ratio_chart_result,
+        "sweeps_chart": sweeps_chart_result,
         "recent_alerts": _safe("recent_alerts", lambda: panels.recent_alerts(conn, profile_id)),
         "recent_listings": _safe(
             "recent_listings", lambda: panels.recent_listings(conn, profile_id)
@@ -233,8 +254,8 @@ _cache: dict[str, tuple[float, dict, dict, int]] = {}
 
 _PAYLOAD_SECTIONS = (
     "status", "indicators", "budget_pacing", "alerts_per_day", "alerts_summary",
-    "best_ratio_chart", "recent_alerts", "recent_listings", "baseline_coverage",
-    "computed_baselines", "baseline_queue",
+    "best_ratio_chart", "sweeps_chart", "recent_alerts", "recent_listings",
+    "baseline_coverage", "computed_baselines", "baseline_queue",
 )
 
 # A transient connection failure (a bind mount reattaching, a snapshot

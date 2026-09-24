@@ -46,6 +46,15 @@ timestamps rather than one row per day.
 `best_ratio_window()` - one MIN(ratio_to_p25) range scan per day, same
 index, same day-by-day walk `alerts_per_day()` uses (`_walk_back_days()`,
 extracted so the DST-safe boundary walk exists in exactly one place).
+
+`sweeps_per_day()` (2026-09-23, docs/learnings.md L20/L22) is the one
+function in this module that does NOT hold to the "bounded by an indexed
+predicate" rule above - `sweeps` carries no index at all as of schema v8,
+and adding one is a schema change out of scope for the task that added
+this function. Deliberate exception, not an oversight: the table grows at
+a small, fixed rate from one profile's collector (~24-30 rows/day), not
+with total history or the active set, so 14 unindexed range scans per
+render stay cheap for a long time - see the function's own docstring.
 """
 
 import sqlite3
@@ -251,6 +260,83 @@ def best_ratio_per_day(
                 "label": label,
                 "ratio": ratio,
                 "baseline_layer": baseline_layer,
+            }
+        )
+
+    entries.reverse()
+    return entries
+
+
+def sweeps_per_day(
+    conn: sqlite3.Connection, profile_id: str, *, days: int = 14, now: int | None = None
+) -> list[dict]:
+    """One entry per LA calendar day, oldest first: {"day_start", "label",
+    "sweeps", "coverage_pct"}.
+
+    Exists for the count, not the coverage (docs/learnings.md L20, L22):
+    on 2026-09-14 a nine-hour power outage produced 15 sweeps instead of
+    the usual ~24, corrupting the recorded lifespan of everything that
+    died during the gap, and nothing surfaced it for eight days - nothing
+    in the system was watching sweep FREQUENCY, only per-sweep coverage.
+    This panel is that missing signal, made visible the next morning
+    instead of during the next archaeology session.
+
+    Walks via _walk_back_days(), same as alerts_per_day()/
+    best_ratio_per_day() above - a day with ZERO sweeps must appear as
+    `sweeps: 0`, not be silently absent, because a missing day would hide
+    exactly the outage this panel exists to catch. A GROUP BY query would
+    drop that day entirely; walking the calendar and querying each day's
+    bounds explicitly is what keeps it present.
+
+    `sweeps` counts every row in the window regardless of `truncated`;
+    `coverage_pct` averages `100.0 * distinct_count / active_count_before`
+    only over rows where `truncated = 0`. A truncated sweep (budget
+    exhausted mid-fetch) can carry `fetched_count = distinct_count = 0`,
+    which is a budget event, not a coverage collapse - averaging it in
+    would drag that day's mean toward zero and misrepresent a completely
+    different failure as this one. If a day has sweeps but every one of
+    them is truncated, `coverage_pct` is `None` for that day (as it also
+    is, for the same reason, on a zero-sweep day) - never a fabricated
+    0.0%, matching best_ratio_per_day()'s A3 "absent is not zero"
+    discipline above. `NULLIF(active_count_before, 0)` guards the
+    division itself; `active_count_before` is NOT NULL in the schema but
+    has no non-zero guarantee, and AVG() over an all-NULL numerator
+    correctly yields NULL rather than raising.
+
+    Scoped to `profile_id`, like every other query in this module
+    (design.md §16 P6) - `sweeps` already carries the column.
+
+    Unlike every other per-day panel in this module, this is NOT an
+    indexed range scan - `sweeps` has no index as of schema v8, and adding
+    one is a schema change out of scope for the task that added this
+    function. Acceptable today: the table grows at a fixed, small rate
+    (~24-30 rows/day from one profile's collector, docs/learnings.md L22),
+    not with the active listing set the way `listings`/`alerts` do, so 14
+    small full-table scans per render stay cheap for a long time. Worth
+    revisiting with a leading-`profile_id` index whenever this table is
+    next touched for a schema-changing reason.
+    """
+    now = now if now is not None else int(time.time())
+
+    entries = []
+    for cur_start, cur_end in _walk_back_days(now, days):
+        sweeps_count = conn.execute(
+            "SELECT COUNT(*) FROM sweeps WHERE profile_id = ? AND swept_at >= ? AND swept_at < ?",
+            (profile_id, cur_start, cur_end),
+        ).fetchone()[0]
+        coverage_pct = conn.execute(
+            "SELECT AVG(100.0 * distinct_count / NULLIF(active_count_before, 0)) "
+            "FROM sweeps WHERE profile_id = ? AND swept_at >= ? AND swept_at < ? "
+            "AND truncated = 0",
+            (profile_id, cur_start, cur_end),
+        ).fetchone()[0]
+        label = datetime.fromtimestamp(cur_start, PACIFIC).strftime("%b %-d")
+        entries.append(
+            {
+                "day_start": cur_start,
+                "label": label,
+                "sweeps": sweeps_count,
+                "coverage_pct": coverage_pct,
             }
         )
 

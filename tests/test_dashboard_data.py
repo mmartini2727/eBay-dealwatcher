@@ -35,8 +35,8 @@ def _kwargs(**overrides):
 
 _ALL_SECTIONS = (
     "status", "indicators", "budget_pacing", "alerts_per_day", "alerts_summary",
-    "best_ratio_chart", "recent_alerts", "recent_listings", "baseline_coverage",
-    "computed_baselines", "baseline_queue",
+    "best_ratio_chart", "sweeps_chart", "recent_alerts", "recent_listings",
+    "baseline_coverage", "computed_baselines", "baseline_queue",
 )
 
 

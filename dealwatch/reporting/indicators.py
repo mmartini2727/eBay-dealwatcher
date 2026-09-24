@@ -85,15 +85,18 @@ STALE_WARN = 25
 # `ceiling` itself, enforced by providers/ratelimit.py, not by this module.
 BUDGET_WARN_PCT = 80.0
 
-# 48 hours. A judgment call, not a derived number: anchored on the observed
-# dead spec_status='ok' death rate (~279 over 7 days at the time this was
-# written, design.md §13's live-verification addendum) - baselines going
-# stale for two full days while listings keep dying at that rate means the
-# survival pool has moved meaningfully since the last recompute without
-# anyone knowing. scripts/recompute_baselines.py is manual-only (no cron,
-# no collector hook) - this indicator is the only thing that will ever
-# surface that drift; nothing else in the system watches this age at all.
-BASELINE_STALE_WARN_MINS = 2880
+# 26 hours (2026-09-23, revised down from 48h/2880). The recompute is no
+# longer manual-only - scripts/recompute-baselines.sh runs nightly via
+# cron at 01:45 local (design.md §17) - so steady-state age now peaks
+# around 24h between runs, not an unbounded drift the way it did when
+# someone had to remember to run it by hand. 48h meant TWO consecutive
+# missed nightly runs before this indicator went amber; 1560 means one
+# missed run warns, with two hours of slack past the expected 24h peak
+# before it does. Deliberately matches the Uptime Kuma push monitor's own
+# 26h heartbeat on that same cron job (docs/learnings.md L17-L19) - two
+# independent signals going stale at the same threshold is the point, not
+# a coincidence to reconcile later.
+BASELINE_STALE_WARN_MINS = 1560
 
 
 def _indicator(state: str, label: str, value, group: str) -> dict:
@@ -236,8 +239,16 @@ def build_indicators(
         baselines_age = _indicator("unknown", "Baselines age", None, "baseline")
     else:
         state = "warn" if baselines_age_mins > BASELINE_STALE_WARN_MINS else "ok"
+        # Display in hours, one decimal ("18.7h ago") - "1122 min ago"
+        # isn't readable at a glance, and a glance is the whole point of
+        # this indicator: "34.2h ago" says "a recompute was missed"
+        # immediately, without doing the /60 in your head. The threshold
+        # comparison above stays in minutes, matching
+        # baselines_computed_age_mins (status.py's payload contract, read
+        # by the MCP status tool and its tests) - only the string shown
+        # here is converted; the underlying field is untouched.
         baselines_age = _indicator(
-            state, "Baselines age", f"{baselines_age_mins} min ago", "baseline"
+            state, "Baselines age", f"{baselines_age_mins / 60:.1f}h ago", "baseline"
         )
 
     # V0.11b Part E: collect_status()'s dead_spec_ok_count (status.py) and
@@ -479,3 +490,104 @@ def build_best_ratio_chart(entries: list[dict]) -> list[dict]:
             }
         )
     return chart
+
+
+# Headroom above the nominal per-day sweep count before a bar hits 100%
+# height (2026-09-23) - chosen so the fixed scale still has room for an
+# ordinary deploy-day spike (docs/learnings.md L22: 29/27/28 observed on
+# real deploy days, against a 24/day nominal) without those days clipping
+# at the top of the chart. 1.25 x 24 = 30, which is exactly the ceiling
+# design.md §4.4/§4.7's 2026-09-22 addendum already used when sizing this
+# same table's page-capacity headroom - not a coincidence to reconcile,
+# just the same "expected value plus deploy-day slack" judgment call
+# landing on the same number twice.
+SWEEPS_CHART_HEADROOM = 1.25
+
+
+def build_sweeps_chart(entries: list[dict], *, sweep_interval_minutes: int) -> dict:
+    """Chart-ready payload for the sweeps-per-day panel (docs/learnings.md
+    L20/L22), built from panels.sweeps_per_day()'s raw output: {"days":
+    [...], "nominal_line_pct", "nominal_per_day_display",
+    "mean_sweeps_display", "mean_coverage_display"}.
+    `nominal_per_day_display` ("24/day") is the ready-to-print string for
+    the reference line below - computed here so the template never does
+    the `1440 / sweep_interval_minutes` arithmetic itself.
+
+    This panel exists for the COUNT, not the coverage - the thing it
+    catches is a day with fewer sweeps than it should have had (a power
+    outage, L20: 15 sweeps instead of 24, unnoticed for eight days because
+    nothing else was watching for exactly this). Coverage is secondary
+    context here, deliberately not scaled or colored to compete with the
+    count for attention (the task's own framing) - it renders as a plain
+    per-day percentage, never a second bar.
+
+    **Fixed scale, not a relative one - the one deliberate difference from
+    build_best_ratio_chart() above.** That function scales bar height to
+    the window's OWN maximum, which is correct there (a relative "how good
+    was the best day" question) and would be actively misleading here: an
+    extended outage spanning the whole 14-day window would make its worst
+    day the window's tallest bar by construction, drawing 100%-height bars
+    through an incident this panel exists to surface. `nominal_per_day` is
+    derived from `sweep_interval_minutes` (1440 / interval), not
+    hardcoded, matching SWEEP_AGE_WARN_MULTIPLIER's own reasoning above
+    that sweep cadence is a per-profile setting, not a global constant.
+    `scale_max` is `nominal_per_day * SWEEPS_CHART_HEADROOM`, and
+    `nominal_line_pct` (`nominal_per_day / scale_max * 100`) is a stable
+    reference position the template draws once as a dashed line - at the
+    default 60-minute cadence this is always 80.0%, so a day's bar falling
+    visibly short of that fixed line reads as "short" at a glance, on
+    every render, without reading the axis or comparing bars to each
+    other. `bar_pct` is clamped to 100 (`min(sweeps / scale_max, 1.0)`) -
+    an exceptional deploy-day spike (L22: 29/27/28 observed) flattens
+    against the top of the chart rather than overflowing it; `scale_max`
+    already has 25% headroom over nominal for exactly this reason, so
+    clamping only matters for a spike bigger than any observed so far.
+
+    `coverage_display` is "—" (not "0.0%" or a blank string) for a day
+    with `coverage_pct is None` - either no sweeps ran that day or every
+    sweep that did was truncated (panels.sweeps_per_day()'s own
+    truncated=0 filter), and neither case has a real number to show.
+
+    Mean sweeps is computed over every day in the window, including zero-
+    sweep days - an outage day pulling the mean down is the point. Mean
+    coverage is computed only over days that HAVE a coverage figure, same
+    None-exclusion discipline as build_alerts_summary()'s
+    best_ratio_14d_display - averaging in a missing day as if it were 0%
+    coverage would understate every window that ever contains an outage,
+    exactly backwards from what this panel is for.
+    """
+    nominal_per_day = 1440 / sweep_interval_minutes
+    scale_max = nominal_per_day * SWEEPS_CHART_HEADROOM
+    nominal_line_pct = (nominal_per_day / scale_max * 100) if scale_max else 0.0
+
+    days = []
+    for e in entries:
+        bar_pct = min(e["sweeps"] / scale_max, 1.0) * 100 if scale_max else 0.0
+        coverage_display = (
+            f"{e['coverage_pct']:.1f}%" if e["coverage_pct"] is not None else "—"
+        )
+        days.append(
+            {
+                "day_start": e["day_start"],
+                "label": e["label"],
+                "sweeps": e["sweeps"],
+                "coverage_display": coverage_display,
+                "bar_pct": bar_pct,
+            }
+        )
+
+    n_days = len(entries) or 1
+    mean_sweeps = sum(e["sweeps"] for e in entries) / n_days
+
+    coverages = [e["coverage_pct"] for e in entries if e["coverage_pct"] is not None]
+    mean_coverage_display = (
+        f"{sum(coverages) / len(coverages):.1f}%" if coverages else "no coverage data in window"
+    )
+
+    return {
+        "days": days,
+        "nominal_line_pct": nominal_line_pct,
+        "nominal_per_day_display": f"{nominal_per_day:.0f}/day",
+        "mean_sweeps_display": f"{mean_sweeps:.1f}/day",
+        "mean_coverage_display": mean_coverage_display,
+    }

@@ -97,6 +97,27 @@ def seed_alert(
     )
 
 
+def seed_sweep(
+    conn,
+    *,
+    swept_at,
+    profile_id=PROFILE,
+    fetched_count=24,
+    distinct_count=24,
+    active_count_before=24,
+    truncated=False,
+    sweep_recorded=True,
+):
+    conn.execute(
+        "INSERT INTO sweeps (profile_id, swept_at, fetched_count, distinct_count, "
+        "active_count_before, truncated, sweep_recorded) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            profile_id, swept_at, fetched_count, distinct_count, active_count_before,
+            1 if truncated else 0, 1 if sweep_recorded else 0,
+        ),
+    )
+
+
 def seed_baseline(conn, *, profile_id=PROFILE, bucket_key="1|intel-10th|16", computed_at=1000):
     conn.execute(
         "INSERT INTO baselines (profile_id, bucket_key, n, n_price_only, p10_cents, "
@@ -931,3 +952,101 @@ def test_best_ratio_per_day_dry_run_filter_matches_best_ratio_24h(tmp_path):
     entries = panels.best_ratio_per_day(conn, PROFILE, days=1, now=_NOON)
 
     assert entries[0]["ratio"] == pytest.approx(0.60)
+
+
+# ---------------------------------------------------------------------------
+# sweeps_per_day() (2026-09-23, docs/learnings.md L20/L22)
+# ---------------------------------------------------------------------------
+
+
+def test_sweeps_per_day_zero_sweep_day_appears_as_zero_not_absent(tmp_path):
+    # The whole point of this panel (L20: a 9-hour power outage produced
+    # 15 sweeps instead of 24 and went unnoticed for 8 days) is that a
+    # short/empty day must be VISIBLE, not silently dropped. A GROUP BY
+    # over `sweeps` would drop a day with zero rows entirely.
+    #
+    # Sabotage prediction: replacing the _walk_back_days() fill with a
+    # bare `GROUP BY date(swept_at, ...)` query would make this go red -
+    # either len(entries) != 14 (the gap day missing outright) or the gap
+    # day simply absent from the list, rather than present with sweeps=0.
+    conn = make_conn(tmp_path)
+    seed_sweep(conn, swept_at=_TODAY_START + 100)  # only today has a sweep
+
+    entries = panels.sweeps_per_day(conn, PROFILE, days=14, now=_NOON)
+
+    assert len(entries) == 14
+    assert entries[-1]["day_start"] == _TODAY_START
+    assert entries[-1]["sweeps"] == 1
+    # every OTHER day in the window is a real gap day: present, sweeps=0.
+    assert all(e["sweeps"] == 0 for e in entries[:-1])
+    assert all(e["coverage_pct"] is None for e in entries[:-1])
+
+
+def test_sweeps_per_day_truncated_rows_count_but_are_excluded_from_coverage(tmp_path):
+    # A truncated sweep (budget exhausted mid-fetch) can carry
+    # fetched_count=distinct_count=0, which is a budget event, not a
+    # coverage collapse - it must still count toward `sweeps` (the
+    # collector did run) but must not drag the coverage MEAN toward zero.
+    #
+    # Sabotage prediction: dropping the "AND truncated = 0" clause from
+    # the coverage query would average the normal row's 96% together with
+    # the truncated row's fabricated 0%, giving 48.0 instead of 96.0 - the
+    # assert below would fail with that wrong value, going red.
+    conn = make_conn(tmp_path)
+    seed_sweep(
+        conn, swept_at=_TODAY_START + 100,
+        fetched_count=96, distinct_count=96, active_count_before=100, truncated=False,
+    )
+    seed_sweep(
+        conn, swept_at=_TODAY_START + 200,
+        fetched_count=0, distinct_count=0, active_count_before=100, truncated=True,
+    )
+
+    entries = panels.sweeps_per_day(conn, PROFILE, days=1, now=_NOON)
+
+    assert entries[0]["sweeps"] == 2  # both rows counted
+    assert entries[0]["coverage_pct"] == pytest.approx(96.0)  # only the non-truncated row
+
+
+def test_sweeps_per_day_all_truncated_is_none_coverage_not_zero(tmp_path):
+    # If every sweep on a day was truncated, there is no real coverage
+    # figure for that day - None, same "absent is not zero" discipline as
+    # best_ratio_per_day()'s A3 above, not a fabricated 0.0%.
+    conn = make_conn(tmp_path)
+    seed_sweep(
+        conn, swept_at=_TODAY_START + 100,
+        fetched_count=0, distinct_count=0, active_count_before=100, truncated=True,
+    )
+
+    entries = panels.sweeps_per_day(conn, PROFILE, days=1, now=_NOON)
+
+    assert entries[0]["sweeps"] == 1
+    assert entries[0]["coverage_pct"] is None
+
+
+def test_sweeps_per_day_scopes_to_profile_id(tmp_path):
+    # design.md §16 P6: any new profile-scoped query needs a two-profile
+    # fixture whose rows collide on the same day, or a single-profile
+    # fixture would pass with or without the WHERE profile_id = ? clause.
+    #
+    # Sabotage prediction: removing the profile_id filter from either
+    # query would make profile A's count/coverage include profile B's
+    # rows too - sweeps would read 2 instead of 1, and coverage would be
+    # the mean of both profiles' rows (60.0) instead of A's alone (90.0).
+    conn = make_conn(tmp_path)
+    seed_sweep(
+        conn, swept_at=_TODAY_START + 100, profile_id="profile-a",
+        fetched_count=90, distinct_count=90, active_count_before=100,
+    )
+    seed_sweep(
+        conn, swept_at=_TODAY_START + 200, profile_id="profile-b",
+        fetched_count=30, distinct_count=30, active_count_before=100,
+    )
+
+    entries_a = panels.sweeps_per_day(conn, "profile-a", days=1, now=_NOON)
+    entries_b = panels.sweeps_per_day(conn, "profile-b", days=1, now=_NOON)
+
+    assert entries_a[0]["sweeps"] == 1
+    assert entries_a[0]["coverage_pct"] == pytest.approx(90.0)
+    assert entries_b[0]["sweeps"] == 1
+    assert entries_b[0]["coverage_pct"] == pytest.approx(30.0)

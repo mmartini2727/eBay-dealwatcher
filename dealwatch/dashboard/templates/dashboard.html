@@ -207,12 +207,39 @@
     font-size: 0.78rem;
   }
   .chart {
+    position: relative;
     display: flex;
     align-items: flex-end;
     gap: 3px;
     height: 110px;
     margin-top: 4px;
   }
+  {# ---------------------------------------------------------------
+     Sweeps-per-day's fixed reference line (2026-09-23) - position:
+     relative on .chart above (harmless for the alerts/best-ratio
+     charts, which have no absolutely-positioned children) is what lets
+     this sit at a stable height inside the chart regardless of bar
+     heights, rather than drifting with whatever the tallest bar that
+     render happens to be (the alerts/best-ratio charts' own relative
+     scaling, deliberately NOT reused here - see build_sweeps_chart()'s
+     docstring for why a fixed scale is the point of this panel).
+     --------------------------------------------------------------- #}
+  .chart-nominal-line {
+    position: absolute;
+    left: 0;
+    right: 0;
+    border-top: 1px dashed var(--muted);
+  }
+  .chart-nominal-label {
+    position: absolute;
+    left: 0;
+    transform: translateY(-100%);
+    font-size: 0.62rem;
+    color: var(--muted);
+    background: var(--panel-bg);
+    padding: 0 3px 1px 0;
+  }
+  .bar-sweep { background: var(--link); }
   .bar-col {
     flex: 1;
     display: flex;
@@ -475,6 +502,65 @@
         <div class="stat">
           <div class="stat-value">{{ payload.alerts_summary.best_ratio_14d_display }}</div>
           <div class="stat-label">Best ratio (14 days)</div>
+        </div>
+      </div>
+    {% endif %}
+  </div>
+
+  {# ---------------------------------------------------------------
+     Sweeps per day (2026-09-23, docs/learnings.md L20/L22) - placed
+     directly after Alerts per day, in DOM order, on purpose: that panel
+     is a normal (non-wide) grid item and the one after it (Best ratio
+     per day) is grid-column: 1/-1, forcing it onto its own row - the
+     cell to the right of Alerts per day would otherwise render empty.
+     This is a baseline monitor, not a pagination-ceiling alarm (design.
+     md §4.4/§4.7's 2026-09-22 addendum measured ~30% capacity headroom
+     and truncated=0 throughout) - it exists for the COUNT, because a
+     9-hour power outage on 2026-09-14 produced 15 sweeps instead of ~24
+     and went unnoticed for eight days with nothing else watching sweep
+     FREQUENCY, only per-sweep coverage.
+
+     Until docs/learnings.md L21's collector defect is fixed (no
+     `sweeps` row written on a non-budget exception - separate prompt,
+     out of scope here), a sweep that failed with a timeout is MISSING
+     from this count entirely rather than shown as a failed attempt, the
+     same way an outage is - so a short day here can mean either cause,
+     and this panel alone cannot yet tell them apart.
+     --------------------------------------------------------------- #}
+  <div class="panel">
+    <h2>Sweeps per day &mdash; 14 days</h2>
+    {% if 'error' in payload.sweeps_chart %}
+      <div class="error-box">Panel unavailable: {{ payload.sweeps_chart.error }}</div>
+    {% else %}
+      <p class="panel-note">
+        Bar height: sweep count that day, on a fixed scale (not scaled to
+        this window's own tallest bar) so a short day always looks short.
+        Dashed line: the expected {{ payload.sweeps_chart.nominal_per_day_display }}
+        for this profile's sweep interval - a bar clearly short of it is
+        the signal, not the coverage percentage under it.
+      </p>
+      <div class="chart">
+        <div class="chart-nominal-line" style="bottom: {{ payload.sweeps_chart.nominal_line_pct }}%;">
+          <span class="chart-nominal-label">{{ payload.sweeps_chart.nominal_per_day_display }}</span>
+        </div>
+        {% for day in payload.sweeps_chart.days %}
+          <div class="bar-col" title="{{ day.label }}: {{ day.sweeps }} sweeps, {{ day.coverage_display }} coverage">
+            <div class="bar-stack">
+              <div class="bar-segment bar-sweep" style="height: {{ day.bar_pct }}%;"></div>
+            </div>
+            <div class="bar-value">{{ day.coverage_display }}</div>
+            <div class="bar-label">{{ day.label }}</div>
+          </div>
+        {% endfor %}
+      </div>
+      <div class="alerts-summary">
+        <div class="stat">
+          <div class="stat-value">{{ payload.sweeps_chart.mean_sweeps_display }}</div>
+          <div class="stat-label">Mean sweeps (14 days)</div>
+        </div>
+        <div class="stat">
+          <div class="stat-value">{{ payload.sweeps_chart.mean_coverage_display }}</div>
+          <div class="stat-label">Mean coverage (14 days)</div>
         </div>
       </div>
     {% endif %}
