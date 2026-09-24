@@ -223,12 +223,43 @@
      render happens to be (the alerts/best-ratio charts' own relative
      scaling, deliberately NOT reused here - see build_sweeps_chart()'s
      docstring for why a fixed scale is the point of this panel).
+
+     z-index (2026-09-23 fix): .bar-col is a flex item of .chart, and
+     flex items paint at the same stacking level as a z-index:0
+     positioned element regardless of their own position/z-index (CSS
+     Flexbox spec) - .chart-nominal-line is position:absolute but had
+     no z-index, so with z-index:auto it painted at that SAME level,
+     ordered by DOM position. It sits before the {% for day in ... %}
+     loop in the markup below, so it painted UNDERNEATH every bar,
+     visible only in the gap above a short one - exactly backwards from
+     a reference line's job. An explicit z-index above 0 is what forces
+     it to paint after (on top of) the bars regardless of DOM order.
+
+     Colour/pattern (2026-09-23 fix): var(--muted) at a plain 1px
+     border-top read fine in a gap over the light page background but
+     had no separation from a solid var(--link) bar once painted on
+     top of one. White at high opacity is what shows against the dark
+     bar fill; the drop-shadow halo is what keeps that same white line
+     from disappearing into the light page background in the gap above
+     a short bar (Sep 14) - one stroke colour that has to read against
+     both, not two different ones. Widened from a plain CSS dashed
+     border (whose dash length isn't independently controllable) to an
+     explicit repeating-linear-gradient so the dash width is a real,
+     visible interval rather than the browser's own thin default.
      --------------------------------------------------------------- #}
   .chart-nominal-line {
     position: absolute;
     left: 0;
     right: 0;
-    border-top: 1px dashed var(--muted);
+    height: 2px;
+    z-index: 2;
+    background-image: repeating-linear-gradient(
+      to right,
+      rgba(255, 255, 255, 0.95) 0, rgba(255, 255, 255, 0.95) 9px,
+      transparent 9px, transparent 18px
+    );
+    filter: drop-shadow(0 0 1px rgba(0, 0, 0, 0.6));
+    pointer-events: none;
   }
   .chart-nominal-label {
     position: absolute;
