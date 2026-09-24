@@ -651,3 +651,167 @@ builds the query itself (`curl -G --data-urlencode "status=..."
 already attached produces a malformed double-query request even once the
 quoting is fixed, so both parts of the call site matter, not just the
 quoting. See README.md's command examples, which use the corrected form.
+
+**This entry grew three more chapters before the monitor actually worked
+(2026-09-22), and all four share one shape: each one presented as "the
+monitor is wrong," and each one was actually the URL.** Monitoring that is
+silently absent looks exactly like monitoring that is passing - that was
+true of the `&`-splitting failure above, and it stayed true through every
+attempt to fix it.
+
+**2. A markdown-formatted URL pasted into the shell never ran at all.**
+Pasting `[https://kuma.example/api/push/TOKEN](https://kuma.example/api/push/TOKEN)`
+- a link as rendered by a chat client or a markdown viewer, brackets and
+all - into `DEALWATCH_KUMA_PUSH_URL=... ./scripts/recompute-baselines.sh`
+made bash treat the square brackets as a glob pattern. Depending on
+`nullglob`/`failglob` state this either expands to nothing and errors, or
+is passed through literally as a string containing `[` and `]` that no
+URL parser downstream accepts - either way, the command as typed never
+executed as intended. Same underlying lesson as the `&` case: a URL is not
+safe to drop into a shell command line unexamined, regardless of which
+tool produced the text being pasted.
+
+**3. A recreated Kuma monitor silently reverted to the 60-second default
+heartbeat.** Recreating the monitor (rather than editing the existing one)
+did not carry over its configured interval; it came back at Kuma's
+60-second default. The cron job pushes once per night. Kuma marked the
+monitor Down 60 seconds after every single push, every night, because
+nothing else arrived within its heartbeat window - a monitor that looked
+attached and configured, silently watching the wrong cadence.
+
+**4. The actual root cause of the persistent Down state, once 1-3 were all
+ruled out: the configured push URL still carried Kuma's own example query
+string** (`?status=up&msg=OK&ping=`) **while the script appends its own**
+via `curl -G --data-urlencode`. Kuma received `status` twice and `msg`
+twice on every push, parsed the duplicated `status` as the array
+`["up","up"]`, failed its string-equality comparison against the literal
+`"up"`, and recorded the beat as **down - while still returning HTTP
+200.** The 200 actively misled the diagnosis for a while: it confirmed the
+request was *delivered*, which said nothing about whether it was
+*accepted*. Visible directly in the Kuma UI's own event log as
+`["OK", "ok"]` once someone thought to look at the raw payload rather than
+the status pill. Same fix as chapter 1, restated because it is the one
+that actually mattered here: pass only the base endpoint, no query string
+of any kind, and let the script's own `--data-urlencode` calls be the only
+place `status`/`msg` are ever set.
+
+Considered and explicitly **not** done: installing logrotate for the
+recompute log. The wrapper already captures the recompute's own output
+and only emits it on failure (design.md §17), so a successful night writes
+one line and the file does not grow meaningfully - there is no rotation
+problem to solve here, only one that would look like there might be if
+this weren't already true.
+
+## L20. A nine-hour power outage silently corrupted lifespan data, and nothing noticed for eight days
+
+On 2026-09-14 a breaker tripped. The server this LXC runs on is not on a
+UPS and could not be restarted until someone was physically home - a
+gap of roughly nine hours. In the `sweeps` table this shows up as 15
+sweeps that day instead of the usual ~24, a single 588-minute gap between
+two consecutive sweeps, and that day's worst measured coverage (94.7%) and
+second-worst drift (2.86%) in the 17-day window checked on 2026-09-22.
+
+The data consequence is the actual learning, not the outage itself.
+`record_sweep` sets `gone_at = last_seen` - the timestamp of the last
+sweep that actually confirmed the listing (design.md §4.2, §4.4). Every
+listing that genuinely died during the nine-hour gap has a `last_seen`
+from *before* the outage, so both its recorded lifespan and its `gone_at`
+are wrong for that listing - not because anything crashed or miscomputed,
+but because nothing was there to observe the truth during the gap. There
+is no fix after the fact: the observation was never made, and the
+per-observation storage model (design.md §4.1/§4.3) has nothing to
+reconstruct from. Those rows are sitting in the candidate pool feeding the
+fast/slow split (`baseline_report.py` section (d), the fast-sale-premise
+open item) right now, indistinguishable from ordinary candidates.
+
+**The detection failure is worth recording on its own.** This was found by
+ad-hoc archaeology on 2026-09-22 - eight days after the fact - while
+investigating something unrelated (the pagination-ceiling and never-swept
+questions, design.md §4.4/§4.7's addendum). Nothing alerted, no indicator
+went amber, no log line anyone was watching flagged it; `docker inspect`
+shows no restart loop, so even the collector's own liveness signals looked
+normal throughout. See the new "collector liveness is unmonitored" open
+item in CLAUDE.md.
+
+**Open design question, recorded and deliberately not decided here:**
+should a death detected by the first sweep following a gap over some
+threshold be excluded from baseline candidacy, since its lifespan is
+known-bad rather than merely noisy in the ordinary sense the negative-
+lifespan guard already handles? The `sweeps` table has everything needed
+to identify these rows (a large gap between consecutive `swept_at` values,
+joined against `listings.gone_at` falling in that window) but nothing
+currently does.
+
+## L21. "Written on every sweep exit path" is false - the exception path writes nothing
+
+CLAUDE.md's V0.8d entry claimed the `sweeps` table gets one row "on every
+sweep exit path (a completed sweep, a truncated one, and the
+early-budget-exhausted return)." That list is missing a fourth exit: an
+unhandled exception. `run_sweep_cycle()` wraps `provider.search()`'s query
+loop in a `try` that catches only `BudgetExhausted`; any other exception -
+an `httpcore.ReadTimeout`, observed once for real on 2026-09-21 - propagates
+straight out of the function to `_sweep_loop`'s own handler, which logs
+`sweep cycle failed` and moves on. No `sweeps` row is written for that
+cycle at all.
+
+Two consequences, pulling in opposite directions.
+
+**Safe, but only by accident.** Everything after the query loop - including
+`record_sweep`'s absence bookkeeping, the mechanism that marks a listing
+gone after enough consecutive misses - is skipped when the exception
+propagates, so a partial fetch cannot manufacture false misses. That is the
+*correct* outcome, and it is the exact outcome the `BudgetExhausted` branch
+achieves **deliberately** (design.md's own reasoning: "a truncated set is
+indistinguishable from listings having disappeared - log and skip rather
+than risk manufacturing false misses"). But the budget path reaches that
+outcome on purpose, by design, while the exception path reaches the
+identical outcome only because the exception happens to unwind the stack
+before the dangerous code runs. Move miss accounting earlier in the
+function, or wrap it in a `finally`, and the timeout path starts
+manufacturing false misses with nothing in the code anywhere explaining
+why it must not - because right now nothing says it must not; the safety
+is a side effect of control flow, not a stated invariant.
+
+**Defective, not just accidentally safe.** The budget path writes a
+`sweep_recorded=False` row - "attempted, could not complete," a real,
+queryable fact. The exception path writes no row at all, so a sweep that
+failed this way is indistinguishable in the `sweeps` table from the
+collector process simply not running. This is exactly what cost real
+diagnostic time on 2026-09-22: the 588-minute gap from the 2026-09-14 power
+outage (L20) and the 120-minute gap from this 2026-09-21 timeout looked
+identical in the table - both just an absence, with nothing distinguishing
+"the process was down" from "the process was up and one sweep failed."
+
+Same class of defect as L10: an invariant stated confidently, in this case
+in CLAUDE.md rather than a module docstring, that ordinary operation
+(a single real network timeout) falsified. CLAUDE.md's V0.8d entry is
+corrected in place to describe what actually happens rather than what was
+intended. Fix (catch broadly around the query loop, write
+`sweep_recorded=False`, continue) is recorded as a CLAUDE.md open item, not
+implemented here - this file only diagnoses.
+
+## L22. Sweeps-per-day above the scheduled 24 is the collector sweeping at startup, not a bug
+
+Daily sweep counts of 29 (09-07), 27 (09-08), and 28 (09-12) looked
+anomalous against a `sweep_interval_minutes: 60` schedule that should
+produce 24 - until checking which days those were: all three were active
+deployment days. Counts settled to a steady 24-26 from 09-15 once deploys
+stopped, which is the tell.
+
+Confirmed by looking at the actual intervals rather than just the daily
+count: a baseline cluster around 3,607 seconds (~60 minutes, as expected)
+with a handful of short outliers - 1,938s, 1,125s, 1,222s, 349s, 243s, and
+one **41-second** gap. A 41-second gap between two sweeps is not clock
+drift or scheduling jitter; it is the sweep loop starting over from
+scratch, which is exactly what happens on every container restart
+(`main.py`'s `lifespan()` fires an immediate sweep on startup, same
+mechanism noted in design.md §4.4's page-count correction).
+
+Ruled out crash-looping as the cause: `docker inspect` on the container
+shows `RestartCount 0` with a single `StartedAt` timestamp
+(`2026-09-21T04:25:02Z`) - one deliberate start, not a supervisor
+repeatedly restarting a failing process. Expected behavior, costing
+roughly 30 extra Browse calls against a 5,000/day budget on a deploy day -
+immaterial. Recorded because a spike in this number looks alarming on
+sight in the `sweeps` table and would otherwise get re-investigated from
+scratch the next time someone notices it.

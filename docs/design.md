@@ -769,6 +769,86 @@ are exactly the population the survival signal weighs most heavily. Any
 future baseline recompute spanning this date is mixing two measurement
 regimes.
 
+### 4.4/4.7 live measurement addendum (2026-09-22) — the pagination ceiling is not firing, and the never-swept rate was never the right check for it
+
+Two questions were open going into this measurement: has the `sweep_page_limit`/
+`sweep_max_pages` ceiling become inadequate as the active set grew (the
+trap CLAUDE.md names directly), and did the `MISS_THRESHOLD` 3→5 change
+(§4.4, corrected above) actually reduce the never-swept rate. Both were
+tested directly against the `sweeps` table over 17 days (2026-09-06 to
+2026-09-22) on the real LXC, not inferred.
+
+**The pagination ceiling is not firing.** `truncated` is 0 on every sweep,
+every day, across the full window. `active_count_before` is flat — 1013 on
+09-07, 1047 on 09-22, about 3% over two weeks, not a ramp toward the
+ceiling. Backing `fetched_count` out of the same data: ~1,010 rows fetched
+per sweep against a `sweep_page_limit * sweep_max_pages` capacity of 1,400
+— roughly **30% headroom**. Coverage (`distinct_count / active_count_before`)
+averages **96.6%**, daily range 94.7–98.2%. This is a real trap and stays
+one — a growing active set can still outrun the ceiling in the future — but
+as measured today it is not degrading anything.
+
+**The miss-rate estimate is refined, not overturned.** §4.4's correction
+above already established that misses are correlated, not independent, and
+that the original ~6% figure was a page-count error. This measurement
+refines the *rate* itself: netting genuine deaths out of the coverage gap
+— ~1,040 active listings, 3.4% uncovered ≈ 35 listings/sweep; 859 deaths
+over ~29 days ≈ 1.2 genuine deaths/hour — gives a true per-sweep miss rate
+of roughly **3.3%**, measured rather than inferred from a resurrection-log
+count. **This does not resolve §4.7.** If these misses are independent
+draws across sweeps, false deaths at `MISS_THRESHOLD=5` are effectively
+zero. If the same low-ranked listings are missed every time — which
+§4.4's correction already found evidence for (`v1|307026418852|0`, five
+consecutive misses) — they die falsely on a roughly five-hour cycle. The
+`sweeps` table is an aggregate count per sweep; it cannot distinguish these
+two cases. That needs per-listing miss streaks, which remains the open
+V0.8f question §4.7 already names.
+
+**The never-swept rate was measuring the wrong thing, not confirming or
+refuting the threshold change.** "Never-swept" (`first_seen == last_seen`)
+means a listing died within roughly one sweep interval
+(`sweep_interval_minutes: 60`) of first being polled — no sweep ever had
+the chance to see it. `MISS_THRESHOLD` governs something unrelated: how
+many *consecutive sweep misses* on a listing the sweep already has seen
+before `gone_at` is written. A listing that genuinely sells inside its
+first hour is never-swept regardless of what the threshold is set to —
+raising the threshold cannot move this number, because the threshold
+never applies to it. There is a **floor** on the never-swept rate set by
+sweep cadence against how fast listings actually die, and no amount of
+correlated-miss tuning changes that floor.
+
+The floor, measured: a lifespan histogram of swept dead candidates in
+30-minute buckets (37, 25, 31, 11, 17, 9, 12, 12, 8, 4, 8, 9) puts
+sub-1-hour deaths at 62 of 768 swept candidates, **8.1%** — and this is a
+*censored* lower bound, since the fastest-dying listings are by
+definition the ones absent from the swept pool to begin with. Observed
+never-swept across all weeks: 91 of 859, **10.6%**. The observed rate sits
+at or just above its own floor, which is the expected shape if the
+never-swept rate is doing exactly what it measures (sweep cadence vs.
+death speed) and nothing else.
+
+Weekly series (`gone_at` by ISO week):
+
+    week      dead_ok  never_swept  pct
+    2026-W34        7            2  28.6   (n too small)
+    2026-W35      214           19   8.9
+    2026-W36      285           27   9.5
+    2026-W37      271           30  11.1
+    2026-W38       82           13  15.9   (partial week, 2 days)
+
+There is an apparent upward trend across W35→W38, and it does not survive
+scrutiny: W38 is two days on 13 events (Poisson error ≈ ±4.4pp, overlapping
+W37 directly), W36→W37 (27/285 vs 30/271) is nowhere near significant, and
+the mechanism that would explain a real rise — the pagination ceiling
+degrading — is the one directly tested above and found not to be firing.
+The condition that would reopen this: W39 **and** W40 both measuring above
+12%.
+
+**The `MISS_THRESHOLD` 3→5 change may still be correct on its own terms**
+(§4.4's independent-vs-correlated-miss reasoning is unaffected by any of
+this) — this measurement was simply never capable of showing that either
+way, because it was checking a number the threshold doesn't influence.
+
 ---
 
 ## 5. Normalization — the actual hard part
