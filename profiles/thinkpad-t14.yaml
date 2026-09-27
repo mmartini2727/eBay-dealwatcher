@@ -602,6 +602,21 @@ seed_baselines:
     p25: 700
     p50: 825
 
+  # Gen 1 AMD 24/32GB: too few fast samples for a computed baseline,
+  # so it fell back to the 16GB-shaped coarse seed (p25 190). That
+  # undervalued it and suppressed ~$150 listings under the $50 floor.
+  # Priced in line with the computed 1|intel-10th|32 bucket.
+  - match: {generation: "1", cpu_family: amd-ryzen-4000, ram_tier: "32"}
+    p25: 215
+    p50: 260
+
+  # Gen 1 AMD 8GB: same coarse fallback overvalued it. The computed
+  # 1|amd-ryzen-4000|16 bucket is p25 $170, so 8GB must sit below that.
+  # Priced relative to the computed Intel 8GB/16GB gap.
+  - match: {generation: "1", cpu_family: amd-ryzen-4000, ram_tier: "8"}
+    p25: 135
+    p50: 160
+
 
   # ----------------------------------------------------------
   # Generation-only bridge (2026-09-07 audit) - the over-broad catch-all.

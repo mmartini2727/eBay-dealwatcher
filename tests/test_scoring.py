@@ -191,6 +191,35 @@ def test_gen5_ultra1_32gb_override_matches_regardless_of_storage_tier():
     assert winner.p50_cents == 62500  # $625
 
 
+def test_gen1_amd_24_32gb_and_8gb_overrides_correct_the_coarse_fallback():
+    # Both ram_tiers previously fell through to the coarse 1|amd-ryzen-4000
+    # entry (p25 $190) - too high for 8GB, too low for 32GB (which was
+    # getting suppressed under the $50 min_savings_usd floor entirely).
+    # The specific overrides must win over the coarse entry, and the
+    # coarse entry must still be there for a listing with no ram_tier at
+    # all (storage/RAM extraction failed) - same fallback shape
+    # test_gen5_ultra1_32gb_override_matches_regardless_of_storage_tier
+    # above exercises for a different bucket.
+    profile = load_profile(REAL_PROFILE_PATH)
+    seeds = compile_seed_baselines(profile)  # must not raise (duplicate-match guard)
+
+    thirty_two_gb = resolve_seed_baseline(
+        seeds, {"generation": "1", "cpu_family": "amd-ryzen-4000", "ram_tier": "32"}
+    )
+    assert thirty_two_gb is not None
+    assert thirty_two_gb.p25_cents == 21500  # $215
+
+    eight_gb = resolve_seed_baseline(
+        seeds, {"generation": "1", "cpu_family": "amd-ryzen-4000", "ram_tier": "8"}
+    )
+    assert eight_gb is not None
+    assert eight_gb.p25_cents == 13500  # $135
+
+    coarse = resolve_seed_baseline(seeds, {"generation": "1", "cpu_family": "amd-ryzen-4000"})
+    assert coarse is not None
+    assert coarse.p25_cents == 19000  # $190 - unchanged, out of scope for this milestone
+
+
 # ---------------------------------------------------------------------------
 # The fallback ladder
 # ---------------------------------------------------------------------------
