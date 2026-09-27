@@ -400,6 +400,68 @@ def test_gate7_skips_a_listing_that_is_not_a_good_enough_deal(tmp_path):
     assert results == []
 
 
+def test_gate7b_skips_a_listing_that_passes_the_ratio_but_saves_less_than_the_floor(tmp_path):
+    # p25_cents=10000 (seed p25=100). price 9800 -> ratio 0.98, clears a
+    # 1.00 max_ratio_to_p25 - but the $2 savings are nowhere near the $50
+    # floor. The ratio alone would let this alert on a trivial margin.
+    conn = make_conn(tmp_path)
+    seed_listing(conn, "item-1", price_cents=9800)
+    profile = make_profile(
+        alerts=make_alerts_config(trigger=AlertTrigger(max_ratio_to_p25=1.00, min_savings_usd=50))
+    )
+    seeds = compile_seed_baselines(profile)
+
+    results = alerting.evaluate(conn, profile, seeds, ["item-1"], now_ts=2000)
+    assert results == []
+
+
+def test_gate7b_boundary_savings_exactly_equal_to_the_floor_passes(tmp_path):
+    # p25_cents=10000, price 5000 -> savings exactly 5000 cents ($50). The
+    # gate is `savings < floor`, so equal must NOT be skipped.
+    conn = make_conn(tmp_path)
+    seed_listing(conn, "item-1", price_cents=5000)
+    profile = make_profile(
+        alerts=make_alerts_config(trigger=AlertTrigger(max_ratio_to_p25=1.00, min_savings_usd=50))
+    )
+    seeds = compile_seed_baselines(profile)
+
+    results = alerting.evaluate(conn, profile, seeds, ["item-1"], now_ts=2000)
+    assert [r.item_id for r in results] == ["item-1"]
+
+
+def test_gate7b_zero_floor_matches_todays_behavior(tmp_path):
+    # min_savings_usd's schema default (0) must be a genuine no-op - the
+    # same listing/config as the happy-path test above, unaffected by
+    # gate 7b existing at all.
+    conn = make_conn(tmp_path)
+    seed_listing(conn, "item-1", price_cents=9000)  # ratio 0.90, savings $10
+    profile = make_profile()  # trigger defaults to min_savings_usd=0
+    seeds = compile_seed_baselines(profile)
+
+    results = alerting.evaluate(conn, profile, seeds, ["item-1"], now_ts=2000)
+    assert [r.item_id for r in results] == ["item-1"]
+
+
+def test_gate7b_does_not_block_a_higher_priced_listing_where_the_ratio_is_the_binding_gate(
+    tmp_path,
+):
+    # A pricier bucket (p25=$1000) where the ratio sits exactly at the
+    # 0.90 threshold - the binding constraint - while the $100 in absolute
+    # savings comfortably clears the $50 floor. Confirms gate 7b doesn't
+    # incidentally block legitimate higher-priced deals it wasn't built to
+    # catch; only cheap-bucket, trivial-margin listings are the target.
+    conn = make_conn(tmp_path)
+    seed_listing(conn, "item-1", price_cents=90000)  # ratio 900/1000 = 0.90
+    profile = make_profile(
+        seed_baselines=[{"match": {}, "p25": 1000, "p50": 1500}],
+        alerts=make_alerts_config(trigger=AlertTrigger(max_ratio_to_p25=0.90, min_savings_usd=50)),
+    )
+    seeds = compile_seed_baselines(profile)
+
+    results = alerting.evaluate(conn, profile, seeds, ["item-1"], now_ts=2000)
+    assert [r.item_id for r in results] == ["item-1"]
+
+
 def test_gate8_skips_a_listing_still_in_cooldown(tmp_path):
     conn = make_conn(tmp_path)
     # price_cents=5000 is a huge (50%) drop from the prior alert's 10000 -

@@ -103,6 +103,32 @@ def test_for_parts_text_rejects_cracked_as_is_title():
     assert result.reject_rule_id == "for-parts-text"
 
 
+def test_for_parts_text_rejects_a_misspelled_bios_locked_title():
+    # The plain '\bbios\s+lock' pattern doesn't match "Lcked" - a real
+    # seller misspelling, not a hypothetical one.
+    title = (
+        "Lenovo ThinkPad T14 Gen 1 i5 10210U 8GB 512GB Win 11 Pro Battey "
+        "BiOS Lcked C2-F4"
+    )
+    result = normalize(PROFILE, fields(title))
+    assert result.spec_status == REJECTED
+    assert result.reject_rule_id == "for-parts-text"
+
+
+def test_for_parts_text_does_not_reject_no_bios_password_or_bios_unlocked():
+    # Legitimate listings routinely say this - the new lock-pattern
+    # additions must not catch them. No \bbios\s+pass\b pattern exists
+    # for exactly this reason.
+    no_password = "Lenovo ThinkPad T14 Gen 1 i5 10210U 8GB 512GB Win 11 Pro - No BIOS Password"
+    unlocked = "Lenovo ThinkPad T14 Gen 1 i5 10210U 8GB 512GB Win 11 Pro - BIOS Unlocked"
+
+    result_no_password = normalize(PROFILE, fields(no_password))
+    result_unlocked = normalize(PROFILE, fields(unlocked))
+
+    assert result_no_password.reject_rule_id != "for-parts-text"
+    assert result_unlocked.reject_rule_id != "for-parts-text"
+
+
 def test_barebones_rejects_no_hdd_title():
     title = title_containing("NO HDD/OS")
     result = normalize(PROFILE, fields(title))

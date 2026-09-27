@@ -139,6 +139,14 @@ class AlertTrigger(BaseModel):
 
     max_ratio_to_p25: float = 1.00
 
+    # V1.0: an absolute dollar floor alongside the ratio - a cheap bucket
+    # (small p25) can clear max_ratio_to_p25 on a discount worth only a
+    # few dollars, which is a real ratio but not a real deal. Default 0
+    # is a deliberate no-op (engine/alerting.py's gate 7b), so an existing
+    # profile that never sets this key keeps today's ratio-only behavior
+    # exactly, not a silently-tightened default.
+    min_savings_usd: float = 0
+
 
 class AlertsConfig(BaseModel):
     """V0.9 - `alerts:` block shape (design.md's dated entry). `extra=

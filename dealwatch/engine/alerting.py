@@ -203,6 +203,10 @@ def evaluate(
         if result.ratio_to_p25 > alerts_cfg.trigger.max_ratio_to_p25:
             continue  # gate 7: not a good enough deal against the baseline
 
+        savings_cents = result.baseline_p25_cents - price_cents
+        if savings_cents < round(alerts_cfg.trigger.min_savings_usd * 100):
+            continue  # gate 7b: the ratio alone lets a cheap bucket alert on a $20 margin
+
         prior = last_alert(conn, item_id)
         if prior is not None:
             if now_ts - prior["sent_at"] < alerts_cfg.cooldown_minutes * 60:

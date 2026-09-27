@@ -92,6 +92,12 @@ reject:
       - '\bas[\s-]?is\b'
       - '\bnot\s+working\b'
       - '\bbios\s+lock'
+      # Catches misspellings ("BIOS Lcked") the plain \block\b pattern
+      # above misses, and the reversed word order ("Locked BIOS"). Do NOT
+      # add a \bbios\s+pass\b pattern here - legitimate listings routinely
+      # say "No BIOS password" or "BIOS unlocked", which must keep passing.
+      - '\bbios\s+lcke?d\b'
+      - '\block(?:ed)?\s+bios\b'
       - '\bcracked\b'
       - '\bbad\s+battery\b'
       - '\bno\s+power\b'
@@ -677,6 +683,11 @@ alerts:
     # 0.90 it's 5. Loosening later is a one-line change if 5/day turns out
     # too quiet.
     max_ratio_to_p25: 0.90
+    # A ratio alone lets a cheap bucket alert on a discount worth only a
+    # few dollars (e.g. a $150 p25 bucket clearing 0.90 on a $15 markdown).
+    # $50 is a real, worth-driving-for saving on top of clearing the ratio,
+    # not a second independent trigger - both gates must pass.
+    min_savings_usd: 50
   # The buying ceiling, distinct from search.filters.price above (a fetch
   # threshold - never truncate what gets collected). Read to decide whether
   # to alert at all, regardless of how good the deal score is. Kept at 1200
