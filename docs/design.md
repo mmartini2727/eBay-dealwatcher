@@ -2587,10 +2587,13 @@ assumed from the build prompt's naming):**
   fast_lifespan_hours, compiled_seeds, limit) -> {"queue": [...],
   "negative_lifespan_dropped": int}`, `alerts_per_day(conn, profile_id,
   *, days, now) -> list[dict]`, `best_ratio_per_day(conn, profile_id, *,
-  days, now) -> list[dict]`, `recent_alerts(conn, profile_id, *, limit)
-  -> list[dict]` - `get_review_queue` and `get_alert_activity` call these
-  directly and return their output essentially unchanged, rather than
-  re-deriving any of the four.
+  days, now) -> list[dict]`, `recent_alerts(conn, profile_id, *, limit,
+  sweep_interval_minutes, now) -> list[dict]` (§18/V1.0a added
+  `sweep_interval_minutes` as a required keyword-only argument and `now`
+  as optional, after this section was first written - corrected here
+  2026-09-28, not when it happened) - `get_review_queue` and
+  `get_alert_activity` call these directly and return their output
+  essentially unchanged, rather than re-deriving any of the four.
 - `providers.ratelimit.la_day_bounds(now) -> tuple[int, int]` -
   `query_listings`' `period="today"` filter, same LA-calendar-day
   discipline as every other "today" in this codebase.
@@ -3300,3 +3303,37 @@ composite-PK bullet gets a one-line cross-reference to L18. CLAUDE.md's
 open items list closes the stale-baseline item and opens two narrower ones
 (the silent-skip Kuma push, and the `awk` line-prefix parse's fragility
 against a nested or reindented `id:`/`enabled:` key).
+
+## 18. V1.0a — alert-outcome precision (decided 2026-09-23, shipped, not yet live-verified)
+
+The decision here was never the arithmetic (`gone_at - sent_at` is one
+subtraction). It was what that number is allowed to claim.
+
+`record_sweep()` sets `gone_at = last_seen`, and only a sweep advances
+`last_seen` - with `sweep_interval_minutes: 60`, the true disappearance
+moment is unknown to within roughly one sweep interval, and the value can
+legitimately precede `sent_at` (the same poll/sweep interleaving
+`docs/learnings.md` L3 already documents for `lifespan_mins`). Decided:
+`reporting/panels.py`'s new `outcome_display` field renders that
+uncertainty rather than a false precision - hour/day resolution only,
+floored to `<1h` below one sweep interval, and an explicit
+`"gone (timing unclear)"` for a negative interval, never a clamped zero.
+Full reasoning is `docs/learnings.md` L23; this entry is the decision
+record pointing at it, not a restatement of it.
+
+**Why the MCP tool description also carries these caveats, when the code
+already refuses to emit false precision on its own:** `docs/learnings.md`
+L15's lesson - a tool description is advice a model may drop, not a
+contract the runtime enforces - cuts the other way here than it did for
+L15 itself. There, the fix was to move enforcement OUT of the description
+and INTO code, because the description alone had proven insufficient.
+Here, the code was already correct from the start (the floor and the
+negative-interval handling are `outcome_display`'s own logic, not
+something a caller could get wrong by not reading a description). The
+description is added anyway, as a second, independent layer: a model
+consuming `get_alert_activity` and reasoning about `outcome_display`
+in prose could still restate "gone ~4h after" as something more precise
+than it is, or infer "sold," even though the string itself never says
+so. The code prevents the field from lying; the description is there to
+stop a caller from over-reading a field that is already telling the
+truth as plainly as it can.

@@ -815,3 +815,43 @@ roughly 30 extra Browse calls against a 5,000/day budget on a deploy day -
 immaterial. Recorded because a spike in this number looks alarming on
 sight in the `sweeps` table and would otherwise get re-investigated from
 scratch the next time someone notices it.
+
+## L23. `gone_at` is hourly-resolution and backdated - any duration derived from it is a floor, not a measurement
+
+`record_sweep()` (`storage/sqlite.py`) sets `gone_at = last_seen`, and
+only a sweep advances `last_seen` - a fast poll never does. With
+`sweep_interval_minutes: 60`, the true moment a listing disappeared is
+unknown to within roughly one sweep interval either side of the stamped
+value. `gone_at` is not "when it died," it is "the last time a sweep
+confirmed it was still there, or the sweep that first found it gone" -
+a backdated confirmation, not an event timestamp.
+
+V1.0a's `outcome_display` (`reporting/panels.py`'s `recent_alerts()`) is
+the first place this project renders a duration built from `gone_at`, and
+it has to render that limitation rather than paper over it: an interval
+under one sweep interval renders as `<1h`, never a specific minute count,
+and a negative interval - real, from the same poll/sweep interleaving
+this file's L3 already records for `lifespan_mins` - renders as
+`"gone (timing unclear)"`, never clamped to zero. Both are floors on what
+the column can honestly claim, not display polish.
+
+Disappearance is also not a sale (CLAUDE.md's own trap: ended early,
+pulled, or a pagination-drift false death, design.md §4.4/§4.7) and is
+reversible - a resurrection clears `gone_at`, so the same item can read
+"gone" on one render and "active" on the next. `outcome_display` never
+says "sold," and the MCP tool description carrying the same caveats
+(`get_alert_activity`) is deliberate, not redundant - L15's lesson is
+that a description is advice a model may drop, so the code has to refuse
+to emit the false precision on its own; the description is a second
+layer, not a replacement for the first.
+
+This is the third measurement in this project that needs a qualifier
+before the raw number means anything, alongside L1's `dead_spec_ok_count`
+vs. `_DEAD_OK_LISTINGS` split (478 vs. 484 - two different definitions of
+"dead," both correct) and `last_sweep_coverage_pct` holding a 0..1
+fraction under a `_pct` name (design.md §13's `coverage_fraction`
+correction). Different failure shapes - a naming mismatch, two competing
+definitions, and here a resolution limit inherent to how the value is
+produced - but the same underlying lesson: a number can be completely
+correct and still mislead anyone who doesn't know what it was measured
+against.

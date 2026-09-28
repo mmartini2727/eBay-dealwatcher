@@ -147,11 +147,13 @@ be recovered.
 | V0.9 | Discord alerts | done, live-verified 2026-09-08 |
 | V0.9a | Multi-notifier support (Discord + Pushover) + scripts baked into the image | done |
 | V0.9b | `?`-bucket alert gate + honest `lifespan_mins` NULLs | done |
-| V0.10 | Status module + CLI health script (design.md §12) | done |
+| V0.10 | Status module + CLI health script (design.md §12) | done, live-verified 2026-09-11 |
 | V0.11 | LAN dashboard, server-rendered, read-only (design.md §13) | done |
 | V0.12 | LAN dashboard enhancements (baseline progress/seed values, alert summary stats, best-ratio-per-day chart) | done |
 | V0.13 | Sweep bookkeeping invariant correction + reporting-path log volume (design.md §14) | done |
-| V1.0 | MCP server (streamable HTTP, LAN only) | next |
+| V1.0 | MCP server, streamable HTTP, LAN only (design.md §15) | done; prompt 1 live-verified 2026-09-18; prompts 2/2a/2b built, not yet live-verified |
+| V1.0a | Alert outcome column — `After alert` / `gone_at` in `recent_alerts()` (design.md §18) | done, not yet live-verified |
+| V1.02 | Documentation pass (this milestone) | done |
 
 Ship V0.6 even though the normalizer is a stub. Raw titles and prices are
 useful history, and persisting `raw_json` means the engine can be re-run over
