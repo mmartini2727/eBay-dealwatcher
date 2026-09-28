@@ -1405,7 +1405,23 @@ def get_market_price(generation: str, cpu_family: str, ram_tier: str) -> dict:
         "volume is calibration traffic, not real market activity. "
         "per_day_best_ratio has NO dry-run filter (matching the "
         "dashboard's own best-ratio chart) - a day's best ratio can "
-        "reflect a dry-run alert. " + _TOOL_CAVEAT
+        "reflect a dry-run alert. recent_events now carries gone_at/"
+        "active/outcome_display (V1.02) - read outcome_display, not "
+        "gone_at directly. gone_at is set from the LAST CONFIRMING SWEEP, "
+        "not the moment of disappearance, and lands on an hourly grid "
+        "(sweep_interval_minutes) - outcome_display never renders "
+        "minutes, and floors anything under one sweep interval to '<1h'. "
+        "A listing disappearing does NOT mean it sold - it also means "
+        "ended early or pulled, and getItem on a dead listing doesn't "
+        "disclose which; outcome_display never says 'sold' and neither "
+        "should you. The elapsed interval can be NEGATIVE (a fast poll "
+        "alerting after the last sweep already advanced last_seen "
+        "backdates gone_at ahead of sent_at) - rendered as 'gone (timing "
+        "unclear)', a known bookkeeping artifact, never a real zero-"
+        "second sale. 'gone' is provisional, not final: a resurrection "
+        "clears gone_at, so the SAME item can read 'gone' on one call and "
+        "'active' on a later one - variation listings especially flap "
+        "for reasons unrelated to dying. " + _TOOL_CAVEAT
     )
 )
 def get_alert_activity(days: int = 14) -> dict:
@@ -1413,7 +1429,12 @@ def get_alert_activity(days: int = 14) -> dict:
     with _readonly_conn() as conn:
         per_day_counts = alerts_per_day(conn, profile.id, days=days, now=now)
         per_day_best_ratio = best_ratio_per_day(conn, profile.id, days=days, now=now)
-        recent_events = recent_alerts(conn, profile.id)
+        recent_events = recent_alerts(
+            conn,
+            profile.id,
+            sweep_interval_minutes=profile.search.poll.sweep_interval_minutes,
+            now=now,
+        )
 
     return {
         "as_of": now,

@@ -108,6 +108,59 @@ def _price_display(cents: int | None) -> str:
     return f"${cents / 100:,.2f}" if cents is not None else "unknown"
 
 
+def _elapsed_display(seconds: int, floor_seconds: int) -> str:
+    """"<1h" / "{N}h" / "{N}d" for a non-negative elapsed duration (V1.02's
+    alert-outcome column). `floor_seconds` is the caller's
+    sweep_interval_minutes * 60, never a hardcoded 3600 - `gone_at` lands
+    on that same grid (record_sweep(), storage/sqlite.py: only a sweep
+    advances last_seen, and gone_at is set FROM last_seen), so a duration
+    measured against it can't honestly claim finer resolution than one
+    sweep interval. Rendering a minute figure here would assert a
+    precision that was never actually captured; see recent_alerts()'s own
+    docstring for the full reasoning (B1).
+    """
+    if seconds < floor_seconds:
+        return "<1h"
+    hours = seconds // 3600
+    if hours < 24:
+        return f"{hours}h"
+    return f"{seconds // 86400}d"
+
+
+def _after_alert_display(gone_at: int | None, sent_at: int, now: int, floor_seconds: int) -> str:
+    """"active {elapsed}" / "gone ~{elapsed} after" / "gone (timing
+    unclear)" - the rendered string for recent_alerts()'s outcome_display
+    field. Called only when the listing row exists; recent_alerts() itself
+    handles the missing-row case (docs/learnings.md, the "sold" trap in
+    CLAUDE.md).
+
+    `gone_at is None` (still active): elapsed is `now - sent_at`, exact
+    (no backdating involved) - no "~" prefix, because the number itself is
+    precise even though "active" could still flip to gone on the next
+    sweep, or flip AWAY on a resurrection (B4) if it's already gone.
+
+    `gone_at` set: `gone_at - sent_at` CAN be negative (B2) - a fast poll
+    can produce an alert after the last sweep already advanced last_seen,
+    so gone_at ends up backdated to a stamp that precedes sent_at. This is
+    the same structural interleaving docs/learnings.md L3 records for
+    lifespan_mins, not a fluke, and it will recur. Rendered as an explicit
+    "timing unclear," never clamped to 0 - a clamp would read as "vanished
+    the instant it was alerted," the most exciting possible reading of a
+    bookkeeping artifact. A non-negative duration gets the "~" prefix
+    precisely because gone_at's OWN value is backdated to the confirming
+    sweep, not just floored for display - the number is doubly
+    approximate, unlike the active branch's exact elapsed time.
+    """
+    if gone_at is None:
+        return f"active {_elapsed_display(now - sent_at, floor_seconds)}"
+    duration = gone_at - sent_at
+    if duration < 0:
+        return "gone (timing unclear)"
+    if duration < floor_seconds:
+        return "gone <1h after"
+    return f"gone ~{_elapsed_display(duration, floor_seconds)} after"
+
+
 def _walk_back_days(now: int, days: int):
     """Yield (day_start, day_end) LA calendar-day boundaries for `days`
     days ending with today, most recent first (V0.12b Part A1) - the
@@ -385,7 +438,14 @@ def best_ratio_window(
     ).fetchone()[0]
 
 
-def recent_alerts(conn: sqlite3.Connection, profile_id: str, *, limit: int = 20) -> list[dict]:
+def recent_alerts(
+    conn: sqlite3.Connection,
+    profile_id: str,
+    *,
+    limit: int = 20,
+    sweep_interval_minutes: int,
+    now: int | None = None,
+) -> list[dict]:
     """Most recent `limit` alert EVENTS (distinct item_id/sent_at pairs),
     most recent first - not `limit` alerts ROWS, so a fan-out to two
     notifiers does not consume two of the caller's slots.
@@ -402,10 +462,58 @@ def recent_alerts(conn: sqlite3.Connection, profile_id: str, *, limit: int = 20)
          so a boundary event that straddled step 1's cutoff still gets
          every one of its notifier rows, not just whichever fell inside
          the first LIMIT.
-    title/item_web_url come from a direct listings.item_id lookup - that
-    column is the table's PRIMARY KEY, so this is a point lookup, not a
-    scan.
+    title/item_web_url/gone_at come from a direct listings.item_id lookup -
+    that column is the table's PRIMARY KEY, so this is a point lookup, not
+    a scan, and gone_at rides along on the SAME lookup (V1.02) - no new
+    query, no new index question.
+
+    V1.02 alert-outcome fields: {"gone_at", "active", "outcome_display"}.
+
+    `sweep_interval_minutes` is required, keyword-only, no default - same
+    "no silently-wrong default" discipline as the profile_id-scoping fix
+    (docs/learnings.md L2) - a wrong-but-plausible interval would render a
+    confident, wrong precision claim rather than failing loudly. Callers
+    already have it (profile.search.poll.sweep_interval_minutes -
+    indicators.py's build_indicators()/build_sweeps_chart() derive the
+    exact same value from the exact same field).
+
+    `active` is `gone_at is None` when the listing row exists - matching
+    recent_listings()'s own key name for the identical concept, so the two
+    panels don't use different words for one idea. When the listing row
+    itself is missing (deleted, or a data integrity gap - the existing
+    listing-not-found path this function already had to handle before
+    V1.02), `active` is `None` (unknown), not `True` - a missing row is
+    NOT evidence the listing is still active, and collapsing "unknown"
+    into "active" here would be a confident, wrong answer manufactured
+    from an absence, the exact failure class docs/learnings.md L14 names
+    for a completely different layer of this system.
+
+    `outcome_display` (CLAUDE.md's "Disappearance ≠ sold" trap, B1-B4 of
+    V1.02's own task spec) is deliberately NEVER the word "sold" -
+    disappearance also means ended early, pulled, or a pagination-drift
+    false death (design.md §4.4/§4.7); `getItem` on a dead listing doesn't
+    disclose which, so this code has no way to know either. It reads
+    "active {elapsed}" or "gone ~{elapsed} after" or "gone (timing
+    unclear)" for a negative interval (`_after_alert_display()`'s own
+    docstring has the full B1/B2 reasoning) - "unknown" only for the
+    missing-listing-row case. `gone_at` alone is provisional, not this
+    function's problem to solve: a resurrection (storage/sqlite.py's
+    record_sighting()) clears it, so a row rendered "gone" on one page
+    load can legitimately render "active" on the next - variation
+    listings (a non-zero third item_id segment) flap for reasons entirely
+    unrelated to dying (design.md §4.4). The dashboard panel-note below
+    this table exists to say so; this function does not chase the point
+    further than rendering an honest, dated snapshot.
+
+    Re-alerts are NOT deduplicated by item_id (B5) - the same item can
+    legitimately appear as two distinct events with two different
+    sent_at values and therefore two different outcome_display strings; a
+    second alert surviving a shorter time than the first is real signal,
+    not noise to be collapsed away.
     """
+    now = now if now is not None else int(time.time())
+    floor_seconds = sweep_interval_minutes * 60
+
     candidate_rows = conn.execute(
         "SELECT item_id, sent_at FROM alerts WHERE profile_id = ? "
         "ORDER BY sent_at DESC, id DESC LIMIT ?",
@@ -439,11 +547,18 @@ def recent_alerts(conn: sqlite3.Connection, profile_id: str, *, limit: int = 20)
         first = notifier_rows[0]
 
         listing = conn.execute(
-            "SELECT title, item_web_url FROM listings WHERE item_id = ?",
+            "SELECT title, item_web_url, gone_at FROM listings WHERE item_id = ?",
             (item_id,),
         ).fetchone()
         title = listing[0] if listing is not None else None
         item_web_url = listing[1] if listing is not None else None
+        gone_at = listing[2] if listing is not None else None
+        active = (gone_at is None) if listing is not None else None
+        outcome_display = (
+            _after_alert_display(gone_at, sent_at, now, floor_seconds)
+            if listing is not None
+            else "unknown"
+        )
 
         results.append(
             {
@@ -459,6 +574,9 @@ def recent_alerts(conn: sqlite3.Connection, profile_id: str, *, limit: int = 20)
                 "baseline_layer": first[4],
                 "dry_run": bool(first[5]),
                 "delivery_statuses": delivery_statuses,
+                "gone_at": gone_at,
+                "active": active,
+                "outcome_display": outcome_display,
             }
         )
 

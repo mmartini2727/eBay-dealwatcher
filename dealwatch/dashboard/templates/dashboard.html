@@ -646,12 +646,18 @@
     {% if 'error' in payload.recent_alerts %}
       <div class="error-box">Panel unavailable: {{ payload.recent_alerts.error }}</div>
     {% elif payload.recent_alerts %}
+      <p class="panel-note">
+        "After alert" means the listing left eBay - not that it sold.
+        Disappearance also means ended early or pulled, and there is no
+        way to tell which (CLAUDE.md). "Gone" is provisional too: a
+        resurrection can flip a row back to active on a later render.
+      </p>
       <div class="table-scroll">
       <table>
         <thead>
           <tr>
             <th>When (PT)</th><th>Listing</th><th>Price</th><th>Ratio (p25)</th>
-            <th>Layer</th><th>Mode</th><th>Delivery</th>
+            <th>Layer</th><th>Mode</th><th>Delivery</th><th>After alert</th>
           </tr>
         </thead>
         <tbody>
@@ -672,6 +678,7 @@
                 {{ notifier }}: {{ delivery_status }}{% if not loop.last %}, {% endif %}
               {% endfor %}
             </td>
+            <td>{{ a.outcome_display }}</td>
           </tr>
           {% endfor %}
         </tbody>

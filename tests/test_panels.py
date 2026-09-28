@@ -8,6 +8,7 @@ it.
 """
 
 import json
+import re
 from datetime import datetime
 
 import pytest
@@ -19,6 +20,7 @@ from dealwatch.reporting import panels
 from dealwatch.storage.sqlite import connect
 
 PROFILE = "thinkpad-t14"
+SWEEP_INTERVAL_MINUTES = 60
 
 
 def make_seeds(seed_baselines):
@@ -237,7 +239,7 @@ def test_recent_alerts_fan_out_counts_as_one_event_not_two_slots(tmp_path):
         seed_alert(conn, item_id, sent_at=2000 + i, notifier="discord")
         seed_alert(conn, item_id, sent_at=2000 + i, notifier="pushover")
 
-    results = panels.recent_alerts(conn, PROFILE, limit=20)
+    results = panels.recent_alerts(conn, PROFILE, limit=20, sweep_interval_minutes=SWEEP_INTERVAL_MINUTES)
 
     assert len(results) == 20
     assert len({(r["item_id"], r["sent_at"]) for r in results}) == 20
@@ -252,7 +254,7 @@ def test_recent_alerts_includes_listing_title_and_url(tmp_path):
     seed_listing(conn, "item-1", title="ThinkPad T14 Gen 2", item_web_url="https://example.com/1")
     seed_alert(conn, "item-1", sent_at=2000, ratio_to_p25=0.72, baseline_layer="computed")
 
-    results = panels.recent_alerts(conn, PROFILE, limit=20)
+    results = panels.recent_alerts(conn, PROFILE, limit=20, sweep_interval_minutes=SWEEP_INTERVAL_MINUTES)
 
     assert len(results) == 1
     r = results[0]
@@ -273,10 +275,115 @@ def test_recent_alerts_respects_profile_isolation(tmp_path):
     seed_alert(conn, "mine", sent_at=2000)
     seed_alert(conn, "theirs", profile_id="other-profile", sent_at=2000)
 
-    results = panels.recent_alerts(conn, PROFILE, limit=20)
+    results = panels.recent_alerts(conn, PROFILE, limit=20, sweep_interval_minutes=SWEEP_INTERVAL_MINUTES)
 
     assert len(results) == 1
     assert results[0]["item_id"] == "mine"
+
+
+# ---------------------------------------------------------------------------
+# recent_alerts - V1.02 alert-outcome column (gone_at/active/outcome_display)
+# ---------------------------------------------------------------------------
+
+
+def test_recent_alerts_outcome_interval_is_sent_at_to_gone_at_not_first_seen_to_gone_at(tmp_path):
+    # A1: lifespan_mins is first_seen -> gone_at (how long the listing
+    # existed); this column is sent_at -> gone_at (how long it survived
+    # after you were told about it). first_seen is set FAR before sent_at
+    # so the two measurements land in different rendered buckets ("2h" vs
+    # "11d") - a fixture where they'd round to the same bucket couldn't
+    # actually catch a first_seen/sent_at mix-up.
+    conn = make_conn(tmp_path)
+    seed_listing(conn, "item-1", first_seen=1, gone_at=1_000_000 + 7200)
+    seed_alert(conn, "item-1", sent_at=1_000_000)
+
+    results = panels.recent_alerts(conn, PROFILE, sweep_interval_minutes=SWEEP_INTERVAL_MINUTES)
+
+    assert results[0]["outcome_display"] == "gone ~2h after"
+
+
+def test_recent_alerts_gone_listing_is_inactive_with_a_correct_interval(tmp_path):
+    conn = make_conn(tmp_path)
+    seed_listing(conn, "gone-item", gone_at=1000 + 7200)  # 2h after the alert
+    seed_listing(conn, "active-item", gone_at=None)
+    seed_alert(conn, "gone-item", sent_at=1000)
+    seed_alert(conn, "active-item", sent_at=1000)
+
+    results = panels.recent_alerts(
+        conn, PROFILE, limit=20, sweep_interval_minutes=SWEEP_INTERVAL_MINUTES, now=1000 + 500000
+    )
+    by_id = {r["item_id"]: r for r in results}
+
+    assert by_id["gone-item"]["active"] is False
+    assert by_id["gone-item"]["gone_at"] == 1000 + 7200
+    assert by_id["gone-item"]["outcome_display"] == "gone ~2h after"
+
+    assert by_id["active-item"]["active"] is True
+    assert by_id["active-item"]["gone_at"] is None
+    assert by_id["active-item"]["outcome_display"].startswith("active ")
+
+
+def test_recent_alerts_sub_sweep_interval_duration_renders_as_the_floor_not_minutes(tmp_path):
+    # B1: gone_at lands on an hourly grid - 25 minutes must render as the
+    # "<1h" floor, never a specific minute count.
+    conn = make_conn(tmp_path)
+    seed_listing(conn, "item-1", gone_at=1000 + 25 * 60)
+    seed_alert(conn, "item-1", sent_at=1000)
+
+    results = panels.recent_alerts(conn, PROFILE, sweep_interval_minutes=SWEEP_INTERVAL_MINUTES)
+
+    display = results[0]["outcome_display"]
+    assert display == "gone <1h after"
+    assert not re.search(r"\d+\s*m\b", display)  # no minute figure anywhere
+
+
+def test_recent_alerts_negative_interval_is_an_explicit_unknown_not_zero_or_negative(tmp_path):
+    # B2: a fast poll can alert after the last sweep already advanced
+    # last_seen, backdating gone_at ahead of sent_at. Never clamp to 0 -
+    # that would read as "vanished the instant it was alerted."
+    conn = make_conn(tmp_path)
+    seed_listing(conn, "item-1", gone_at=900)  # gone_at BEFORE sent_at
+    seed_alert(conn, "item-1", sent_at=1000)
+
+    results = panels.recent_alerts(conn, PROFILE, sweep_interval_minutes=SWEEP_INTERVAL_MINUTES)
+
+    assert results[0]["outcome_display"] == "gone (timing unclear)"
+    assert "-" not in results[0]["outcome_display"]
+    assert "0" not in results[0]["outcome_display"]
+
+
+def test_recent_alerts_re_alert_events_are_not_deduplicated_and_can_differ(tmp_path):
+    # B5: the same item_id alerted twice, at different sent_at, must
+    # produce two distinct events with two distinct durations - the
+    # second alert surviving a shorter time is real signal, not noise to
+    # collapse away.
+    conn = make_conn(tmp_path)
+    seed_listing(conn, "item-1", gone_at=100000)
+    seed_alert(conn, "item-1", sent_at=1000)   # duration ~27.5h -> renders in days
+    seed_alert(conn, "item-1", sent_at=90000)  # duration ~2.8h
+
+    results = panels.recent_alerts(conn, PROFILE, sweep_interval_minutes=SWEEP_INTERVAL_MINUTES)
+
+    assert len(results) == 2
+    assert len({r["sent_at"] for r in results}) == 2
+    durations = {r["outcome_display"] for r in results}
+    assert len(durations) == 2  # different sent_at -> different rendered duration
+
+
+def test_recent_alerts_missing_listing_row_still_returns_an_event_without_raising(tmp_path):
+    # The pre-V1.02 "listing not found" path (title/item_web_url already
+    # defaulted to None) - active/outcome_display must degrade to an
+    # honest "unknown", not fabricate active=True from an absent row.
+    conn = make_conn(tmp_path)
+    seed_alert(conn, "ghost-item", sent_at=1000)  # no seed_listing() call at all
+
+    results = panels.recent_alerts(conn, PROFILE, sweep_interval_minutes=SWEEP_INTERVAL_MINUTES)
+
+    assert len(results) == 1
+    assert results[0]["item_id"] == "ghost-item"
+    assert results[0]["gone_at"] is None
+    assert results[0]["active"] is None
+    assert results[0]["outcome_display"] == "unknown"
 
 
 # ---------------------------------------------------------------------------

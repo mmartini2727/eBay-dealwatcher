@@ -1429,7 +1429,7 @@ def test_get_alert_activity_sabotage_counting_raw_rows_instead_of_events(tmp_pat
     conn.close()
     _use_db(monkeypatch, db_path)
 
-    def _naive_rows(conn, profile_id, *, limit=20):
+    def _naive_rows(conn, profile_id, *, limit=20, **kwargs):
         rows = conn.execute(
             "SELECT item_id, sent_at, notifier, delivery_status FROM alerts "
             "WHERE profile_id = ? ORDER BY sent_at DESC LIMIT ?", (profile_id, limit),

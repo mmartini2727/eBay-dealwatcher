@@ -212,7 +212,12 @@ def build_payload(
         "alerts_summary": _safe("alerts_summary", _build_alerts_summary),
         "best_ratio_chart": best_ratio_chart_result,
         "sweeps_chart": sweeps_chart_result,
-        "recent_alerts": _safe("recent_alerts", lambda: panels.recent_alerts(conn, profile_id)),
+        "recent_alerts": _safe(
+            "recent_alerts",
+            lambda: panels.recent_alerts(
+                conn, profile_id, sweep_interval_minutes=sweep_interval_minutes, now=now
+            ),
+        ),
         "recent_listings": _safe(
             "recent_listings", lambda: panels.recent_listings(conn, profile_id)
         ),
