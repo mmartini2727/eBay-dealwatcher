@@ -2092,3 +2092,95 @@ def test_find_deals_rejects_bad_bucket_argument_instead_of_empty_deals(tmp_path,
     # matched zero listings and the response carried "deals": [] (a
     # legitimate-looking, empty market answer) instead of an error -
     # red-confirmed and reverted.
+
+
+# ---------------------------------------------------------------------------
+# /widget - plain GET+JSON summary for a non-MCP reader (a Homepage
+# "Custom API" widget, an uptime board, curl by hand)
+# ---------------------------------------------------------------------------
+
+# --- 1: same four indicators get_system_health reads, never re-derived ----
+
+
+def test_widget_matches_build_indicators_for_the_same_status(tmp_path, monkeypatch):
+    from dealwatch.reporting.indicators import build_indicators
+    from dealwatch.reporting.status import collect_status
+
+    db_path = _make_db(tmp_path)
+    conn = connect(db_path)
+    seed_sweep(conn, swept_at=500_000, distinct_count=10)
+    conn.close()
+    _use_db(monkeypatch, db_path)
+
+    with TestClient(mcp_server._build_app()) as client:
+        r = client.get("/widget")
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["profile_id"] == PROFILE_ID
+
+    live_settings = get_settings()
+    ceiling = live_settings.daily_call_limit - live_settings.daily_reserve_calls
+    conn = mcp_server.connect_readonly(str(db_path))
+    conn.row_factory = sqlite3.Row
+    try:
+        status = collect_status(conn, PROFILE_ID, ceiling=ceiling, now=body["as_of"])
+    finally:
+        conn.close()
+    expected = build_indicators(
+        status,
+        sweep_interval_minutes=mcp_server.profile.search.poll.sweep_interval_minutes,
+        dry_run=mcp_server.profile.alerts.dry_run if mcp_server.profile.alerts else True,
+        notifiers=mcp_server.profile.alerts.notifiers if mcp_server.profile.alerts else [],
+    )
+
+    assert body["collector"] == expected["collector"]
+    assert body["budget"] == expected["budget"]
+    assert body["baselines_age"] == expected["baselines_age"]
+    assert body["sweep_coverage"] == expected["sweep_coverage"]
+
+    # Manual sabotage (source edit, run, revert - see report): changed
+    # _widget_payload()'s "collector" field to a hardcoded literal
+    # instead of indicators["collector"] - both this test and test 2
+    # below failed as predicted (body["collector"] no longer matched
+    # either `expected` here or the monkeypatched sentinel there) -
+    # red-confirmed and reverted.
+
+
+# --- 2: route is wired to the shared helper, not its own copy -------------
+
+
+def test_widget_sabotage_bypassing_the_shared_helper(tmp_path, monkeypatch):
+    db_path = _make_db(tmp_path)
+    _use_db(monkeypatch, db_path)
+
+    sentinel = {"state": "warn", "label": "Collector", "value": "degraded", "group": "health"}
+
+    def _fake_build_health_indicators(now):
+        return (
+            {},
+            {
+                "collector": sentinel,
+                "budget": sentinel,
+                "baselines_age": sentinel,
+                "sweep_coverage": sentinel,
+            },
+            0,
+        )
+
+    monkeypatch.setattr(mcp_server, "_build_health_indicators", _fake_build_health_indicators)
+
+    with TestClient(mcp_server._build_app()) as client:
+        r = client.get("/widget")
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["collector"] == sentinel
+    assert body["budget"] == sentinel
+    assert body["baselines_age"] == sentinel
+    assert body["sweep_coverage"] == sentinel
+    # If /widget instead called collect_status()/build_indicators()
+    # directly (a second, independent computation rather than this
+    # shared helper), monkeypatching _build_health_indicators here would
+    # have no effect and the sentinel values above would not appear -
+    # this is the test that would catch that divergence.

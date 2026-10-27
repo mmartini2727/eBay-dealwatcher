@@ -392,6 +392,36 @@ def _next_sweep(last_sweep_started_at: int | None, sweep_interval_minutes: int, 
     return {"state": "pending", "estimated_at": estimated_at, "display": f"in {in_min} min"}
 
 
+def _build_health_indicators(now: int) -> tuple[dict, dict, int]:
+    """(status, indicators, ceiling) - the one computation of "is DealWatch
+    healthy" shared by get_system_health (the tool, JSON-RPC) and /widget
+    (a plain GET+JSON route, below, for a non-MCP reader like a Homepage
+    dashboard widget). Extracted so the two can never silently diverge on
+    what 'healthy' means.
+    """
+    alerts_cfg = profile.alerts
+    dry_run = alerts_cfg.dry_run if alerts_cfg is not None else True
+    notifiers = alerts_cfg.notifiers if alerts_cfg is not None else []
+    sweep_interval_minutes = profile.search.poll.sweep_interval_minutes
+    # Fresh get_settings() read, like _readonly_conn()'s own db_path read -
+    # same escape hatch main.py's dashboard() route uses, so a test's
+    # monkeypatched DAILY_CALL_LIMIT/DAILY_RESERVE_CALLS take effect
+    # without reimporting this module.
+    live_settings = get_settings()
+    ceiling = live_settings.daily_call_limit - live_settings.daily_reserve_calls
+
+    with _readonly_conn() as conn:
+        status = collect_status(conn, profile.id, ceiling=ceiling, now=now)
+
+    indicators = build_indicators(
+        status,
+        sweep_interval_minutes=sweep_interval_minutes,
+        dry_run=dry_run,
+        notifiers=notifiers,
+    )
+    return status, indicators, ceiling
+
+
 @mcp.tool(
     description=(
         "Is DealWatch working? When was the last sweep? When's the next one? "
@@ -418,26 +448,8 @@ def _next_sweep(last_sweep_started_at: int | None, sweep_interval_minutes: int, 
 )
 def get_system_health() -> dict:
     now = int(time.time())
-    alerts_cfg = profile.alerts
-    dry_run = alerts_cfg.dry_run if alerts_cfg is not None else True
-    notifiers = alerts_cfg.notifiers if alerts_cfg is not None else []
     sweep_interval_minutes = profile.search.poll.sweep_interval_minutes
-    # Fresh get_settings() read, like _readonly_conn()'s own db_path read -
-    # same escape hatch main.py's dashboard() route uses, so a test's
-    # monkeypatched DAILY_CALL_LIMIT/DAILY_RESERVE_CALLS take effect
-    # without reimporting this module.
-    live_settings = get_settings()
-    ceiling = live_settings.daily_call_limit - live_settings.daily_reserve_calls
-
-    with _readonly_conn() as conn:
-        status = collect_status(conn, profile.id, ceiling=ceiling, now=now)
-
-    indicators = build_indicators(
-        status,
-        sweep_interval_minutes=sweep_interval_minutes,
-        dry_run=dry_run,
-        notifiers=notifiers,
-    )
+    status, indicators, ceiling = _build_health_indicators(now)
     pacing = build_budget_pacing(status, now)
 
     alive = status["alive"]
@@ -1661,6 +1673,46 @@ async def health(request: Request) -> JSONResponse:
             "vocabulary_degraded": vocabulary_degraded,
         }
     )
+
+
+# ---------------------------------------------------------------------------
+# /widget - a plain GET+JSON summary for a non-MCP reader (a Homepage
+# "Custom API" widget, an uptime board, curl by hand). /mcp speaks
+# JSON-RPC over POST and get_system_health is an MCP tool call, neither of
+# which a dashboard widget can do - this is the four indicators worth a
+# glance, flattened to one GET. Same computation get_system_health() runs
+# (_build_health_indicators), never a second, divergent "is this healthy".
+# This process has no eBay/Discord/Pushover credentials to begin with
+# (D1) - same LAN-only, unauthenticated posture as the rest of DealWatch.
+# ---------------------------------------------------------------------------
+
+
+def _widget_payload() -> dict:
+    now = int(time.time())
+    _status, indicators, _ceiling = _build_health_indicators(now)
+    return {
+        "as_of": now,
+        "profile_id": profile.id,
+        "collector": indicators["collector"],
+        "budget": indicators["budget"],
+        "baselines_age": indicators["baselines_age"],
+        "sweep_coverage": indicators["sweep_coverage"],
+    }
+
+
+@mcp.custom_route("/widget", methods=["GET"])
+async def widget(request: Request) -> JSONResponse:
+    """Flat JSON for an external dashboard widget. Each of the four
+    fields is {"state", "label", "value", "group"} (reporting/indicators.py's
+    own shape) - "state" is one of a small fixed vocabulary
+    (ok/warn/unknown/info, see indicators.py) a widget can color by,
+    "value"/"label" are the ready-to-print strings the DealWatch dashboard
+    itself renders, never raw numbers needing their own formatting here.
+    Blocking DB read kept off this process's event loop via
+    asyncio.to_thread, same reasoning as /health's own route.
+    """
+    payload = await asyncio.to_thread(_widget_payload)
+    return JSONResponse(payload)
 
 
 # ---------------------------------------------------------------------------
